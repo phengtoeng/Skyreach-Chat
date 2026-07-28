@@ -1,0 +1,16 @@
+[package]
+name = "seal-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "DSCP-1 narrow facade over audited crypto crates. No homemade primitives."
+
+[dependencies]
+blake3 = "1"
+ed25519-dalek = "2"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+sharks = "0.5"
+rand = "0.8"
+anyhow = "1"
+zeroize = "1"

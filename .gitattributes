@@ -1,0 +1,6 @@
+# Normalize line endings to LF in the repo (Windows + macOS collaboration).
+* text=auto eol=lf
+# Binary / generated
+*.so binary
+*.jar binary
+*.png binary

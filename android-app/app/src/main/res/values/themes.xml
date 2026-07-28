@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Compose draws all UI colors itself (MaterialTheme in MainActivity); this base
+         theme only styles the window/status bar. Uses a built-in Material theme so the
+         app needs no extra view-system dependency. -->
+    <style name="Theme.SplitSeal" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:statusBarColor">#FF17212B</item>
+        <item name="android:navigationBarColor">#FF17212B</item>
+    </style>
+</resources>

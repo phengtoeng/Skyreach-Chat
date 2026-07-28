@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["seal-crypto", "seal-core", "seal-ffi", "wcaht-seal-sdk"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+# DSCP-1 / Denvion SplitSeal — WCAHT-native sealed messenger.
+#
+# Phase 0/1 foundation:
+#   seal-crypto  audited-crypto facade (no homemade primitives)
+#   seal-core    DSCP-1 protocol core, client state machine, mock WCAHT seal chain,
+#                sender/recipient flows + threat-model tests (runnable on desktop)
+#   seal-ffi     C-ABI (iOS/Swift) + JNI (Android/Kotlin) surface over seal-core
+#   wcaht-seal-sdk  real WCAHT integration: live finality read + anchor txns,
+#                   implements seal_core::SealChain (swaps in for MockSealChain)
+#
+# Native apps live in ../ios-app (SwiftUI) and ../android-app (Kotlin/Compose)
+# and link this Rust core. See README.md for the mobile build path.
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1

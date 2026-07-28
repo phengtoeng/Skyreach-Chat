@@ -1,0 +1,12 @@
+[package]
+name = "seal-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "DSCP-1 protocol core: canonical objects, client state machine, mock WCAHT seal chain, sender/recipient flows."
+
+[dependencies]
+seal-crypto = { path = "../seal-crypto" }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+anyhow = "1"
