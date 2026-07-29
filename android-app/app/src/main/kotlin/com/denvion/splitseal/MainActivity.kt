@@ -897,7 +897,6 @@ private fun NewContactScreen(
     var last by remember { mutableStateOf("") }
     var phone by remember { mutableStateOf("") }
     var sync by remember { mutableStateOf(true) }
-    var code by remember { mutableStateOf("") }
     var country by remember { mutableStateOf(COUNTRIES[0]) }
     var countryMenu by remember { mutableStateOf(false) }
     val canSave = first.isNotBlank() || scanned != null
@@ -978,24 +977,30 @@ private fun NewContactScreen(
                 Text("Add via QR Code", color = Blue, fontSize = 16.sp)
             }
 
-            // Add by the denvion: contact code — a Paste button reads the clipboard directly
-            // (no long-press, so no emulator text-magnifier crash). Easiest between two emulators.
+            // Add by the denvion: contact code — a single Paste button reads the clipboard directly.
+            // Deliberately NO editable field: tapping into a text field on the emulator pops the
+            // text-selection Magnifier, whose crash_dump helper dies and takes the app down.
             Spacer(Modifier.height(18.dp))
             Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color.White).padding(16.dp)) {
                 Text("Or add by contact code", color = Sub, fontSize = 13.sp)
-                Spacer(Modifier.height(8.dp))
-                FormField("denvion:…", code, KeyboardType.Text) { code = it }
+                Spacer(Modifier.height(4.dp))
+                Text("On the other phone: Settings ▸ Copy my code, then tap Paste here.", color = Sub, fontSize = 11.sp)
                 Spacer(Modifier.height(10.dp))
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    OutlinedButton(
-                        onClick = {
+                Row(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Blue)
+                        .clickable {
                             val clip = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
-                            val t = clip?.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.text?.toString()?.trim().orEmpty()
-                            if (t.isNotEmpty()) code = t
-                        },
-                        modifier = Modifier.weight(1f),
-                    ) { Text("Paste") }
-                    Button(onClick = { onPasteCode(code.trim()) }, enabled = code.isNotBlank(), modifier = Modifier.weight(1f)) { Text("Add by code") }
+                            val t = clip?.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.text?.toString().orEmpty()
+                            if (t.isBlank()) android.widget.Toast.makeText(ctx, "Clipboard is empty — copy the denvion: code first", android.widget.Toast.LENGTH_SHORT).show()
+                            else onPasteCode(t)
+                        }
+                        .padding(vertical = 14.dp),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Filled.ContentPaste, null, tint = Color.White, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Paste contact code", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                 }
             }
 

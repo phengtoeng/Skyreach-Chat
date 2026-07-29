@@ -716,7 +716,6 @@ struct NewContactView: View {
     @State private var last = ""
     @State private var phone = ""
     @State private var sync = true
-    @State private var code = ""
     @State private var country = iosCountries[0]
     @State private var showSync = false
 
@@ -793,28 +792,17 @@ struct NewContactView: View {
                     }
                     .background(Color.white).clipShape(RoundedRectangle(cornerRadius: 14))
 
-                    // Paste the denvion: contact code directly — no camera needed (easiest between two simulators).
-                    VStack(alignment: .leading, spacing: 10) {
+                    // Paste the denvion: contact code directly — one button, no editable field
+                    // (an editable field pops the text-selection Magnifier, which crashes on the emulator).
+                    VStack(alignment: .leading, spacing: 8) {
                         Text("Or add by contact code").font(.system(size: 13)).foregroundColor(.dvSub)
-                        TextField("denvion:…", text: $code)
-                            .textInputAutocapitalization(.never).autocorrectionDisabled().foregroundColor(.dvInk)
-                            .padding(12).background(Color(hex: 0xF1F4F7)).clipShape(RoundedRectangle(cornerRadius: 10))
-                        HStack(spacing: 10) {
-                            Button(action: {
-                                if let s = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty { code = s }
-                            }) {
-                                Text("Paste")
-                                    .font(.system(size: 15, weight: .semibold)).foregroundColor(.dvBlue)
-                                    .frame(maxWidth: .infinity).padding(.vertical, 12)
-                                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.dvBlue))
-                            }
-                            Button(action: { let c = code.trimmingCharacters(in: .whitespacesAndNewlines); if !c.isEmpty { onPasteCode(c) } }) {
-                                Text("Add by code")
-                                    .font(.system(size: 15, weight: .semibold)).foregroundColor(.white)
-                                    .frame(maxWidth: .infinity).padding(.vertical, 12)
-                                    .background(code.isEmpty ? Color(hex: 0xCBD3DA) : Color.dvBlue)
-                                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                            }.disabled(code.isEmpty)
+                        Text("On the other phone: Settings ▸ Copy my code, then tap Paste here.")
+                            .font(.system(size: 11)).foregroundColor(.dvSub)
+                        Button(action: { onPasteCode(UIPasteboard.general.string ?? "") }) {
+                            Label("Paste contact code", systemImage: "doc.on.clipboard")
+                                .font(.system(size: 15, weight: .semibold)).foregroundColor(.white)
+                                .frame(maxWidth: .infinity).padding(.vertical, 14)
+                                .background(Color.dvBlue).clipShape(RoundedRectangle(cornerRadius: 10))
                         }
                     }
                     .padding(16).background(Color.white).clipShape(RoundedRectangle(cornerRadius: 14))
