@@ -37,7 +37,7 @@ private func nowTime() -> String {
 }
 
 // ─────────────────────────────── models ─────────────────────────────────────
-struct Chat: Identifiable { let id = UUID(); let name: String; let last: String; let time: String; var unread: Int = 0; var devicePub: String = "" }
+struct Chat: Identifiable { let id = UUID(); let name: String; let last: String; let time: String; var unread: Int = 0; var devicePub: String = ""; var identityPub: String = "" }
 enum Kind { case text, image, voice }
 enum MsgState { case plain, sealing, opened }
 struct Msg: Identifiable {
@@ -66,7 +66,7 @@ private func seedThread() -> [Msg] {
 }
 
 // ─────────────────────── identity + contacts (persisted) ────────────────────
-struct Contact: Identifiable { let id = UUID(); let name: String; let address: String; let devicePub: String; let phone: String }
+struct Contact: Identifiable { let id = UUID(); let name: String; let address: String; let devicePub: String; let identityPub: String; let phone: String }
 
 enum Store {
     private static let d = UserDefaults.standard
@@ -93,12 +93,12 @@ enum Store {
         guard let s = d.string(forKey: "inbox_\(tag)"), let data = s.data(using: .utf8) else { return [] }
         return ((try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]) ?? []
     }
-    /// Append a received message; returns false if this seal_id was already stored.
+    /// Append a received message (tagged with the sender's identity_pub); false if already stored.
     @discardableResult
-    static func addInbox(_ tag: String, _ sealId: String, _ text: String) -> Bool {
+    static func addInbox(_ tag: String, _ sealId: String, _ text: String, _ sender: String) -> Bool {
         var a = inbox(tag)
         if a.contains(where: { ($0["id"] as? String) == sealId }) { return false }
-        a.append(["id": sealId, "text": text, "ts": Date().timeIntervalSince1970])
+        a.append(["id": sealId, "text": text, "sender": sender, "ts": Date().timeIntervalSince1970])
         if let out = try? JSONSerialization.data(withJSONObject: a), let s = String(data: out, encoding: .utf8) {
             d.set(s, forKey: "inbox_\(tag)")
         }
@@ -115,7 +115,8 @@ func loadOrCreateIdentity() -> [String: Any] {
 func loadContacts() -> [Contact] {
     Store.contacts().map {
         Contact(name: $0["name"] as? String ?? "", address: $0["address"] as? String ?? "",
-                devicePub: $0["device_pub"] as? String ?? "", phone: $0["phone"] as? String ?? "")
+                devicePub: $0["device_pub"] as? String ?? "", identityPub: $0["identity_pub"] as? String ?? "",
+                phone: $0["phone"] as? String ?? "")
     }
 }
 
@@ -245,6 +246,7 @@ struct ContentView: View {
             c["address"] = s["address"] ?? ""
             c["device_pub"] = s["device_pub"] ?? ""
             c["identity_pub"] = s["identity_pub"] ?? ""
+            c["identity_pub"] = s["identity_pub"] ?? ""
         }
         if let data = try? JSONSerialization.data(withJSONObject: c), let json = String(data: data, encoding: .utf8) {
             Store.addContact(json)
@@ -260,6 +262,7 @@ struct ContentView: View {
                     chat: c,
                     myDeviceSeed: identity["device_seed"] as? String ?? "",
                     myDevicePub: identity["device_pub"] as? String ?? "",
+                    myIdentitySeed: identity["identity_seed"] as? String ?? "",
                     onBack: { openChat = nil }
                 )
             } else if showNew {
@@ -317,7 +320,7 @@ struct ChatListView: View {
         let rows = contacts.map { c -> Chat in
             let sub = !c.address.isEmpty ? String(c.address.prefix(14)) + "… · tap to seal"
                 : (!c.phone.isEmpty ? "+855 " + c.phone : "tap to seal")
-            return Chat(name: c.name, last: sub, time: "", devicePub: c.devicePub)
+            return Chat(name: c.name, last: sub, time: "", devicePub: c.devicePub, identityPub: c.identityPub)
         } + CHATS
         VStack(spacing: 0) {
             HStack(spacing: 8) {
@@ -702,6 +705,7 @@ struct ConversationView: View {
     let chat: Chat
     let myDeviceSeed: String
     let myDevicePub: String
+    let myIdentitySeed: String
     let onBack: () -> Void
     @State private var messages: [Msg] = []
     @State private var draft = ""
@@ -762,9 +766,12 @@ struct ConversationView: View {
             }
             if real {
                 if messages.isEmpty {
+                    // restore only messages FROM this contact; seed `seen` with every id so poll skips them.
                     for o in Store.inbox(myTag) {
                         if let id = o["id"] as? String { seen.insert(id) }
-                        messages.append(Msg(text: o["text"] as? String ?? "", incoming: true, time: "", state: .opened))
+                        if (o["sender"] as? String) == chat.identityPub {
+                            messages.append(Msg(text: o["text"] as? String ?? "", incoming: true, time: "", state: .opened))
+                        }
                     }
                 }
                 while !Task.isCancelled {
@@ -807,12 +814,14 @@ struct ConversationView: View {
                   let bundle = item["bundle"],
                   let bd = try? JSONSerialization.data(withJSONObject: bundle),
                   let bundleStr = String(data: bd, encoding: .utf8) else { continue }
+            let sender = (item["bundle"] as? [String: Any])?["sender_id_pub"] as? String ?? ""
             let shares = await collectShares(sealId)
             let openStr = SealCore.openReceived(myDeviceSeed, bundleStr, shares)
             if let r = (try? JSONSerialization.jsonObject(with: Data(openStr.utf8))) as? [String: Any],
                (r["ok"] as? Bool) == true, let plain = r["plaintext"] as? String {
                 seen.insert(sealId)
-                if Store.addInbox(myTag, sealId, plain) { // persist; the dedup authority
+                // persist under my inbox tagged by sender; only SHOW it in this contact's chat.
+                if Store.addInbox(myTag, sealId, plain, sender) && sender == chat.identityPub {
                     messages.append(Msg(text: plain, incoming: true, time: nowTime(), state: .opened))
                 }
             }
@@ -831,7 +840,7 @@ struct ConversationView: View {
             if real {
                 // seal + SHIP over the relay + gateways; the recipient's device polls + opens.
                 var ok = false
-                let shipStr = SealCore.sealShippable(chat.devicePub, text, fast)
+                let shipStr = SealCore.sealShippable(myIdentitySeed, chat.devicePub, text, fast)
                 if let ship = (try? JSONSerialization.jsonObject(with: Data(shipStr.utf8))) as? [String: Any], (ship["ok"] as? Bool) == true {
                     await shipSeal(ship)
                     ok = true

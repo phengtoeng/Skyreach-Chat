@@ -42,8 +42,9 @@ char *ss_mailbox_tag(const char *device_pub);
 char *ss_seal_to(const char *device_pub, const char *text, int fast);
 
 /* Seal + return artifacts to SHIP over the services (real cross-device delivery):
- *   { ok, seal_id, mailbox_tag, bundle, shares }  (bundle → relay, shares[i] → gateway i) */
-char *ss_seal_shippable(const char *device_pub, const char *text, int fast);
+ *   { ok, seal_id, mailbox_tag, bundle, shares }  (bundle → relay, shares[i] → gateway i)
+ * identity_seed = the SENDER's stored identity seed; bundle.sender_id_pub = sender identity_pub. */
+char *ss_seal_shippable(const char *identity_seed, const char *device_pub, const char *text, int fast);
 
 /* Open a message COLLECTED from the services:
  *   { ok, plaintext }  or  { ok:false, reason }  (device_seed = recipient's stored seed). */

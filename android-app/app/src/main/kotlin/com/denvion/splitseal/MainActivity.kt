@@ -77,7 +77,7 @@ private fun initials(name: String) =
     name.trim().split(" ").filter { it.isNotEmpty() }.take(2).joinToString("") { it.first().uppercase() }
 
 // ─────────────────────────────── models ─────────────────────────────────────
-private data class Chat(val name: String, val last: String, val time: String, val unread: Int = 0, val devicePub: String = "")
+private data class Chat(val name: String, val last: String, val time: String, val unread: Int = 0, val devicePub: String = "", val identityPub: String = "")
 
 private enum class Kind { TEXT, IMAGE, VOICE }
 private enum class State { PLAIN, SEALING, OPENED }
@@ -113,7 +113,7 @@ private fun seedThread(): List<Msg> = listOf(
 )
 
 // ─────────────────────── identity + contacts (persisted) ────────────────────
-private data class Contact(val name: String, val address: String, val devicePub: String, val phone: String)
+private data class Contact(val name: String, val address: String, val devicePub: String, val identityPub: String, val phone: String)
 
 private class Store(ctx: Context) {
     private val p = ctx.getSharedPreferences("denvion", Context.MODE_PRIVATE)
@@ -130,11 +130,11 @@ private class Store(ctx: Context) {
 
     // received messages, persisted + deduped per mailbox tag (all my inbound share my tag).
     fun inbox(tag: String): JSONArray = p.getString("inbox_$tag", null)?.let { JSONArray(it) } ?: JSONArray()
-    /** Append a received message; returns false if this seal_id was already stored. */
-    fun addInbox(tag: String, sealId: String, text: String): Boolean {
+    /** Append a received message (tagged with the sender's identity_pub); false if already stored. */
+    fun addInbox(tag: String, sealId: String, text: String, sender: String): Boolean {
         val a = inbox(tag)
         for (i in 0 until a.length()) if (a.getJSONObject(i).optString("id") == sealId) return false
-        a.put(JSONObject().put("id", sealId).put("text", text).put("ts", System.currentTimeMillis()))
+        a.put(JSONObject().put("id", sealId).put("text", text).put("sender", sender).put("ts", System.currentTimeMillis()))
         p.edit().putString("inbox_$tag", a.toString()).apply()
         return true
     }
@@ -151,7 +151,7 @@ private fun loadContacts(store: Store): List<Contact> {
     val a = store.contacts()
     return (0 until a.length()).map {
         val o = a.getJSONObject(it)
-        Contact(o.optString("name"), o.optString("address"), o.optString("device_pub"), o.optString("phone"))
+        Contact(o.optString("name"), o.optString("address"), o.optString("device_pub"), o.optString("identity_pub"), o.optString("phone"))
     }
 }
 
@@ -331,6 +331,7 @@ private fun App(proto: String) {
             chat,
             myDeviceSeed = identity.optString("device_seed"),
             myDevicePub = identity.optString("device_pub"),
+            myIdentitySeed = identity.optString("identity_seed"),
             store = store,
         ) { openChat = null }
         showNew -> NewContactScreen(
@@ -405,7 +406,7 @@ private fun ChatListScreen(
             it.phone.isNotBlank() -> "+855 " + it.phone
             else -> "tap to seal"
         }
-        Chat(it.name, sub, "", devicePub = it.devicePub)
+        Chat(it.name, sub, "", devicePub = it.devicePub, identityPub = it.identityPub)
     } + CHATS
     Column(Modifier.fillMaxSize().background(ScreenBg)) {
         Row(
@@ -820,6 +821,7 @@ private fun ConversationScreen(
     chat: Chat,
     myDeviceSeed: String,
     myDevicePub: String,
+    myIdentitySeed: String,
     store: Store,
     onBack: () -> Unit,
 ) {
@@ -837,12 +839,15 @@ private fun ConversationScreen(
     val messages = remember {
         mutableStateListOf<Msg>().apply {
             if (real) {
-                // restore previously-received messages (deduped by seal_id)
+                // restore received messages, but only the ones FROM this contact (by sender identity).
+                // seed `seen` with every stored id (any sender) so the poll never re-opens them.
                 val stored = store.inbox(myTag)
                 for (i in 0 until stored.length()) {
                     val o = stored.getJSONObject(i)
                     seen.add(o.optString("id"))
-                    add(Msg(System.nanoTime() + i, o.optString("text"), true, "", state = State.OPENED))
+                    if (o.optString("sender") == chat.identityPub) {
+                        add(Msg(System.nanoTime() + i, o.optString("text"), true, "", state = State.OPENED))
+                    }
                 }
             } else {
                 addAll(seedThread())
@@ -874,7 +879,9 @@ private fun ConversationScreen(
                 if (opened != null && opened.optBoolean("ok")) {
                     seen.add(sealId)
                     val text = opened.optString("plaintext")
-                    if (store.addInbox(myTag, sealId, text)) { // persist; the dedup authority
+                    val sender = bundle.optString("sender_id_pub") // sender's stable identity_pub
+                    // persist under my inbox tagged by sender; only SHOW it in this contact's chat.
+                    if (store.addInbox(myTag, sealId, text, sender) && sender == chat.identityPub) {
                         messages.add(Msg(System.nanoTime(), text, true, now(), state = State.OPENED))
                         listState.animateScrollToItem(messages.lastIndex)
                     }
@@ -904,7 +911,7 @@ private fun ConversationScreen(
                 // seal + SHIP over the relay + gateways; the recipient's device polls + opens.
                 val ok = runCatching {
                     withContext(Dispatchers.IO) {
-                        val ship = JSONObject(SealCore.sealShippable(chat.devicePub, text, fast))
+                        val ship = JSONObject(SealCore.sealShippable(myIdentitySeed, chat.devicePub, text, fast))
                         if (!ship.optBoolean("ok")) return@withContext false
                         shipSeal(ship)
                         true
