@@ -9,10 +9,12 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -77,7 +79,7 @@ private fun initials(name: String) =
     name.trim().split(" ").filter { it.isNotEmpty() }.take(2).joinToString("") { it.first().uppercase() }
 
 // ─────────────────────────────── models ─────────────────────────────────────
-private data class Chat(val name: String, val last: String, val time: String, val unread: Int = 0, val devicePub: String = "", val identityPub: String = "")
+private data class Chat(val name: String, val last: String, val time: String, val unread: Int = 0, val devicePub: String = "", val identityPub: String = "", val isContact: Boolean = false)
 
 private enum class Kind { TEXT, IMAGE, VOICE }
 private enum class State { PLAIN, SEALING, OPENED }
@@ -123,6 +125,38 @@ private class Store(ctx: Context) {
     fun addContact(c: JSONObject) {
         val a = contacts(); a.put(c); p.edit().putString("contacts", a.toString()).apply()
     }
+    /** Add a contact parsed from a card (from an inbound message) unless one with the same
+     *  identity_pub already exists. Returns true if it was newly added. */
+    fun addContactFromCard(card: JSONObject): Boolean {
+        val idp = card.optString("identity_pub")
+        val a = contacts()
+        if (idp.isNotBlank()) for (i in 0 until a.length()) if (a.getJSONObject(i).optString("identity_pub") == idp) return false
+        a.put(
+            JSONObject().put("name", card.optString("name", "Contact")).put("address", card.optString("address"))
+                .put("device_pub", card.optString("device_pub")).put("identity_pub", idp),
+        )
+        p.edit().putString("contacts", a.toString()).apply()
+        return true
+    }
+    /** Remove a saved contact (match by identity_pub when present, else by name). */
+    fun removeContact(identityPub: String, name: String) {
+        val a = contacts(); val out = JSONArray()
+        for (i in 0 until a.length()) {
+            val o = a.getJSONObject(i)
+            val match = if (identityPub.isNotBlank()) o.optString("identity_pub") == identityPub else o.optString("name") == name
+            if (!match) out.put(o)
+        }
+        p.edit().putString("contacts", out.toString()).apply()
+    }
+
+    // Demo placeholder chats can't be "deleted" (they aren't real contacts) — hide them by name.
+    fun hiddenChats(): Set<String> = p.getString("hidden_chats", null)?.let {
+        val a = JSONArray(it); (0 until a.length()).map { i -> a.getString(i) }.toSet()
+    } ?: emptySet()
+    fun hideChat(name: String) {
+        val s = hiddenChats().toMutableSet(); s.add(name)
+        p.edit().putString("hidden_chats", JSONArray(s.toList()).toString()).apply()
+    }
 
     // backend host (relay + gateways + directory)
     fun serverHost(): String = p.getString("server_host", Server.DEFAULT_HOST) ?: Server.DEFAULT_HOST
@@ -137,6 +171,16 @@ private class Store(ctx: Context) {
         a.put(JSONObject().put("id", sealId).put("text", text).put("sender", sender).put("ts", System.currentTimeMillis()))
         p.edit().putString("inbox_$tag", a.toString()).apply()
         return true
+    }
+    /** Drop every received message from a given sender (used when deleting that conversation). */
+    fun clearInboxFrom(tag: String, sender: String) {
+        if (tag.isBlank()) return
+        val a = inbox(tag); val out = JSONArray()
+        for (i in 0 until a.length()) {
+            val o = a.getJSONObject(i)
+            if (o.optString("sender") != sender) out.put(o)
+        }
+        p.edit().putString("inbox_$tag", out.toString()).apply()
     }
 }
 
@@ -262,11 +306,42 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Server.host = Store(this).serverHost() // apply the saved backend before any network call
+        ensureNotifChannel(this)
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            runCatching { requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1001) }
+        }
         val proto = runCatching {
             JSONObject(SealCore.version()).let { "DSCP-${it.getInt("version")} · chain ${it.getLong("chain_id")}" }
         }.getOrDefault("DSCP-2")
         setContent { MaterialTheme(colorScheme = lightColorScheme(primary = Blue)) { App(proto) } }
     }
+}
+
+// ── local notifications for inbound messages ──
+private const val NOTIF_CHANNEL = "denvion_messages"
+private var notifSeq = 2000
+
+private fun ensureNotifChannel(ctx: Context) {
+    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+        val ch = android.app.NotificationChannel(NOTIF_CHANNEL, "Messages", android.app.NotificationManager.IMPORTANCE_HIGH)
+        ch.description = "New sealed messages"
+        (ctx.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager).createNotificationChannel(ch)
+    }
+}
+
+private fun notifyMessage(ctx: Context, title: String, text: String) {
+    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU &&
+        androidx.core.content.ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.POST_NOTIFICATIONS) !=
+        android.content.pm.PackageManager.PERMISSION_GRANTED
+    ) return
+    val n = androidx.core.app.NotificationCompat.Builder(ctx, NOTIF_CHANNEL)
+        .setSmallIcon(android.R.drawable.ic_dialog_email)
+        .setContentTitle(title)
+        .setContentText(text)
+        .setAutoCancel(true)
+        .setPriority(androidx.core.app.NotificationCompat.PRIORITY_HIGH)
+        .build()
+    runCatching { androidx.core.app.NotificationManagerCompat.from(ctx).notify(notifSeq++, n) }
 }
 
 @Composable
@@ -286,9 +361,52 @@ private fun App(proto: String) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val store = remember { Store(ctx) }
-    val identity = remember { loadOrCreateIdentity(store) }
+    var identity by remember { mutableStateOf(loadOrCreateIdentity(store)) }
     var contacts by remember { mutableStateOf(loadContacts(store)) }
+    var hidden by remember { mutableStateOf(store.hiddenChats()) }
+    // My own inbox tag — every seal addressed to me lands here; also purged when I delete a chat.
+    val myTag = remember {
+        val dp = identity.optString("device_pub")
+        if (dp.isBlank()) "" else runCatching { JSONObject(SealCore.mailboxTag(dp)).optString("mailbox_tag") }.getOrDefault("")
+    }
     var openChat by remember { mutableStateOf<Chat?>(null) }
+
+    // ── Always-on inbox poll (while on the chat list) ──
+    // Receive messages even when the specific chat isn't open: fetch → open → auto-create the
+    // sender as a replyable contact (from the card embedded in the bundle) → store → notify.
+    val seenGlobal = remember { mutableSetOf<String>() }
+    LaunchedEffect(openChat == null, myTag) {
+        if (openChat != null || myTag.isBlank()) return@LaunchedEffect
+        store.inbox(myTag).let { s -> for (i in 0 until s.length()) seenGlobal.add(s.getJSONObject(i).optString("id")) }
+        while (openChat == null) {
+            val items = withContext(Dispatchers.IO) { fetchInboxAll(myTag) }
+            for (item in items) {
+                val sealId = item.optString("seal_id")
+                val bundle = item.optJSONObject("bundle") ?: continue
+                if (sealId.isBlank() || sealId in seenGlobal) continue
+                val shares = withContext(Dispatchers.IO) { collectShares(sealId) }
+                val opened = runCatching {
+                    withContext(Dispatchers.IO) { JSONObject(SealCore.openReceived(identity.optString("device_seed"), bundle.toString(), shares)) }
+                }.getOrNull()
+                if (opened != null && opened.optBoolean("ok")) {
+                    seenGlobal.add(sealId)
+                    val text = opened.optString("plaintext")
+                    val sender = bundle.optString("sender_id_pub")
+                    var senderName = "New message"
+                    val senderCard = bundle.optString("sender_card")
+                    if (senderCard.isNotBlank()) {
+                        val parsed = runCatching { JSONObject(SealCore.parseCard(senderCard)) }.getOrNull()
+                        if (parsed != null && parsed.optBoolean("ok")) {
+                            senderName = parsed.optString("name").ifBlank { senderName }
+                            if (store.addContactFromCard(parsed)) contacts = loadContacts(store)
+                        }
+                    }
+                    if (store.addInbox(myTag, sealId, text, sender)) notifyMessage(ctx, senderName, text)
+                }
+            }
+            delay(3000)
+        }
+    }
     var tab by remember { mutableStateOf(0) }
     var showNew by remember { mutableStateOf(false) }
     var scanned by remember { mutableStateOf<JSONObject?>(null) }
@@ -309,6 +427,32 @@ private fun App(proto: String) {
                 setOrientationLocked(false)
             }
         )
+    }
+
+    fun deleteChat(c: Chat) {
+        if (c.isContact) {
+            store.removeContact(c.identityPub, c.name)
+            store.clearInboxFrom(myTag, c.identityPub)
+            contacts = loadContacts(store)
+        } else {
+            store.hideChat(c.name)
+            hidden = store.hiddenChats()
+        }
+    }
+
+    // Tell a freshly-added contact they were added: ship a small hello so THEIR device gets a real
+    // inbound event → the chat + a notification appear on their side ("X added you").
+    fun sendHello(devicePub: String) {
+        if (devicePub.isBlank()) return
+        val seed = identity.optString("identity_seed")
+        val card = identity.optString("card")
+        val myName = identity.optString("name", "Someone").ifBlank { "Someone" }
+        scope.launch(Dispatchers.IO) {
+            val ship = runCatching {
+                JSONObject(SealCore.sealShippable(seed, card, devicePub, "👋 $myName added you on Denvion", false))
+            }.getOrNull()
+            if (ship != null && ship.optBoolean("ok")) shipSeal(ship)
+        }
     }
 
     fun publishPhone(phone: String) {
@@ -332,6 +476,7 @@ private fun App(proto: String) {
             myDeviceSeed = identity.optString("device_seed"),
             myDevicePub = identity.optString("device_pub"),
             myIdentitySeed = identity.optString("identity_seed"),
+            myCard = identity.optString("card"),
             store = store,
         ) { openChat = null }
         showNew -> NewContactScreen(
@@ -365,6 +510,7 @@ private fun App(proto: String) {
                 }
                 store.addContact(c)
                 contacts = loadContacts(store)
+                scanned?.optString("device_pub")?.let { if (it.isNotBlank()) sendHello(it) }
                 showNew = false; scanned = null
             },
         )
@@ -373,6 +519,20 @@ private fun App(proto: String) {
             currentHost = Server.host,
             onTab = { tab = it },
             onPublish = { publishPhone(it) },
+            onSaveName = { newName ->
+                val nm = newName.trim().ifBlank { "Me" }
+                val rebuilt = runCatching {
+                    JSONObject(SealCore.cardFor(identity.optString("identity_seed"), identity.optString("device_seed"), nm))
+                }.getOrNull()
+                if (rebuilt != null) {
+                    // reassign a fresh object so the card/QR recompose; identity_pub/address stay stable.
+                    val next = JSONObject(identity.toString())
+                        .put("name", nm).put("card", rebuilt.optString("card")).put("address", rebuilt.optString("address"))
+                    store.saveIdentity(next)
+                    identity = next
+                    android.widget.Toast.makeText(ctx, "Name saved — your contact card now shows \"$nm\"", android.widget.Toast.LENGTH_SHORT).show()
+                }
+            },
             onSaveHost = { h ->
                 Server.host = h
                 store.saveServerHost(h)
@@ -381,8 +541,10 @@ private fun App(proto: String) {
         )
         else -> ChatListScreen(
             contacts = contacts,
+            hidden = hidden,
             onOpen = { openChat = it },
             onAdd = { showNew = true; scanned = null },
+            onDelete = { deleteChat(it) },
             tab = tab,
             onTab = { tab = it },
         )
@@ -393,21 +555,24 @@ private fun App(proto: String) {
 @Composable
 private fun ChatListScreen(
     contacts: List<Contact>,
+    hidden: Set<String>,
     onOpen: (Chat) -> Unit,
     onAdd: () -> Unit,
+    onDelete: (Chat) -> Unit,
     tab: Int,
     onTab: (Int) -> Unit,
 ) {
     SystemBars(Blue, darkIcons = false)
-    // real contacts first (address / phone as subtitle), then the demo threads
+    var pendingDelete by remember { mutableStateOf<Chat?>(null) }
+    // real contacts first (address / phone as subtitle), then the demo threads (minus hidden ones)
     val rows = contacts.map {
         val sub = when {
             it.address.isNotBlank() -> it.address.take(14) + "… · tap to seal"
             it.phone.isNotBlank() -> "+855 " + it.phone
             else -> "tap to seal"
         }
-        Chat(it.name, sub, "", devicePub = it.devicePub, identityPub = it.identityPub)
-    } + CHATS
+        Chat(it.name, sub, "", devicePub = it.devicePub, identityPub = it.identityPub, isContact = true)
+    } + CHATS.filter { it.name !in hidden }
     Column(Modifier.fillMaxSize().background(ScreenBg)) {
         Row(
             Modifier.fillMaxWidth().background(Blue).padding(horizontal = 16.dp, vertical = 14.dp),
@@ -422,7 +587,7 @@ private fun ChatListScreen(
         Box(Modifier.weight(1f)) {
             LazyColumn(Modifier.fillMaxSize()) {
                 items(rows) { c ->
-                    ChatRow(c) { onOpen(c) }
+                    ChatRow(c, onClick = { onOpen(c) }, onLongClick = { pendingDelete = c })
                     Box(Modifier.padding(start = 84.dp).fillMaxWidth().height(1.dp).background(Hair))
                 }
             }
@@ -435,12 +600,29 @@ private fun ChatListScreen(
         }
         BottomBar(tab, onTab)
     }
+
+    pendingDelete?.let { target ->
+        AlertDialog(
+            onDismissRequest = { pendingDelete = null },
+            title = { Text("Delete chat") },
+            text = { Text("Delete your conversation with ${target.name}? This removes it from this device.") },
+            confirmButton = {
+                TextButton(onClick = { onDelete(target); pendingDelete = null }) {
+                    Text("Delete", color = Color(0xFFE0403A), fontWeight = FontWeight.SemiBold)
+                }
+            },
+            dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("Cancel", color = Sub) } },
+        )
+    }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun ChatRow(c: Chat, onClick: () -> Unit) {
+private fun ChatRow(c: Chat, onClick: () -> Unit, onLongClick: () -> Unit) {
     Row(
-        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 12.dp),
+        Modifier.fillMaxWidth()
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Avatar(c.name, 52.dp)
@@ -507,6 +689,7 @@ private fun ProfileScreen(
     currentHost: String,
     onTab: (Int) -> Unit,
     onPublish: (String) -> Unit,
+    onSaveName: (String) -> Unit,
     onSaveHost: (String) -> Unit,
 ) {
     SystemBars(Blue, darkIcons = false)
@@ -514,6 +697,7 @@ private fun ProfileScreen(
     val address = identity.optString("address")
     val card = identity.optString("card")
     val qr = remember(card) { runCatching { qrBitmap(card) }.getOrNull() }
+    var myName by remember(name) { mutableStateOf(name) }
     var myPhone by remember { mutableStateOf(identity.optString("phone")) }
     var host by remember { mutableStateOf(currentHost) }
     Column(Modifier.fillMaxSize().background(ScreenBg)) {
@@ -532,6 +716,37 @@ private fun ProfileScreen(
             Avatar(name, 76.dp)
             Spacer(Modifier.height(10.dp))
             Text(name, fontSize = 20.sp, fontWeight = FontWeight.SemiBold, color = Ink)
+
+            Spacer(Modifier.height(16.dp))
+            Text("Your display name", fontSize = 13.sp, color = Sub)
+            Spacer(Modifier.height(4.dp))
+            Text("This is the name shown when others add you or get your messages.", fontSize = 11.sp, color = Sub, textAlign = TextAlign.Center)
+            Spacer(Modifier.height(8.dp))
+            Row(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Color(0xFFF1F4F7)).padding(horizontal = 14.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(Modifier.weight(1f)) {
+                    if (myName.isEmpty()) Text("your name", color = Sub, fontSize = 15.sp)
+                    BasicTextField(
+                        value = myName,
+                        onValueChange = { myName = it },
+                        singleLine = true,
+                        textStyle = TextStyle(color = Ink, fontSize = 15.sp),
+                        cursorBrush = Brush.verticalGradient(listOf(Blue, Blue)),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            }
+            Spacer(Modifier.height(10.dp))
+            Box(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                    .background(if (myName.isNotBlank() && myName != name) Blue else Color(0xFFCBD3DA))
+                    .clickable(enabled = myName.isNotBlank() && myName != name) { onSaveName(myName) }
+                    .padding(vertical = 14.dp),
+                contentAlignment = Alignment.Center,
+            ) { Text("Save name", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold) }
+
             Spacer(Modifier.height(18.dp))
             Text("WCAHT identity address", fontSize = 12.sp, color = Sub)
             Spacer(Modifier.height(2.dp))
@@ -822,6 +1037,7 @@ private fun ConversationScreen(
     myDeviceSeed: String,
     myDevicePub: String,
     myIdentitySeed: String,
+    myCard: String,
     store: Store,
     onBack: () -> Unit,
 ) {
@@ -911,7 +1127,7 @@ private fun ConversationScreen(
                 // seal + SHIP over the relay + gateways; the recipient's device polls + opens.
                 val ok = runCatching {
                     withContext(Dispatchers.IO) {
-                        val ship = JSONObject(SealCore.sealShippable(myIdentitySeed, chat.devicePub, text, fast))
+                        val ship = JSONObject(SealCore.sealShippable(myIdentitySeed, myCard, chat.devicePub, text, fast))
                         if (!ship.optBoolean("ok")) return@withContext false
                         shipSeal(ship)
                         true

@@ -4,6 +4,7 @@ import AVFoundation
 import UIKit
 import Contacts
 import ContactsUI
+import UserNotifications
 
 // ─────────────────────────────── palette ────────────────────────────────────
 extension Color {
@@ -37,7 +38,7 @@ private func nowTime() -> String {
 }
 
 // ─────────────────────────────── models ─────────────────────────────────────
-struct Chat: Identifiable { let id = UUID(); let name: String; let last: String; let time: String; var unread: Int = 0; var devicePub: String = ""; var identityPub: String = "" }
+struct Chat: Identifiable { let id = UUID(); let name: String; let last: String; let time: String; var unread: Int = 0; var devicePub: String = ""; var identityPub: String = ""; var isContact: Bool = false }
 enum Kind { case text, image, voice }
 enum MsgState { case plain, sealing, opened }
 struct Msg: Identifiable {
@@ -87,6 +88,41 @@ enum Store {
             d.set(s, forKey: "contacts")
         }
     }
+    /// Add a contact parsed from a card (from an inbound message) unless one with the same
+    /// identity_pub already exists. Returns true if it was newly added.
+    @discardableResult
+    static func addContactFromCard(_ card: [String: Any]) -> Bool {
+        let idp = card["identity_pub"] as? String ?? ""
+        var a = contacts()
+        if !idp.isEmpty, a.contains(where: { ($0["identity_pub"] as? String) == idp }) { return false }
+        a.append([
+            "name": card["name"] as? String ?? "Contact",
+            "address": card["address"] as? String ?? "",
+            "device_pub": card["device_pub"] as? String ?? "",
+            "identity_pub": idp,
+        ])
+        if let out = try? JSONSerialization.data(withJSONObject: a), let s = String(data: out, encoding: .utf8) {
+            d.set(s, forKey: "contacts")
+        }
+        return true
+    }
+    /// Remove a saved contact (match by identity_pub when present, else by name).
+    static func removeContact(identityPub: String, name: String) {
+        var a = contacts()
+        a.removeAll { o in
+            if !identityPub.isEmpty { return (o["identity_pub"] as? String) == identityPub }
+            return (o["name"] as? String) == name
+        }
+        if let out = try? JSONSerialization.data(withJSONObject: a), let s = String(data: out, encoding: .utf8) {
+            d.set(s, forKey: "contacts")
+        }
+    }
+
+    // Demo placeholder chats aren't real contacts — hide them by name.
+    static func hiddenChats() -> Set<String> { Set(d.stringArray(forKey: "hidden_chats") ?? []) }
+    static func hideChat(_ name: String) {
+        var s = hiddenChats(); s.insert(name); d.set(Array(s), forKey: "hidden_chats")
+    }
 
     // received messages, persisted + deduped per mailbox tag (all my inbound share my tag).
     static func inbox(_ tag: String) -> [[String: Any]] {
@@ -103,6 +139,15 @@ enum Store {
             d.set(s, forKey: "inbox_\(tag)")
         }
         return true
+    }
+    /// Drop every received message from a given sender (used when deleting that conversation).
+    static func clearInbox(tag: String, sender: String) {
+        guard !tag.isEmpty else { return }
+        var a = inbox(tag)
+        a.removeAll { ($0["sender"] as? String) == sender }
+        if let out = try? JSONSerialization.data(withJSONObject: a), let s = String(data: out, encoding: .utf8) {
+            d.set(s, forKey: "inbox_\(tag)")
+        }
     }
 }
 
@@ -228,15 +273,56 @@ func collectShares(_ sealId: String) async -> String {
     return "[]"
 }
 
+// ── local notifications for inbound messages ──
+// The delegate lets notifications show as a banner even while the app is foregrounded
+// (the poller runs in-app), matching Android's heads-up behaviour.
+final class NotifDelegate: NSObject, UNUserNotificationCenterDelegate {
+    static let shared = NotifDelegate()
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
+    }
+}
+func requestNotifs() {
+    UNUserNotificationCenter.current().delegate = NotifDelegate.shared
+    UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
+}
+func notifyMessage(_ title: String, _ body: String) {
+    let c = UNMutableNotificationContent()
+    c.title = title; c.body = body; c.sound = .default
+    UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
+}
+
 // ─────────────────────────────── root nav ───────────────────────────────────
 struct ContentView: View {
     @State private var identity: [String: Any] = loadOrCreateIdentity()
     @State private var contacts: [Contact] = loadContacts()
+    @State private var hidden: Set<String> = Store.hiddenChats()
     @State private var openChat: Chat? = nil
     @State private var tab = 0
     @State private var showNew = false
     @State private var showScanner = false
     @State private var scanned: [String: Any]? = nil
+    @State private var seenGlobal = Set<String>()
+
+    /// My own inbox tag — every seal addressed to me lands here; also purged when I delete a chat.
+    private func myMailboxTag() -> String {
+        let dp = identity["device_pub"] as? String ?? ""
+        guard !dp.isEmpty else { return "" }
+        let j = SealCore.mailboxTag(dp)
+        return ((try? JSONSerialization.jsonObject(with: Data(j.utf8))) as? [String: Any])?["mailbox_tag"] as? String ?? ""
+    }
+
+    private func deleteChat(_ c: Chat) {
+        if c.isContact {
+            Store.removeContact(identityPub: c.identityPub, name: c.name)
+            Store.clearInbox(tag: myMailboxTag(), sender: c.identityPub)
+            contacts = loadContacts()
+        } else {
+            Store.hideChat(c.name)
+            hidden = Store.hiddenChats()
+        }
+    }
 
     private func saveContact(_ first: String, _ last: String, _ phone: String) {
         let nm = [first, last].filter { !$0.isEmpty }.joined(separator: " ")
@@ -246,13 +332,77 @@ struct ContentView: View {
             c["address"] = s["address"] ?? ""
             c["device_pub"] = s["device_pub"] ?? ""
             c["identity_pub"] = s["identity_pub"] ?? ""
-            c["identity_pub"] = s["identity_pub"] ?? ""
         }
         if let data = try? JSONSerialization.data(withJSONObject: c), let json = String(data: data, encoding: .utf8) {
             Store.addContact(json)
             contacts = loadContacts()
         }
+        // tell the other side they were added (they'll get a real inbound → chat + notification)
+        if let dp = scanned?["device_pub"] as? String, !dp.isEmpty { sendHello(to: dp) }
         showNew = false; scanned = nil
+    }
+
+    /// Ship a small "added you" hello so the peer's device surfaces the chat + a notification.
+    private func sendHello(to devicePub: String) {
+        let seed = identity["identity_seed"] as? String ?? ""
+        let card = identity["card"] as? String ?? ""
+        let myName = (identity["name"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "Someone"
+        Task.detached {
+            let shipStr = SealCore.sealShippable(seed, card, devicePub, "👋 \(myName) added you on Denvion", false)
+            if let ship = (try? JSONSerialization.jsonObject(with: Data(shipStr.utf8))) as? [String: Any], (ship["ok"] as? Bool) == true {
+                await shipSeal(ship)
+            }
+        }
+    }
+
+    /// Rebuild my card under a new display name (identity_pub/address stay stable) and persist it.
+    private func saveName(_ newName: String) {
+        let nm = newName.trimmingCharacters(in: .whitespaces).isEmpty ? "Me" : newName.trimmingCharacters(in: .whitespaces)
+        let rebuilt = SealCore.cardFor(identity["identity_seed"] as? String ?? "", identity["device_seed"] as? String ?? "", nm)
+        guard let r = (try? JSONSerialization.jsonObject(with: Data(rebuilt.utf8))) as? [String: Any] else { return }
+        var id = identity
+        id["name"] = nm
+        id["card"] = r["card"] ?? id["card"] ?? ""
+        id["address"] = r["address"] ?? id["address"] ?? ""
+        if let data = try? JSONSerialization.data(withJSONObject: id), let json = String(data: data, encoding: .utf8) {
+            Store.saveIdentity(json)
+            identity = id
+        }
+    }
+
+    /// Always-on inbox poll while NOT in a conversation: receive even when the chat isn't open,
+    /// auto-create the sender as a replyable contact (from the embedded card), store + notify.
+    @MainActor private func globalPoll() async {
+        let tag = myMailboxTag()
+        guard openChat == nil, !tag.isEmpty else { return }
+        for o in Store.inbox(tag) { if let id = o["id"] as? String { seenGlobal.insert(id) } }
+        while !Task.isCancelled {
+            let deviceSeed = identity["device_seed"] as? String ?? ""
+            for item in await fetchInboxAll(tag) {
+                guard let sealId = item["seal_id"] as? String, !sealId.isEmpty, !seenGlobal.contains(sealId),
+                      let bundle = item["bundle"],
+                      let bd = try? JSONSerialization.data(withJSONObject: bundle),
+                      let bundleStr = String(data: bd, encoding: .utf8) else { continue }
+                let shares = await collectShares(sealId)
+                let openStr = SealCore.openReceived(deviceSeed, bundleStr, shares)
+                if let r = (try? JSONSerialization.jsonObject(with: Data(openStr.utf8))) as? [String: Any],
+                   (r["ok"] as? Bool) == true, let plain = r["plaintext"] as? String {
+                    seenGlobal.insert(sealId)
+                    let bmap = item["bundle"] as? [String: Any]
+                    let sender = bmap?["sender_id_pub"] as? String ?? ""
+                    var senderName = "New message"
+                    if let cardCode = bmap?["sender_card"] as? String, !cardCode.isEmpty {
+                        let parsed = SealCore.parseCard(cardCode)
+                        if let pj = (try? JSONSerialization.jsonObject(with: Data(parsed.utf8))) as? [String: Any], (pj["ok"] as? Bool) == true {
+                            if let n = pj["name"] as? String, !n.isEmpty { senderName = n }
+                            if Store.addContactFromCard(pj) { contacts = loadContacts() }
+                        }
+                    }
+                    if Store.addInbox(tag, sealId, plain, sender) { notifyMessage(senderName, plain) }
+                }
+            }
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+        }
     }
 
     var body: some View {
@@ -263,6 +413,7 @@ struct ContentView: View {
                     myDeviceSeed: identity["device_seed"] as? String ?? "",
                     myDevicePub: identity["device_pub"] as? String ?? "",
                     myIdentitySeed: identity["identity_seed"] as? String ?? "",
+                    myCard: identity["card"] as? String ?? "",
                     onBack: { openChat = nil }
                 )
             } else if showNew {
@@ -280,7 +431,7 @@ struct ContentView: View {
                     onSave: saveContact
                 )
             } else if tab == 2 {
-                ProfileView(identity: identity, tab: tab, onTab: { tab = $0 }, onPublish: { phone in
+                ProfileView(identity: identity, tab: tab, onTab: { tab = $0 }, onSaveName: { saveName($0) }, onPublish: { phone in
                     var id = identity
                     id["phone"] = phone
                     if let data = try? JSONSerialization.data(withJSONObject: id), let json = String(data: data, encoding: .utf8) {
@@ -291,7 +442,7 @@ struct ContentView: View {
                     Task { _ = await directoryPublish(phone, card) }
                 })
             } else {
-                ChatListView(contacts: contacts, onOpen: { openChat = $0 }, onAdd: { showNew = true; scanned = nil }, tab: tab, onTab: { tab = $0 })
+                ChatListView(contacts: contacts, hidden: hidden, onOpen: { openChat = $0 }, onAdd: { showNew = true; scanned = nil }, onDelete: deleteChat, tab: tab, onTab: { tab = $0 })
             }
         }
         .fullScreenCover(isPresented: $showScanner) {
@@ -306,22 +457,28 @@ struct ContentView: View {
                 onClose: { showScanner = false }
             )
         }
+        .onAppear { requestNotifs() }
+        // run the always-on inbox poll whenever we're NOT inside a conversation
+        .task(id: openChat == nil) { await globalPoll() }
     }
 }
 
 // ─────────────────────────────── chat list ──────────────────────────────────
 struct ChatListView: View {
     let contacts: [Contact]
+    let hidden: Set<String>
     let onOpen: (Chat) -> Void
     let onAdd: () -> Void
+    let onDelete: (Chat) -> Void
     let tab: Int
     let onTab: (Int) -> Void
+    @State private var pendingDelete: Chat? = nil
     var body: some View {
         let rows = contacts.map { c -> Chat in
             let sub = !c.address.isEmpty ? String(c.address.prefix(14)) + "… · tap to seal"
                 : (!c.phone.isEmpty ? "+855 " + c.phone : "tap to seal")
-            return Chat(name: c.name, last: sub, time: "", devicePub: c.devicePub, identityPub: c.identityPub)
-        } + CHATS
+            return Chat(name: c.name, last: sub, time: "", devicePub: c.devicePub, identityPub: c.identityPub, isContact: true)
+        } + CHATS.filter { !hidden.contains($0.name) }
         VStack(spacing: 0) {
             HStack(spacing: 8) {
                 Image(systemName: "shield.fill").foregroundColor(.white).font(.system(size: 20))
@@ -338,7 +495,11 @@ struct ChatListView: View {
                     LazyVStack(spacing: 0) {
                         ForEach(rows.indices, id: \.self) { i in
                             let c = rows[i]
-                            ChatRow(c).contentShape(Rectangle()).onTapGesture { onOpen(c) }
+                            ChatRow(c).contentShape(Rectangle())
+                                .onTapGesture { onOpen(c) }
+                                .contextMenu {
+                                    Button(role: .destructive) { pendingDelete = c } label: { Label("Delete Chat", systemImage: "trash") }
+                                }
                             Rectangle().fill(Color.dvHair).frame(height: 1).padding(.leading, 84)
                         }
                     }
@@ -353,6 +514,12 @@ struct ChatListView: View {
             BottomBar(tab: tab, onTab: onTab)
         }
         .background(Color.white)
+        .alert("Delete chat", isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } })) {
+            Button("Cancel", role: .cancel) { pendingDelete = nil }
+            Button("Delete", role: .destructive) { if let c = pendingDelete { onDelete(c) }; pendingDelete = nil }
+        } message: {
+            Text("Delete your conversation with \(pendingDelete?.name ?? "")? This removes it from this device.")
+        }
     }
 }
 
@@ -418,8 +585,10 @@ struct ProfileView: View {
     let identity: [String: Any]
     let tab: Int
     let onTab: (Int) -> Void
+    let onSaveName: (String) -> Void
     let onPublish: (String) -> Void
     @State private var myPhone: String = ""
+    @State private var myName: String = ""
     @State private var host: String = Server.host
     var body: some View {
         let name = identity["name"] as? String ?? "Me"
@@ -438,6 +607,24 @@ struct ProfileView: View {
                 VStack(spacing: 14) {
                     Avatar(name, 76)
                     Text(name).font(.system(size: 20, weight: .semibold)).foregroundColor(.dvInk)
+
+                    VStack(spacing: 6) {
+                        Text("Your display name").font(.system(size: 13)).foregroundColor(.dvSub)
+                        Text("This is the name shown when others add you or get your messages.")
+                            .font(.system(size: 11)).foregroundColor(.dvSub).multilineTextAlignment(.center)
+                        TextField("your name", text: $myName)
+                            .textInputAutocapitalization(.words).foregroundColor(.dvInk).multilineTextAlignment(.center)
+                            .padding(12).background(Color(hex: 0xF1F4F7)).clipShape(RoundedRectangle(cornerRadius: 12))
+                        Button(action: { onSaveName(myName) }) {
+                            Text("Save name")
+                                .font(.system(size: 15, weight: .semibold)).foregroundColor(.white)
+                                .frame(maxWidth: .infinity).padding(.vertical, 14)
+                                .background(myName.trimmingCharacters(in: .whitespaces).isEmpty || myName == name ? Color(hex: 0xCBD3DA) : Color.dvBlue)
+                                .clipShape(RoundedRectangle(cornerRadius: 12))
+                        }.disabled(myName.trimmingCharacters(in: .whitespaces).isEmpty || myName == name)
+                    }
+                    .onAppear { if myName.isEmpty { myName = name } }
+
                     VStack(spacing: 2) {
                         Text("WCAHT identity address").font(.system(size: 12)).foregroundColor(.dvSub)
                         Text(address).font(.system(size: 13)).foregroundColor(.dvBlue)
@@ -706,6 +893,7 @@ struct ConversationView: View {
     let myDeviceSeed: String
     let myDevicePub: String
     let myIdentitySeed: String
+    let myCard: String
     let onBack: () -> Void
     @State private var messages: [Msg] = []
     @State private var draft = ""
@@ -840,7 +1028,7 @@ struct ConversationView: View {
             if real {
                 // seal + SHIP over the relay + gateways; the recipient's device polls + opens.
                 var ok = false
-                let shipStr = SealCore.sealShippable(myIdentitySeed, chat.devicePub, text, fast)
+                let shipStr = SealCore.sealShippable(myIdentitySeed, myCard, chat.devicePub, text, fast)
                 if let ship = (try? JSONSerialization.jsonObject(with: Data(shipStr.utf8))) as? [String: Any], (ship["ok"] as? Bool) == true {
                     await shipSeal(ship)
                     ok = true

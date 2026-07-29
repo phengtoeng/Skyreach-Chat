@@ -93,7 +93,10 @@ fn seal_to_json(device_pub_hex: &str, text: &str, fast: bool) -> String {
 /// Seal `text` to a device and return the artifacts to SHIP over the services:
 /// the ciphertext `bundle` (→ delivery relay, keyed by `mailbox_tag`) and the `shares`
 /// (one → each gateway). This is real cross-device delivery, not an in-process demo.
-fn seal_shippable_json(identity_seed_hex: &str, device_pub_hex: &str, text: &str, fast: bool) -> String {
+///
+/// `sender_card` is the SENDER's own contact card, embedded in the bundle so the recipient
+/// can identify the sender and REPLY without a prior manual add (self-describing message).
+fn seal_shippable_json(identity_seed_hex: &str, sender_card: &str, device_pub_hex: &str, text: &str, fast: bool) -> String {
     let dp: Option<[u8; 32]> = hex::decode(device_pub_hex.trim()).ok().and_then(|v| v.try_into().ok());
     let Some(device_pub) = dp else {
         return json!({ "ok": false, "error": "bad device pubkey" }).to_string();
@@ -113,6 +116,7 @@ fn seal_shippable_json(identity_seed_hex: &str, device_pub_hex: &str, text: &str
         "envelope": serde_json::to_value(&item.envelope).unwrap_or(Value::Null),
         "signed_leaf": serde_json::to_value(&item.signed_leaf).unwrap_or(Value::Null),
         "sender_id_pub": hex::encode(sender_id.public()),
+        "sender_card": sender_card,
     });
     let shares: Vec<Value> = item.share_envelopes.iter().filter_map(|s| serde_json::to_value(s).ok()).collect();
     json!({
@@ -281,8 +285,8 @@ pub unsafe extern "C" fn ss_seal_to(device_pub: *const c_char, text: *const c_ch
 /// # Safety
 /// `identity_seed`, `device_pub` and `text` must be null or valid NUL-terminated C strings.
 #[no_mangle]
-pub unsafe extern "C" fn ss_seal_shippable(identity_seed: *const c_char, device_pub: *const c_char, text: *const c_char, fast: i32) -> *mut c_char {
-    to_c(seal_shippable_json(&cstr(identity_seed), &cstr(device_pub), &cstr(text), fast != 0))
+pub unsafe extern "C" fn ss_seal_shippable(identity_seed: *const c_char, sender_card: *const c_char, device_pub: *const c_char, text: *const c_char, fast: i32) -> *mut c_char {
+    to_c(seal_shippable_json(&cstr(identity_seed), &cstr(sender_card), &cstr(device_pub), &cstr(text), fast != 0))
 }
 
 /// Open a collected message: `{ ok, plaintext }` or `{ ok:false, reason }`.
@@ -573,14 +577,16 @@ pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeSealShippable<'
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     identity_seed: JString<'local>,
+    sender_card: JString<'local>,
     device_pub: JString<'local>,
     text: JString<'local>,
     fast: jni::sys::jboolean,
 ) -> jstring {
     let is = jstr(&mut env, &identity_seed);
+    let sc = jstr(&mut env, &sender_card);
     let dp = jstr(&mut env, &device_pub);
     let t = jstr(&mut env, &text);
-    ret(env, seal_shippable_json(&is, &dp, &t, fast != 0))
+    ret(env, seal_shippable_json(&is, &sc, &dp, &t, fast != 0))
 }
 
 #[no_mangle]
@@ -632,7 +638,7 @@ mod tests {
             let _ = mailbox_tag_json(s);
             let _ = phone_commitment_json(s);
             let _ = seal_to_json(s, s, false);
-            let _ = seal_shippable_json(s, s, s, true);
+            let _ = seal_shippable_json(s, s, s, s, true);
             let _ = card_for_json(s, s, s);
             let _ = open_received_json(s, s, s);
         }
@@ -651,7 +657,8 @@ mod tests {
 
         // ...and equal to the tag the SENDER ships to, so polling it receives the seal.
         let seed = bob["identity_seed"].as_str().unwrap();
-        let ship: Value = serde_json::from_str(&seal_shippable_json(seed, device_pub, "hi", false)).unwrap();
+        let card = bob["card"].as_str().unwrap();
+        let ship: Value = serde_json::from_str(&seal_shippable_json(seed, card, device_pub, "hi", false)).unwrap();
         assert_eq!(ship["ok"], true);
         assert_eq!(ship["mailbox_tag"], t1["mailbox_tag"]);
 
@@ -669,10 +676,16 @@ mod tests {
         let device_seed = bob["device_seed"].as_str().unwrap();
         let alice: Value = serde_json::from_str(&new_identity_json("Alice")).unwrap();
         let alice_seed = alice["identity_seed"].as_str().unwrap();
+        let alice_card = alice["card"].as_str().unwrap();
 
-        let ship: Value = serde_json::from_str(&seal_shippable_json(alice_seed, device_pub, "meet at 9", false)).unwrap();
+        let ship: Value = serde_json::from_str(&seal_shippable_json(alice_seed, alice_card, device_pub, "meet at 9", false)).unwrap();
         // attribution: the bundle names ALICE's stable identity as the sender.
         assert_eq!(ship["bundle"]["sender_id_pub"], alice["identity_pub"]);
+        // self-describing: the bundle carries Alice's card so Bob can reply without adding her first.
+        let parsed: Value = serde_json::from_str(&parse_card_json(ship["bundle"]["sender_card"].as_str().unwrap())).unwrap();
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["identity_pub"], alice["identity_pub"]);
+        assert_eq!(parsed["device_pub"], alice["device_pub"]);
         let bundle = ship["bundle"].to_string();
         let shares = ship["shares"].to_string();
 

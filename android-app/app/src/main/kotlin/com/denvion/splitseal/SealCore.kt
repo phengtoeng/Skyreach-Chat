@@ -18,7 +18,7 @@ object SealCore {
     private external fun nativePhoneCommitment(phone: String): String
     private external fun nativeMailboxTag(devicePub: String): String
     private external fun nativeSealTo(devicePub: String, text: String, fast: Boolean): String
-    private external fun nativeSealShippable(identitySeed: String, devicePub: String, text: String, fast: Boolean): String
+    private external fun nativeSealShippable(identitySeed: String, senderCard: String, devicePub: String, text: String, fast: Boolean): String
     private external fun nativeOpenReceived(deviceSeed: String, bundle: String, shares: String): String
 
     /** `{ "protocol":"DSCP-2", "version":2, "chain_id":7789 }` */
@@ -48,9 +48,10 @@ object SealCore {
     /** Seal text to a contact's device pubkey (hex). Returns {ok, seal_id, recipient_device_commitment, ciphertext_len}. */
     fun sealTo(devicePub: String, text: String, fast: Boolean): String = nativeSealTo(devicePub, text, fast)
 
-    /** Seal (signed by MY identitySeed so it's attributable) + return {ok, seal_id, mailbox_tag, bundle, shares}. */
-    fun sealShippable(identitySeed: String, devicePub: String, text: String, fast: Boolean): String =
-        nativeSealShippable(identitySeed, devicePub, text, fast)
+    /** Seal (signed by MY identitySeed, with MY card embedded so the peer can reply) + return
+     *  {ok, seal_id, mailbox_tag, bundle, shares}. bundle.sender_card = senderCard. */
+    fun sealShippable(identitySeed: String, senderCard: String, devicePub: String, text: String, fast: Boolean): String =
+        nativeSealShippable(identitySeed, senderCard, devicePub, text, fast)
 
     /** Open a collected message with the recipient's device seed. Returns {ok, plaintext} or {ok:false, reason}. */
     fun openReceived(deviceSeed: String, bundle: String, shares: String): String = nativeOpenReceived(deviceSeed, bundle, shares)
