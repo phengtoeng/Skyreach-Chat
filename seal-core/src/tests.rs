@@ -567,3 +567,23 @@ fn i_can_seal_to_a_contact_i_added_from_their_card() {
     assert_eq!(item.signed_leaf.leaf.recipient_device_commitment, device_commitment(&bob_card.device_pub));
     assert_eq!(bob_card.address(), bob.address());
 }
+
+#[test]
+fn phone_directory_resolves_number_to_address_without_storing_the_number() {
+    let bob = Identity::generate("Bob");
+    let dir = MockDirectory::new();
+    dir.register("+1 (555) 123-4567", bob.card());
+
+    // a differently-formatted SAME number resolves to Bob's address + device key
+    let found = dir.lookup("1 555 123 4567").expect("resolves");
+    assert_eq!(found.address(), bob.address());
+    assert_eq!(found.device_pub, bob.device_pub());
+
+    // an unknown number does not resolve
+    assert!(dir.lookup("+1 999 000 0000").is_none());
+
+    // the directory key is a hash of the normalized number — same number, same key
+    assert_eq!(phone_commitment("+1 555-123-4567"), phone_commitment("15551234567"));
+    // different numbers → different keys
+    assert_ne!(phone_commitment("+15551234567"), phone_commitment("+15559999999"));
+}

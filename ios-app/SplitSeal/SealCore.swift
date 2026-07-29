@@ -28,6 +28,11 @@ enum SealCore {
         code.withCString { copy(ss_parse_card($0)) }
     }
 
+    /// Directory key for a phone number: {normalized, phone_commitment}. hash(phone) → address (off-chain).
+    static func phoneCommitment(_ phone: String) -> String {
+        phone.withCString { copy(ss_phone_commitment($0)) }
+    }
+
     /// Copy a Rust-owned C string into a Swift String and free the original.
     private static func copy(_ ptr: UnsafeMutablePointer<CChar>?) -> String {
         guard let ptr = ptr else { return "{}" }

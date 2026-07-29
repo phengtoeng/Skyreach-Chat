@@ -110,7 +110,7 @@ private fun seedThread(): List<Msg> = listOf(
 )
 
 // ─────────────────────── identity + contacts (persisted) ────────────────────
-private data class Contact(val name: String, val address: String, val devicePub: String)
+private data class Contact(val name: String, val address: String, val devicePub: String, val phone: String)
 
 private class Store(ctx: Context) {
     private val p = ctx.getSharedPreferences("denvion", Context.MODE_PRIVATE)
@@ -133,7 +133,7 @@ private fun loadContacts(store: Store): List<Contact> {
     val a = store.contacts()
     return (0 until a.length()).map {
         val o = a.getJSONObject(it)
-        Contact(o.optString("name"), o.optString("address"), o.optString("device_pub"))
+        Contact(o.optString("name"), o.optString("address"), o.optString("device_pub"), o.optString("phone"))
     }
 }
 
@@ -179,24 +179,14 @@ private fun App(proto: String) {
     var contacts by remember { mutableStateOf(loadContacts(store)) }
     var openChat by remember { mutableStateOf<Chat?>(null) }
     var tab by remember { mutableStateOf(0) }
-    var showAdd by remember { mutableStateOf(false) }
-
-    fun addByCode(code: String): String? {
-        val res = JSONObject(SealCore.parseCard(code))
-        return if (res.optBoolean("ok")) {
-            store.addContact(res)
-            contacts = loadContacts(store)
-            null
-        } else {
-            res.optString("error", "invalid code")
-        }
-    }
+    var showNew by remember { mutableStateOf(false) }
+    var scanned by remember { mutableStateOf<JSONObject?>(null) }
 
     val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
         result.contents?.let { code ->
-            val err = addByCode(code)
-            if (err == null) showAdd = false
-            else android.widget.Toast.makeText(ctx, err, android.widget.Toast.LENGTH_SHORT).show()
+            val res = JSONObject(SealCore.parseCard(code))
+            if (res.optBoolean("ok")) scanned = res
+            else android.widget.Toast.makeText(ctx, res.optString("error", "invalid code"), android.widget.Toast.LENGTH_SHORT).show()
         }
     }
     fun launchScan() {
@@ -213,25 +203,31 @@ private fun App(proto: String) {
     val chat = openChat
     when {
         chat != null -> ConversationScreen(chat) { openChat = null }
+        showNew -> NewContactScreen(
+            scanned = scanned,
+            onScan = { launchScan() },
+            onCancel = { showNew = false; scanned = null },
+            onSave = { first, last, phone ->
+                val nm = listOf(first, last).filter { it.isNotBlank() }.joinToString(" ")
+                    .ifBlank { scanned?.optString("name") ?: "Contact" }
+                val c = JSONObject().put("name", nm).put("phone", phone)
+                scanned?.let {
+                    c.put("address", it.optString("address"))
+                        .put("device_pub", it.optString("device_pub"))
+                        .put("identity_pub", it.optString("identity_pub"))
+                }
+                store.addContact(c)
+                contacts = loadContacts(store)
+                showNew = false; scanned = null
+            },
+        )
         tab == 2 -> ProfileScreen(identity, tab) { tab = it }
         else -> ChatListScreen(
             contacts = contacts,
             onOpen = { openChat = it },
-            onAdd = { showAdd = true },
+            onAdd = { showNew = true; scanned = null },
             tab = tab,
             onTab = { tab = it },
-        )
-    }
-
-    if (showAdd) {
-        AddContactDialog(
-            onDismiss = { showAdd = false },
-            onScan = { launchScan() },
-            onSubmit = { code ->
-                val err = addByCode(code)
-                if (err == null) showAdd = false
-                err
-            },
         )
     }
 }
@@ -246,8 +242,15 @@ private fun ChatListScreen(
     onTab: (Int) -> Unit,
 ) {
     SystemBars(Blue, darkIcons = false)
-    // real contacts first (address as subtitle), then the demo threads
-    val rows = contacts.map { Chat(it.name, it.address.take(14) + "… · tap to seal", "") } + CHATS
+    // real contacts first (address / phone as subtitle), then the demo threads
+    val rows = contacts.map {
+        val sub = when {
+            it.address.isNotBlank() -> it.address.take(14) + "… · tap to seal"
+            it.phone.isNotBlank() -> "+855 " + it.phone
+            else -> "tap to seal"
+        }
+        Chat(it.name, sub, "")
+    } + CHATS
     Column(Modifier.fillMaxSize().background(ScreenBg)) {
         Row(
             Modifier.fillMaxWidth().background(Blue).padding(horizontal = 16.dp, vertical = 14.dp),
@@ -390,37 +393,112 @@ private fun ProfileScreen(identity: JSONObject, tab: Int, onTab: (Int) -> Unit) 
 }
 
 @Composable
-private fun AddContactDialog(onDismiss: () -> Unit, onScan: () -> Unit, onSubmit: (String) -> String?) {
-    var code by remember { mutableStateOf("") }
-    var error by remember { mutableStateOf<String?>(null) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Add contact") },
-        text = {
-            Column {
-                OutlinedButton(onClick = onScan, modifier = Modifier.fillMaxWidth()) {
-                    Icon(Icons.Filled.QrCodeScanner, null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(8.dp))
-                    Text("Scan QR code")
+private fun NewContactScreen(
+    scanned: JSONObject?,
+    onScan: () -> Unit,
+    onCancel: () -> Unit,
+    onSave: (String, String, String) -> Unit,
+) {
+    val bg = Color(0xFFF2F3F5)
+    SystemBars(bg, darkIcons = true)
+    var first by remember(scanned) { mutableStateOf(scanned?.optString("name") ?: "") }
+    var last by remember { mutableStateOf("") }
+    var phone by remember { mutableStateOf("") }
+    var sync by remember { mutableStateOf(true) }
+    val canSave = first.isNotBlank() || scanned != null
+
+    Column(Modifier.fillMaxSize().background(bg)) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                Modifier.size(36.dp).clip(CircleShape).background(Color.White).clickable(onClick = onCancel),
+                contentAlignment = Alignment.Center,
+            ) { Icon(Icons.Filled.Close, "Cancel", tint = Ink, modifier = Modifier.size(20.dp)) }
+            Spacer(Modifier.weight(1f))
+            Text("New Contact", fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = Ink)
+            Spacer(Modifier.weight(1f))
+            Box(
+                Modifier.size(36.dp).clip(CircleShape).background(if (canSave) Blue else Color(0xFFCBD3DA))
+                    .clickable(enabled = canSave) { onSave(first.trim(), last.trim(), phone.trim()) },
+                contentAlignment = Alignment.Center,
+            ) { Icon(Icons.Filled.Check, "Save", tint = Color.White, modifier = Modifier.size(20.dp)) }
+        }
+
+        Column(Modifier.verticalScroll(rememberScrollState()).padding(16.dp)) {
+            Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color.White).padding(horizontal = 16.dp)) {
+                FormField("First Name", first) { first = it }
+                Box(Modifier.fillMaxWidth().height(1.dp).background(Hair))
+                FormField("Last Name", last) { last = it }
+            }
+            Spacer(Modifier.height(18.dp))
+
+            Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color.White)) {
+                Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("🇰🇭  Cambodia", color = Ink, fontSize = 16.sp)
+                    Spacer(Modifier.weight(1f))
+                    Icon(Icons.Filled.ChevronRight, null, tint = Sub)
                 }
-                Spacer(Modifier.height(12.dp))
-                Text("…or paste their Denvion code.", fontSize = 13.sp, color = Sub)
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = code,
-                    onValueChange = { code = it; error = null },
-                    placeholder = { Text("denvion:…") },
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                error?.let {
-                    Spacer(Modifier.height(6.dp))
-                    Text(it, color = Color(0xFFD9534F), fontSize = 12.sp)
+                Box(Modifier.padding(start = 16.dp).fillMaxWidth().height(1.dp).background(Hair))
+                Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("+855", color = Ink, fontSize = 16.sp)
+                    Spacer(Modifier.width(16.dp))
+                    Box(Modifier.weight(1f)) {
+                        if (phone.isEmpty()) Text("00 000 0000", color = Sub, fontSize = 16.sp)
+                        BasicTextField(
+                            value = phone,
+                            onValueChange = { phone = it.filter { c -> c.isDigit() || c == ' ' } },
+                            textStyle = TextStyle(color = Ink, fontSize = 16.sp),
+                            cursorBrush = Brush.verticalGradient(listOf(Blue, Blue)),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
                 }
             }
-        },
-        confirmButton = { TextButton(onClick = { error = onSubmit(code.trim()) }) { Text("Add") } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-    )
+            Spacer(Modifier.height(18.dp))
+
+            Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color.White).padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("Sync Contact to Phone", color = Ink, fontSize = 16.sp)
+                Spacer(Modifier.weight(1f))
+                Switch(checked = sync, onCheckedChange = { sync = it })
+            }
+            Spacer(Modifier.height(18.dp))
+
+            Row(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color.White).clickable(onClick = onScan).padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(Icons.Filled.QrCode2, null, tint = Blue)
+                Spacer(Modifier.width(12.dp))
+                Text("Add via QR Code", color = Blue, fontSize = 16.sp)
+            }
+
+            if (scanned != null) {
+                Spacer(Modifier.height(16.dp))
+                Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color(0xFFE9F7EE)).padding(16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Filled.CheckCircle, null, tint = Green, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Linked to WCAHT address", color = Ink, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    Text(scanned.optString("address"), color = Blue, fontSize = 12.sp)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FormField(placeholder: String, value: String, onChange: (String) -> Unit) {
+    Box(Modifier.fillMaxWidth().padding(vertical = 15.dp)) {
+        if (value.isEmpty()) Text(placeholder, color = Sub, fontSize = 16.sp)
+        BasicTextField(
+            value = value,
+            onValueChange = onChange,
+            textStyle = TextStyle(color = Ink, fontSize = 16.sp),
+            cursorBrush = Brush.verticalGradient(listOf(Blue, Blue)),
+            modifier = Modifier.fillMaxWidth(),
+        )
+    }
 }
 
 // ────────────────────────────── conversation ────────────────────────────────

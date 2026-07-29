@@ -288,6 +288,44 @@ impl ContactCard {
     }
 }
 
+// ───────────────── phone ↔ address directory (privacy-preserving) ───────────
+
+/// Normalize a phone number to its digits (dropping `+`, spaces, and punctuation), so
+/// different formattings of the same number map to the same commitment. Numbers should
+/// include the country code (E.164), e.g. `+1 555 123 4567` and `15551234567` are equal.
+pub fn normalize_phone(raw: &str) -> String {
+    raw.chars().filter(|c| c.is_ascii_digit()).collect()
+}
+
+/// A privacy-preserving commitment to a phone number. This — never the raw number and
+/// never anything on-chain — is the directory key that resolves to a WCAHT address.
+pub fn phone_commitment(phone: &str) -> [u8; 32] {
+    sc::hash("DSCP-2/phone", normalize_phone(phone).as_bytes())
+}
+
+/// Off-chain phone directory: maps a phone COMMITMENT to the owner's contact card
+/// (address + device key). The raw number is never stored and never goes on-chain. The
+/// production directory is a registered service (SMS proof-of-ownership + a signed
+/// binding); this mock demonstrates the resolution.
+#[derive(Default)]
+pub struct MockDirectory {
+    by_phone: std::sync::Mutex<HashMap<[u8; 32], ContactCard>>,
+}
+
+impl MockDirectory {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Publish `phone → your card`. Production requires SMS proof + your signature.
+    pub fn register(&self, phone: &str, card: ContactCard) {
+        self.by_phone.lock().unwrap().insert(phone_commitment(phone), card);
+    }
+    /// Resolve a phone number to its owner's card (address + device key), or `None`.
+    pub fn lookup(&self, phone: &str) -> Option<ContactCard> {
+        self.by_phone.lock().unwrap().get(&phone_commitment(phone)).cloned()
+    }
+}
+
 // ─────────────────────────── mock WCAHT seal chain ──────────────────────────
 
 /// Lifecycle exposed by RPC (spec §9.3). The client opens ONLY at `Finalised`.

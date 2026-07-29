@@ -29,6 +29,10 @@ char *ss_card_for(const char *identity_seed, const char *device_seed, const char
  *   { ok:true, name, address, identity_pub, device_pub }  or  { ok:false, error }. */
 char *ss_parse_card(const char *code);
 
+/* Privacy-preserving directory key for a phone number: { normalized, phone_commitment }.
+ * The raw number never goes on-chain; hash(phone) resolves to an address in the directory. */
+char *ss_phone_commitment(const char *phone);
+
 /* Free a string returned by any ss_* function. Safe on NULL. */
 void ss_free(char *ptr);
 

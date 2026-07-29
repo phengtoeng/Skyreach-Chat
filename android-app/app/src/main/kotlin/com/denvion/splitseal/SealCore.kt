@@ -15,6 +15,7 @@ object SealCore {
     private external fun nativeNewIdentity(name: String): String
     private external fun nativeCardFor(identitySeed: String, deviceSeed: String, name: String): String
     private external fun nativeParseCard(code: String): String
+    private external fun nativePhoneCommitment(phone: String): String
 
     /** `{ "protocol":"DSCP-2", "version":2, "chain_id":7789 }` */
     fun version(): String = nativeVersion()
@@ -33,4 +34,7 @@ object SealCore {
 
     /** Validate a scanned/pasted contact code. Returns {ok,name,address,identity_pub,device_pub} or {ok:false,error}. */
     fun parseCard(code: String): String = nativeParseCard(code)
+
+    /** Directory key for a phone number: {normalized, phone_commitment}. hash(phone) → address (off-chain). */
+    fun phoneCommitment(phone: String): String = nativePhoneCommitment(phone)
 }

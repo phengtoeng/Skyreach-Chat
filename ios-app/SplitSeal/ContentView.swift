@@ -63,7 +63,7 @@ private func seedThread() -> [Msg] {
 }
 
 // ─────────────────────── identity + contacts (persisted) ────────────────────
-struct Contact: Identifiable { let id = UUID(); let name: String; let address: String; let devicePub: String }
+struct Contact: Identifiable { let id = UUID(); let name: String; let address: String; let devicePub: String; let phone: String }
 
 enum Store {
     private static let d = UserDefaults.standard
@@ -94,7 +94,8 @@ func loadOrCreateIdentity() -> [String: Any] {
 }
 func loadContacts() -> [Contact] {
     Store.contacts().map {
-        Contact(name: $0["name"] as? String ?? "", address: $0["address"] as? String ?? "", devicePub: $0["device_pub"] as? String ?? "")
+        Contact(name: $0["name"] as? String ?? "", address: $0["address"] as? String ?? "",
+                devicePub: $0["device_pub"] as? String ?? "", phone: $0["phone"] as? String ?? "")
     }
 }
 
@@ -112,44 +113,47 @@ struct ContentView: View {
     @State private var contacts: [Contact] = loadContacts()
     @State private var openChat: Chat? = nil
     @State private var tab = 0
-    @State private var showAdd = false
+    @State private var showNew = false
     @State private var showScanner = false
+    @State private var scanned: [String: Any]? = nil
 
-    private func addByCode(_ code: String) -> String? {
-        let res = SealCore.parseCard(code)
-        let j = (try? JSONSerialization.jsonObject(with: Data(res.utf8))) as? [String: Any]
-        if (j?["ok"] as? Bool) == true {
-            Store.addContact(res)
-            contacts = loadContacts()
-            return nil
+    private func saveContact(_ first: String, _ last: String, _ phone: String) {
+        let nm = [first, last].filter { !$0.isEmpty }.joined(separator: " ")
+        let name = nm.isEmpty ? (scanned?["name"] as? String ?? "Contact") : nm
+        var c: [String: Any] = ["name": name, "phone": phone]
+        if let s = scanned {
+            c["address"] = s["address"] ?? ""
+            c["device_pub"] = s["device_pub"] ?? ""
+            c["identity_pub"] = s["identity_pub"] ?? ""
         }
-        return (j?["error"] as? String) ?? "invalid code"
+        if let data = try? JSONSerialization.data(withJSONObject: c), let json = String(data: data, encoding: .utf8) {
+            Store.addContact(json)
+            contacts = loadContacts()
+        }
+        showNew = false; scanned = nil
     }
 
     var body: some View {
         Group {
             if let c = openChat {
                 ConversationView(chat: c, onBack: { openChat = nil })
+            } else if showNew {
+                NewContactView(scanned: scanned, onScan: { showScanner = true }, onCancel: { showNew = false; scanned = nil }, onSave: saveContact)
             } else if tab == 2 {
                 ProfileView(identity: identity, tab: tab, onTab: { tab = $0 })
             } else {
-                ChatListView(contacts: contacts, onOpen: { openChat = $0 }, onAdd: { showAdd = true }, tab: tab, onTab: { tab = $0 })
+                ChatListView(contacts: contacts, onOpen: { openChat = $0 }, onAdd: { showNew = true; scanned = nil }, tab: tab, onTab: { tab = $0 })
             }
-        }
-        .sheet(isPresented: $showAdd) {
-            AddContactSheet(
-                onCancel: { showAdd = false },
-                onScan: { showAdd = false; showScanner = true },
-                onAdd: { code in
-                    let err = addByCode(code)
-                    if err == nil { showAdd = false }
-                    return err
-                }
-            )
         }
         .fullScreenCover(isPresented: $showScanner) {
             QRScannerView(
-                onFound: { code in showScanner = false; _ = addByCode(code) },
+                onFound: { code in
+                    showScanner = false
+                    let res = SealCore.parseCard(code)
+                    if let d = (try? JSONSerialization.jsonObject(with: Data(res.utf8))) as? [String: Any], (d["ok"] as? Bool) == true {
+                        scanned = d
+                    }
+                },
                 onClose: { showScanner = false }
             )
         }
@@ -164,7 +168,11 @@ struct ChatListView: View {
     let tab: Int
     let onTab: (Int) -> Void
     var body: some View {
-        let rows = contacts.map { Chat(name: $0.name, last: String($0.address.prefix(14)) + "… · tap to seal", time: "") } + CHATS
+        let rows = contacts.map { c -> Chat in
+            let sub = !c.address.isEmpty ? String(c.address.prefix(14)) + "… · tap to seal"
+                : (!c.phone.isEmpty ? "+855 " + c.phone : "tap to seal")
+            return Chat(name: c.name, last: sub, time: "")
+        } + CHATS
         VStack(spacing: 0) {
             HStack(spacing: 8) {
                 Image(systemName: "shield.fill").foregroundColor(.white).font(.system(size: 20))
@@ -302,37 +310,97 @@ struct ProfileView: View {
     }
 }
 
-struct AddContactSheet: View {
-    let onCancel: () -> Void
+struct NewContactView: View {
+    let scanned: [String: Any]?
     let onScan: () -> Void
-    let onAdd: (String) -> String?
-    @State private var code = ""
-    @State private var error: String? = nil
+    let onCancel: () -> Void
+    let onSave: (String, String, String) -> Void
+    @State private var first = ""
+    @State private var last = ""
+    @State private var phone = ""
+    @State private var sync = true
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Add contact").font(.system(size: 20, weight: .bold)).foregroundColor(.dvInk)
-            Button(action: onScan) {
-                HStack {
-                    Image(systemName: "qrcode.viewfinder")
-                    Text("Scan QR code")
-                }
-                .frame(maxWidth: .infinity).padding(12)
-                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.dvBlue))
-            }
-            .foregroundColor(.dvBlue)
-            Text("…or paste their Denvion code.").font(.system(size: 13)).foregroundColor(.dvSub)
-            TextField("denvion:…", text: $code, axis: .vertical).lineLimit(2...5)
-                .padding(10).background(Color(hex: 0xF1F4F7)).clipShape(RoundedRectangle(cornerRadius: 10))
-            if let e = error { Text(e).font(.system(size: 12)).foregroundColor(.red) }
+        let canSave = !first.trimmingCharacters(in: .whitespaces).isEmpty || scanned != nil
+        VStack(spacing: 0) {
             HStack {
+                Button(action: onCancel) {
+                    Image(systemName: "xmark").foregroundColor(.dvInk)
+                        .frame(width: 36, height: 36).background(Color.white).clipShape(Circle())
+                }
                 Spacer()
-                Button("Cancel", action: onCancel).foregroundColor(.dvSub)
-                Button("Add") { error = onAdd(code.trimmingCharacters(in: .whitespacesAndNewlines)) }
-                    .fontWeight(.semibold).foregroundColor(.dvBlue).padding(.leading, 16)
+                Text("New Contact").font(.system(size: 17, weight: .semibold)).foregroundColor(.dvInk)
+                Spacer()
+                Button(action: {
+                    if canSave {
+                        onSave(first.trimmingCharacters(in: .whitespaces), last.trimmingCharacters(in: .whitespaces), phone.trimmingCharacters(in: .whitespaces))
+                    }
+                }) {
+                    Image(systemName: "checkmark").foregroundColor(.white)
+                        .frame(width: 36, height: 36).background(canSave ? Color.dvBlue : Color(hex: 0xCBD3DA)).clipShape(Circle())
+                }.disabled(!canSave)
+            }
+            .padding(.horizontal, 14).padding(.vertical, 12)
+
+            ScrollView {
+                VStack(spacing: 18) {
+                    VStack(spacing: 0) {
+                        TextField("First Name", text: $first).foregroundColor(.dvInk).padding(16)
+                        Divider().padding(.leading, 16)
+                        TextField("Last Name", text: $last).foregroundColor(.dvInk).padding(16)
+                    }
+                    .background(Color.white).clipShape(RoundedRectangle(cornerRadius: 14))
+
+                    VStack(spacing: 0) {
+                        HStack {
+                            Text("🇰🇭  Cambodia").foregroundColor(.dvInk)
+                            Spacer()
+                            Image(systemName: "chevron.right").foregroundColor(.dvSub)
+                        }.padding(16)
+                        Divider().padding(.leading, 16)
+                        HStack {
+                            Text("+855").foregroundColor(.dvInk)
+                            Spacer().frame(width: 16)
+                            TextField("00 000 0000", text: $phone).keyboardType(.numberPad).foregroundColor(.dvInk)
+                        }.padding(16)
+                    }
+                    .background(Color.white).clipShape(RoundedRectangle(cornerRadius: 14))
+
+                    HStack {
+                        Text("Sync Contact to Phone").foregroundColor(.dvInk)
+                        Spacer()
+                        Toggle("", isOn: $sync).labelsHidden()
+                    }
+                    .padding(16).background(Color.white).clipShape(RoundedRectangle(cornerRadius: 14))
+
+                    Button(action: onScan) {
+                        HStack {
+                            Image(systemName: "qrcode")
+                            Text("Add via QR Code")
+                            Spacer()
+                        }.foregroundColor(.dvBlue).padding(16)
+                    }
+                    .background(Color.white).clipShape(RoundedRectangle(cornerRadius: 14))
+
+                    if let s = scanned {
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Image(systemName: "checkmark.circle.fill").foregroundColor(.dvGreen)
+                                Text("Linked to WCAHT address").font(.system(size: 14, weight: .semibold)).foregroundColor(.dvInk)
+                            }
+                            Text(s["address"] as? String ?? "").font(.system(size: 12)).foregroundColor(.dvBlue)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(16).background(Color(hex: 0xE9F7EE)).clipShape(RoundedRectangle(cornerRadius: 14))
+                    }
+                }
+                .padding(16)
             }
         }
-        .padding(20)
-        .presentationDetents([.medium])
+        .background(Color(hex: 0xF2F3F5).ignoresSafeArea())
+        .onChange(of: (scanned?["address"] as? String) ?? "") { addr in
+            if !addr.isEmpty, first.isEmpty, let n = scanned?["name"] as? String { first = n }
+        }
     }
 }
 

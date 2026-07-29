@@ -67,6 +67,16 @@ fn card_for_json(identity_seed_hex: &str, device_seed_hex: &str, name: &str) -> 
     .to_string()
 }
 
+/// Privacy-preserving directory key for a phone number (never the raw number, never
+/// on-chain). `hash(normalized phone)` — what resolves to a WCAHT address in the directory.
+fn phone_commitment_json(phone: &str) -> String {
+    json!({
+        "normalized": normalize_phone(phone),
+        "phone_commitment": hex::encode(phone_commitment(phone)),
+    })
+    .to_string()
+}
+
 /// Validate a scanned/pasted contact code into a contact.
 fn parse_card_json(code: &str) -> String {
     match ContactCard::decode(code) {
@@ -132,6 +142,15 @@ pub unsafe extern "C" fn ss_card_for(
 #[no_mangle]
 pub unsafe extern "C" fn ss_parse_card(code: *const c_char) -> *mut c_char {
     to_c(parse_card_json(&cstr(code)))
+}
+
+/// Directory key for a phone number: `{ normalized, phone_commitment }`.
+///
+/// # Safety
+/// `phone` must be null or a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn ss_phone_commitment(phone: *const c_char) -> *mut c_char {
+    to_c(phone_commitment_json(&cstr(phone)))
 }
 
 /// Free a string returned by any `ss_*` function. Safe on null.
@@ -373,6 +392,16 @@ pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeParseCard<'loca
 ) -> jstring {
     let code = jstr(&mut env, &code);
     ret(env, parse_card_json(&code))
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativePhoneCommitment<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    phone: JString<'local>,
+) -> jstring {
+    let phone = jstr(&mut env, &phone);
+    ret(env, phone_commitment_json(&phone))
 }
 
 #[cfg(test)]
