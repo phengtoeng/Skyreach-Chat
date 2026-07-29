@@ -255,7 +255,9 @@ func directoryPublish(_ phone: String, _ card: String) async -> Bool {
 
 // Delivery services (see Server above). Ship ciphertext to the relay + shares to gateways.
 var relayURL: String { "http://\(Server.host):9200" }
-var gatewayURLs: [String] { [9201, 9202, 9203].map { "http://\(Server.host):\($0)" } }
+// 3 INDEPENDENT gateways, one per node (t=2 of 3): no single machine holds all key shares,
+// and any one gateway can be down and messages still open. N5, N6, N7 — all on :9201.
+var gatewayURLs: [String] { ["139.99.150.23", "51.79.176.134", "51.79.162.80"].map { "http://\($0):9201" } }
 
 @discardableResult
 func httpPost(_ urlStr: String, _ body: String) async -> Int {

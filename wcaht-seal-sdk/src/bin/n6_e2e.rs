@@ -14,11 +14,13 @@ use serde_json::{json, Value};
 fn main() -> Result<()> {
     let host = std::env::args().nth(1).unwrap_or_else(|| "51.79.176.134".to_string());
     let relay = format!("http://{host}:9200");
+    // 3 INDEPENDENT gateways, one per node (t=2 of 3) — the shares physically live on 3 machines.
     let gateways = [
-        format!("http://{host}:9201"),
-        format!("http://{host}:9202"),
-        format!("http://{host}:9203"),
+        "http://139.99.150.23:9201".to_string(), // N5
+        "http://51.79.176.134:9201".to_string(), // N6
+        "http://51.79.162.80:9201".to_string(),  // N7
     ];
+    println!("gateways: N5 + N6 + N7 (t=2 of 3, each on :9201)");
     let http = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;

@@ -232,11 +232,14 @@ private fun loadContacts(store: Store): List<Contact> {
 // "10.0.2.2" for services on the emulator's own host machine. Only a hostname/IP: the
 // ports are fixed. Nothing here is secret; the servers only ever see ciphertext + hashes.
 object Server {
-    const val DEFAULT_HOST = "51.79.176.134" // N6
+    const val DEFAULT_HOST = "51.79.176.134" // N6 — hosts the relay + directory
     @Volatile var host: String = DEFAULT_HOST
     val directory: String get() = "http://$host:9988"
     val relay: String get() = "http://$host:9200"
-    val gateways: List<String> get() = listOf(9201, 9202, 9203).map { "http://$host:$it" }
+    // 3 INDEPENDENT gateways, one per node (t=2 of 3): no single machine holds all key shares,
+    // and any one gateway can be down and messages still open. N5, N6, N7 — all on :9201.
+    val gatewayHosts = listOf("139.99.150.23", "51.79.176.134", "51.79.162.80")
+    val gateways: List<String> get() = gatewayHosts.map { "http://$it:9201" }
 }
 
 private fun directoryLookup(phone: String): JSONObject? {
