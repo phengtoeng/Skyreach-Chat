@@ -1,5 +1,7 @@
 import SwiftUI
 import CoreImage.CIFilterBuiltins
+import AVFoundation
+import UIKit
 
 // ─────────────────────────────── palette ────────────────────────────────────
 extension Color {
@@ -111,6 +113,18 @@ struct ContentView: View {
     @State private var openChat: Chat? = nil
     @State private var tab = 0
     @State private var showAdd = false
+    @State private var showScanner = false
+
+    private func addByCode(_ code: String) -> String? {
+        let res = SealCore.parseCard(code)
+        let j = (try? JSONSerialization.jsonObject(with: Data(res.utf8))) as? [String: Any]
+        if (j?["ok"] as? Bool) == true {
+            Store.addContact(res)
+            contacts = loadContacts()
+            return nil
+        }
+        return (j?["error"] as? String) ?? "invalid code"
+    }
 
     var body: some View {
         Group {
@@ -123,17 +137,21 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $showAdd) {
-            AddContactSheet(onCancel: { showAdd = false }, onAdd: { code in
-                let res = SealCore.parseCard(code)
-                let j = (try? JSONSerialization.jsonObject(with: Data(res.utf8))) as? [String: Any]
-                if (j?["ok"] as? Bool) == true {
-                    Store.addContact(res)
-                    contacts = loadContacts()
-                    showAdd = false
-                    return nil
+            AddContactSheet(
+                onCancel: { showAdd = false },
+                onScan: { showAdd = false; showScanner = true },
+                onAdd: { code in
+                    let err = addByCode(code)
+                    if err == nil { showAdd = false }
+                    return err
                 }
-                return (j?["error"] as? String) ?? "invalid code"
-            })
+            )
+        }
+        .fullScreenCover(isPresented: $showScanner) {
+            QRScannerView(
+                onFound: { code in showScanner = false; _ = addByCode(code) },
+                onClose: { showScanner = false }
+            )
         }
     }
 }
@@ -286,13 +304,23 @@ struct ProfileView: View {
 
 struct AddContactSheet: View {
     let onCancel: () -> Void
+    let onScan: () -> Void
     let onAdd: (String) -> String?
     @State private var code = ""
     @State private var error: String? = nil
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Add contact").font(.system(size: 20, weight: .bold)).foregroundColor(.dvInk)
-            Text("Paste your contact's Denvion code.").font(.system(size: 13)).foregroundColor(.dvSub)
+            Button(action: onScan) {
+                HStack {
+                    Image(systemName: "qrcode.viewfinder")
+                    Text("Scan QR code")
+                }
+                .frame(maxWidth: .infinity).padding(12)
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.dvBlue))
+            }
+            .foregroundColor(.dvBlue)
+            Text("…or paste their Denvion code.").font(.system(size: 13)).foregroundColor(.dvSub)
             TextField("denvion:…", text: $code, axis: .vertical).lineLimit(2...5)
                 .padding(10).background(Color(hex: 0xF1F4F7)).clipShape(RoundedRectangle(cornerRadius: 10))
             if let e = error { Text(e).font(.system(size: 12)).foregroundColor(.red) }
@@ -507,5 +535,69 @@ private struct Avatar: View {
     var body: some View {
         Circle().fill(avatarColor(name)).frame(width: size, height: size)
             .overlay(Text(initials(name)).foregroundColor(.white).font(.system(size: size / 2.6, weight: .semibold)))
+    }
+}
+
+// ─────────────────────────── camera QR scanner ──────────────────────────────
+// Requires NSCameraUsageDescription in Info.plist (e.g. "Scan a contact's QR code").
+struct QRScannerView: UIViewControllerRepresentable {
+    let onFound: (String) -> Void
+    let onClose: () -> Void
+    func makeUIViewController(context: Context) -> ScannerVC {
+        let vc = ScannerVC()
+        vc.onFound = onFound
+        vc.onClose = onClose
+        return vc
+    }
+    func updateUIViewController(_ uiViewController: ScannerVC, context: Context) {}
+}
+
+final class ScannerVC: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
+    var onFound: ((String) -> Void)?
+    var onClose: (() -> Void)?
+    private let session = AVCaptureSession()
+    private var handled = false
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .black
+        guard let device = AVCaptureDevice.default(for: .video),
+              let input = try? AVCaptureDeviceInput(device: device),
+              session.canAddInput(input) else { return }
+        session.addInput(input)
+        let output = AVCaptureMetadataOutput()
+        guard session.canAddOutput(output) else { return }
+        session.addOutput(output)
+        output.setMetadataObjectsDelegate(self, queue: .main)
+        output.metadataObjectTypes = [.qr]
+
+        let preview = AVCaptureVideoPreviewLayer(session: session)
+        preview.frame = view.layer.bounds
+        preview.videoGravity = .resizeAspectFill
+        view.layer.addSublayer(preview)
+
+        let cancel = UIButton(type: .system)
+        cancel.setTitle("Cancel", for: .normal)
+        cancel.setTitleColor(.white, for: .normal)
+        cancel.titleLabel?.font = .systemFont(ofSize: 17, weight: .semibold)
+        cancel.frame = CGRect(x: 20, y: 56, width: 90, height: 40)
+        cancel.addTarget(self, action: #selector(closeTapped), for: .touchUpInside)
+        view.addSubview(cancel)
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in self?.session.startRunning() }
+    }
+
+    @objc private func closeTapped() {
+        session.stopRunning()
+        onClose?()
+    }
+
+    func metadataOutput(_ output: AVCaptureMetadataOutput, didOutput metadataObjects: [AVMetadataObject], from connection: AVCaptureConnection) {
+        guard !handled,
+              let obj = metadataObjects.first as? AVMetadataMachineReadableCodeObject,
+              let value = obj.stringValue else { return }
+        handled = true
+        session.stopRunning()
+        onFound?(value)
     }
 }

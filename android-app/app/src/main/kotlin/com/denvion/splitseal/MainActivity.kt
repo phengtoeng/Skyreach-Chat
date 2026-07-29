@@ -5,7 +5,10 @@ import android.content.Context
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -178,6 +181,35 @@ private fun App(proto: String) {
     var tab by remember { mutableStateOf(0) }
     var showAdd by remember { mutableStateOf(false) }
 
+    fun addByCode(code: String): String? {
+        val res = JSONObject(SealCore.parseCard(code))
+        return if (res.optBoolean("ok")) {
+            store.addContact(res)
+            contacts = loadContacts(store)
+            null
+        } else {
+            res.optString("error", "invalid code")
+        }
+    }
+
+    val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
+        result.contents?.let { code ->
+            val err = addByCode(code)
+            if (err == null) showAdd = false
+            else android.widget.Toast.makeText(ctx, err, android.widget.Toast.LENGTH_SHORT).show()
+        }
+    }
+    fun launchScan() {
+        scanLauncher.launch(
+            ScanOptions().apply {
+                setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                setPrompt("Scan a Denvion contact code")
+                setBeepEnabled(false)
+                setOrientationLocked(false)
+            }
+        )
+    }
+
     val chat = openChat
     when {
         chat != null -> ConversationScreen(chat) { openChat = null }
@@ -194,16 +226,11 @@ private fun App(proto: String) {
     if (showAdd) {
         AddContactDialog(
             onDismiss = { showAdd = false },
+            onScan = { launchScan() },
             onSubmit = { code ->
-                val res = JSONObject(SealCore.parseCard(code))
-                if (res.optBoolean("ok")) {
-                    store.addContact(res)
-                    contacts = loadContacts(store)
-                    showAdd = false
-                    null
-                } else {
-                    res.optString("error", "invalid code")
-                }
+                val err = addByCode(code)
+                if (err == null) showAdd = false
+                err
             },
         )
     }
@@ -363,7 +390,7 @@ private fun ProfileScreen(identity: JSONObject, tab: Int, onTab: (Int) -> Unit) 
 }
 
 @Composable
-private fun AddContactDialog(onDismiss: () -> Unit, onSubmit: (String) -> String?) {
+private fun AddContactDialog(onDismiss: () -> Unit, onScan: () -> Unit, onSubmit: (String) -> String?) {
     var code by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
     AlertDialog(
@@ -371,8 +398,14 @@ private fun AddContactDialog(onDismiss: () -> Unit, onSubmit: (String) -> String
         title = { Text("Add contact") },
         text = {
             Column {
-                Text("Paste your contact's Denvion code.", fontSize = 13.sp, color = Sub)
-                Spacer(Modifier.height(10.dp))
+                OutlinedButton(onClick = onScan, modifier = Modifier.fillMaxWidth()) {
+                    Icon(Icons.Filled.QrCodeScanner, null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Scan QR code")
+                }
+                Spacer(Modifier.height(12.dp))
+                Text("…or paste their Denvion code.", fontSize = 13.sp, color = Sub)
+                Spacer(Modifier.height(8.dp))
                 OutlinedTextField(
                     value = code,
                     onValueChange = { code = it; error = null },
