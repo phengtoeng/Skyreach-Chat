@@ -1095,23 +1095,24 @@ private fun Composer(value: String, onChange: (String) -> Unit, onSend: () -> Un
         Modifier.fillMaxWidth().background(Color.White).padding(horizontal = 10.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Row(
-            Modifier.weight(1f).clip(RoundedCornerShape(24.dp)).background(Color(0xFFF1F4F7)).padding(horizontal = 12.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Icon(Icons.Outlined.EmojiEmotions, null, tint = Sub, modifier = Modifier.size(22.dp))
-            Spacer(Modifier.width(8.dp))
-            Box(Modifier.weight(1f)) {
-                if (value.isEmpty()) Text("Message", color = Sub, fontSize = 15.sp)
-                BasicTextField(
-                    value = value,
-                    onValueChange = onChange,
-                    textStyle = TextStyle(color = Ink, fontSize = 15.sp),
-                    cursorBrush = Brush.verticalGradient(listOf(Blue, Blue)),
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            }
-        }
+        OutlinedTextField(
+            value = value,
+            onValueChange = onChange,
+            placeholder = { Text("Message", color = Sub, fontSize = 15.sp) },
+            leadingIcon = { Icon(Icons.Outlined.EmojiEmotions, null, tint = Sub, modifier = Modifier.size(22.dp)) },
+            maxLines = 5,
+            shape = RoundedCornerShape(24.dp),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedContainerColor = Color(0xFFF1F4F7),
+                unfocusedContainerColor = Color(0xFFF1F4F7),
+                focusedBorderColor = Color.Transparent,
+                unfocusedBorderColor = Color.Transparent,
+                cursorColor = Blue,
+                focusedTextColor = Ink,
+                unfocusedTextColor = Ink,
+            ),
+            modifier = Modifier.weight(1f),
+        )
         Spacer(Modifier.width(8.dp))
         val active = value.isNotBlank()
         Box(
