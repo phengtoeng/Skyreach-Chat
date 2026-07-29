@@ -198,18 +198,40 @@ live backend. To point elsewhere (e.g. `10.0.2.2` for services on the emulator's
 `127.0.0.1` on the iOS sim), open **Settings ▸ Server**, type the IP/host, Save. One host drives
 all five URLs; ports are fixed.
 
-### How the two-device test works
-1. Both phones keep the default server (N6), or set the **same** host in Settings ▸ Server.
-2. A and B each add the other: scan the QR on the other's **My Denvion ID** screen, **or** publish
-   a number (Profile) and look it up (New Contact).
-3. A opens the B conversation and sends. The app seals to B's device key, ships the ciphertext
-   `{seal_id, bundle}` to the relay under **B's mailbox tag** + the 3 shares to the gateways.
-4. B's app polls **its own** mailbox tag (`ss_mailbox_tag(my device_pub)`) every ~3 s, collects
-   the released shares, opens locally, shows the message. Received messages persist per device.
+### iOS build (on the Mac, after `git pull`)
+The iOS app is source-only in the repo (no committed `.a`/`.xcodeproj`) — build the Rust core fresh:
+1. `cd denvion-splitseal && cargo build -p seal-ffi --target aarch64-apple-ios-sim`
+   (use `x86_64-apple-ios` on an Intel Mac).
+2. In Xcode: add the 4 files under `ios-app/SplitSeal/`; **Link Binary With Libraries** →
+   `libseal_ffi.a` (from `target/<triple>/debug/`); Build Settings ▸ **Other Linker Flags** =
+   `-force_load $(PROJECT_DIR)/libseal_ffi.a`; set **Objective-C Bridging Header** =
+   `SplitSeal-Bridging-Header.h` and add `seal-ffi/include/` to Header Search Paths.
+3. Info.plist keys: `NSAppTransportSecurity ▸ NSAllowsArbitraryLoads = YES` (N6 is plain http),
+   `NSCameraUsageDescription` (QR scan), `NSContactsUsageDescription` (Sync to Phone).
+4. Android side: on a FRESH (non-emulator) checkout, rebuild the `.so` once —
+   `cargo ndk -t x86_64 -o android-app/app/src/main/jniLibs build --release -p seal-ffi`.
 
-Received messages are keyed by the recipient's mailbox tag (sender identity is ephemeral per seal,
-by design), so with several real contacts all inbound shows in each real conversation — fine for a
-1:1 test; per-sender routing is a later refinement.
+### How the two-device test works (Android ↔ iOS)
+1. Both apps default to the **N6** backend — no setup (Settings ▸ Server to change; must match).
+2. A and B **add each other**. Easiest path (works with no camera): on each phone open
+   **My Denvion ID**, copy the `denvion:…` code, send it across; on the other phone tap
+   **New Contact ▸ Paste ▸ Add by code ▸ ✓ Save**. (QR scan / phone-number directory also work.)
+3. A opens the B conversation and sends → the app seals to B's device key, ships the ciphertext
+   `{seal_id, bundle}` to the relay under **B's mailbox tag** + the 3 shares to the gateways.
+4. B's app polls **its own** mailbox tag (`ss_mailbox_tag(my device_pub)`) every ~3 s, collects the
+   released shares, opens locally, shows it. On A's side you only see the outgoing "🔒 Sealed for B".
+
+### Gotchas for the 2-device test
+- **"Me" is a self-loopback, not another device.** The auto-created "Me" contact is linked to your
+  OWN device key, so sealing to it ships to your own mailbox and your own poll echoes it right back —
+  an on-device proof of the full pipeline, NOT a send to iOS. Use a REAL contact (the other phone).
+- **Messages aren't tagged by sender yet** (TOP FOLLOW-UP). Received messages are keyed by the
+  recipient's mailbox tag (the per-seal sender id is ephemeral), so ALL inbound — including "Me"
+  self-test messages — shows in EVERY real conversation. Before a clean iOS test either **Clear
+  storage** on the app (fresh identity + empty inbox; re-share codes), OR do the **sender-tagging
+  fix**: have the sender sign with their stable identity so the recipient routes each message to the
+  right chat (small change: FFI `ss_seal_shippable` takes the sender's identity seed + the recipient
+  filters by `sender_id_pub` == a contact's `identity_pub`; mirror on iOS + Android).
 
 ---
 
