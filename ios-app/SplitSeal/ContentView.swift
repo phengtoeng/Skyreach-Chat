@@ -107,6 +107,28 @@ func qrImage(_ text: String) -> Image? {
     return Image(decorative: cg, scale: 1, orientation: .up)
 }
 
+// Phone directory (privacy-preserving): send only hash(phone), never the number.
+// On the iOS simulator the host is 127.0.0.1; point at your directory server for real use.
+// (http needs an NSAppTransportSecurity / NSAllowsLocalNetworking exception in Info.plist.)
+let directoryURL = "http://127.0.0.1:9988"
+
+func directoryLookup(_ phone: String) async -> [String: Any]? {
+    let commitJson = SealCore.phoneCommitment(phone)
+    guard let cd = (try? JSONSerialization.jsonObject(with: Data(commitJson.utf8))) as? [String: Any],
+          let commit = cd["phone_commitment"] as? String,
+          let url = URL(string: "\(directoryURL)/lookup/\(commit)"),
+          let (data, resp) = try? await URLSession.shared.data(from: url),
+          (resp as? HTTPURLResponse)?.statusCode == 200,
+          let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+          let card = body["card"] as? String
+    else { return nil }
+    let res = SealCore.parseCard(card)
+    if let d = (try? JSONSerialization.jsonObject(with: Data(res.utf8))) as? [String: Any], (d["ok"] as? Bool) == true {
+        return d
+    }
+    return nil
+}
+
 // ─────────────────────────────── root nav ───────────────────────────────────
 struct ContentView: View {
     @State private var identity: [String: Any] = loadOrCreateIdentity()
@@ -138,7 +160,13 @@ struct ContentView: View {
             if let c = openChat {
                 ConversationView(chat: c, onBack: { openChat = nil })
             } else if showNew {
-                NewContactView(scanned: scanned, onScan: { showScanner = true }, onCancel: { showNew = false; scanned = nil }, onSave: saveContact)
+                NewContactView(
+                    scanned: scanned,
+                    onScan: { showScanner = true },
+                    onLookup: { phone in Task { if let card = await directoryLookup(phone) { scanned = card } } },
+                    onCancel: { showNew = false; scanned = nil },
+                    onSave: saveContact
+                )
             } else if tab == 2 {
                 ProfileView(identity: identity, tab: tab, onTab: { tab = $0 })
             } else {
@@ -313,6 +341,7 @@ struct ProfileView: View {
 struct NewContactView: View {
     let scanned: [String: Any]?
     let onScan: () -> Void
+    let onLookup: (String) -> Void
     let onCancel: () -> Void
     let onSave: (String, String, String) -> Void
     @State private var first = ""
@@ -381,6 +410,17 @@ struct NewContactView: View {
                         }.foregroundColor(.dvBlue).padding(16)
                     }
                     .background(Color.white).clipShape(RoundedRectangle(cornerRadius: 14))
+
+                    if !phone.isEmpty && scanned == nil {
+                        Button(action: { onLookup(phone) }) {
+                            HStack {
+                                Image(systemName: "magnifyingglass")
+                                Text("Look up this number on the directory")
+                                Spacer()
+                            }.foregroundColor(.dvBlue).padding(16)
+                        }
+                        .background(Color.white).clipShape(RoundedRectangle(cornerRadius: 14))
+                    }
 
                     if let s = scanned {
                         VStack(alignment: .leading, spacing: 4) {

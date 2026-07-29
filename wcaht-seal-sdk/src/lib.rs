@@ -20,6 +20,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use seal_core::{SealChain, SealProof, SealStatus};
 use serde_json::{json, Value};
 
+pub mod directory;
 pub mod relay;
 
 // ───────────────────────────── live RPC client ──────────────────────────────

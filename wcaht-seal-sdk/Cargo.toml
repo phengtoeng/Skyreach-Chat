@@ -40,3 +40,15 @@ path = "src/bin/fast_e2e.rs"
 [[bin]]
 name = "wcaht-seal-stake"
 path = "src/bin/stake.rs"
+
+[[bin]]
+name = "wcaht-seal-directory"
+path = "src/bin/directory_server.rs"
+
+[[bin]]
+name = "wcaht-seal-dir-demo"
+path = "src/bin/dir_demo.rs"
+
+[[bin]]
+name = "wcaht-seal-dir-register"
+path = "src/bin/dir_register.rs"

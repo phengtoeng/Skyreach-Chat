@@ -137,6 +137,41 @@ private fun loadContacts(store: Store): List<Contact> {
     }
 }
 
+// Phone directory (privacy-preserving): the app sends only hash(phone), never the number.
+// 10.0.2.2 = the host loopback from the Android emulator; point at your directory server.
+private const val DIRECTORY_URL = "http://10.0.2.2:9988"
+
+private fun directoryLookup(phone: String): JSONObject? {
+    return try {
+        val commit = JSONObject(SealCore.phoneCommitment(phone)).optString("phone_commitment")
+        if (commit.isEmpty()) return null
+        val conn = (java.net.URL("$DIRECTORY_URL/lookup/$commit").openConnection() as java.net.HttpURLConnection).apply {
+            connectTimeout = 4000; readTimeout = 4000
+        }
+        if (conn.responseCode == 200) {
+            val card = JSONObject(conn.inputStream.bufferedReader().use { it.readText() }).optString("card")
+            val res = JSONObject(SealCore.parseCard(card))
+            if (res.optBoolean("ok")) res else null
+        } else null
+    } catch (e: Exception) {
+        null
+    }
+}
+
+private fun directoryPublish(phone: String, cardCode: String): Boolean {
+    return try {
+        val commit = JSONObject(SealCore.phoneCommitment(phone)).optString("phone_commitment")
+        val conn = (java.net.URL("$DIRECTORY_URL/register").openConnection() as java.net.HttpURLConnection).apply {
+            requestMethod = "POST"; doOutput = true; connectTimeout = 4000; readTimeout = 4000
+            setRequestProperty("Content-Type", "application/json")
+        }
+        conn.outputStream.use { it.write(JSONObject().put("commitment", commit).put("card", cardCode).toString().toByteArray()) }
+        conn.responseCode == 200
+    } catch (e: Exception) {
+        false
+    }
+}
+
 private fun qrBitmap(text: String, size: Int = 480): androidx.compose.ui.graphics.ImageBitmap {
     val matrix = com.google.zxing.qrcode.QRCodeWriter().encode(text, com.google.zxing.BarcodeFormat.QR_CODE, size, size)
     val pixels = IntArray(size * size)
@@ -174,6 +209,7 @@ private fun SystemBars(color: Color, darkIcons: Boolean) {
 @Composable
 private fun App(proto: String) {
     val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
     val store = remember { Store(ctx) }
     val identity = remember { loadOrCreateIdentity(store) }
     var contacts by remember { mutableStateOf(loadContacts(store)) }
@@ -206,6 +242,17 @@ private fun App(proto: String) {
         showNew -> NewContactScreen(
             scanned = scanned,
             onScan = { launchScan() },
+            onLookup = { phone ->
+                scope.launch {
+                    val card = withContext(Dispatchers.IO) { directoryLookup(phone) }
+                    if (card != null) {
+                        scanned = card
+                        android.widget.Toast.makeText(ctx, "Found ${card.optString("name")} in directory", android.widget.Toast.LENGTH_SHORT).show()
+                    } else {
+                        android.widget.Toast.makeText(ctx, "No directory match for that number", android.widget.Toast.LENGTH_SHORT).show()
+                    }
+                }
+            },
             onCancel = { showNew = false; scanned = null },
             onSave = { first, last, phone ->
                 val nm = listOf(first, last).filter { it.isNotBlank() }.joinToString(" ")
@@ -396,6 +443,7 @@ private fun ProfileScreen(identity: JSONObject, tab: Int, onTab: (Int) -> Unit) 
 private fun NewContactScreen(
     scanned: JSONObject?,
     onScan: () -> Unit,
+    onLookup: (String) -> Unit,
     onCancel: () -> Unit,
     onSave: (String, String, String) -> Unit,
 ) {
@@ -469,6 +517,18 @@ private fun NewContactScreen(
                 Icon(Icons.Filled.QrCode2, null, tint = Blue)
                 Spacer(Modifier.width(12.dp))
                 Text("Add via QR Code", color = Blue, fontSize = 16.sp)
+            }
+
+            if (phone.isNotBlank() && scanned == null) {
+                Spacer(Modifier.height(12.dp))
+                Row(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color.White).clickable { onLookup(phone) }.padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Filled.Search, null, tint = Blue)
+                    Spacer(Modifier.width(12.dp))
+                    Text("Look up this number on the directory", color = Blue, fontSize = 16.sp)
+                }
             }
 
             if (scanned != null) {
