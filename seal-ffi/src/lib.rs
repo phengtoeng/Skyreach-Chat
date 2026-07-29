@@ -67,6 +67,29 @@ fn card_for_json(identity_seed_hex: &str, device_seed_hex: &str, name: &str) -> 
     .to_string()
 }
 
+/// Seal `text` to a specific contact's device public key (hex). The result is
+/// openable ONLY by that device — proof the message is bound to the real contact.
+fn seal_to_json(device_pub_hex: &str, text: &str, fast: bool) -> String {
+    let dp: Option<[u8; 32]> = hex::decode(device_pub_hex.trim()).ok().and_then(|v| v.try_into().ok());
+    let Some(device_pub) = dp else {
+        return json!({ "ok": false, "error": "bad device pubkey" }).to_string();
+    };
+    let sender_id = sc::SignId::generate();
+    let sender_dev = sc::SignId::generate();
+    let gw_ids: Vec<[u8; 32]> = (0..3).map(|_| sc::random_32()).collect();
+    let mode = if fast { SealMode::FastSeal } else { SealMode::StrictSeal };
+    match seal_text_with_mode(text.as_bytes(), &sender_id, &sender_dev, &device_pub, sc::random_32(), &gw_ids, 2, 100, 100_000, mode) {
+        Ok(item) => json!({
+            "ok": true,
+            "seal_id": hex::encode(item.signed_leaf.leaf.seal_id),
+            "recipient_device_commitment": hex::encode(item.signed_leaf.leaf.recipient_device_commitment),
+            "ciphertext_len": item.envelope.ciphertext.len(),
+        })
+        .to_string(),
+        Err(e) => json!({ "ok": false, "error": e.to_string() }).to_string(),
+    }
+}
+
 /// Privacy-preserving directory key for a phone number (never the raw number, never
 /// on-chain). `hash(normalized phone)` — what resolves to a WCAHT address in the directory.
 fn phone_commitment_json(phone: &str) -> String {
@@ -151,6 +174,16 @@ pub unsafe extern "C" fn ss_parse_card(code: *const c_char) -> *mut c_char {
 #[no_mangle]
 pub unsafe extern "C" fn ss_phone_commitment(phone: *const c_char) -> *mut c_char {
     to_c(phone_commitment_json(&cstr(phone)))
+}
+
+/// Seal `text` to a contact's device public key (hex). Returns
+/// `{ ok, seal_id, recipient_device_commitment, ciphertext_len }`.
+///
+/// # Safety
+/// `device_pub` and `text` must be null or valid NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn ss_seal_to(device_pub: *const c_char, text: *const c_char, fast: i32) -> *mut c_char {
+    to_c(seal_to_json(&cstr(device_pub), &cstr(text), fast != 0))
 }
 
 /// Free a string returned by any `ss_*` function. Safe on null.
@@ -402,6 +435,19 @@ pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativePhoneCommitment
 ) -> jstring {
     let phone = jstr(&mut env, &phone);
     ret(env, phone_commitment_json(&phone))
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeSealTo<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    device_pub: JString<'local>,
+    text: JString<'local>,
+    fast: jni::sys::jboolean,
+) -> jstring {
+    let dp = jstr(&mut env, &device_pub);
+    let t = jstr(&mut env, &text);
+    ret(env, seal_to_json(&dp, &t, fast != 0))
 }
 
 #[cfg(test)]

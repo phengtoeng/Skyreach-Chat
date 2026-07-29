@@ -33,6 +33,11 @@ enum SealCore {
         phone.withCString { copy(ss_phone_commitment($0)) }
     }
 
+    /// Seal text to a contact's device pubkey (hex). Returns {ok, seal_id, recipient_device_commitment, ciphertext_len}.
+    static func sealTo(_ devicePub: String, _ text: String, _ fast: Bool) -> String {
+        devicePub.withCString { d in text.withCString { t in copy(ss_seal_to(d, t, fast ? 1 : 0)) } }
+    }
+
     /// Copy a Rust-owned C string into a Swift String and free the original.
     private static func copy(_ ptr: UnsafeMutablePointer<CChar>?) -> String {
         guard let ptr = ptr else { return "{}" }

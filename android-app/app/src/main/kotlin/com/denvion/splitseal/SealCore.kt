@@ -16,6 +16,7 @@ object SealCore {
     private external fun nativeCardFor(identitySeed: String, deviceSeed: String, name: String): String
     private external fun nativeParseCard(code: String): String
     private external fun nativePhoneCommitment(phone: String): String
+    private external fun nativeSealTo(devicePub: String, text: String, fast: Boolean): String
 
     /** `{ "protocol":"DSCP-2", "version":2, "chain_id":7789 }` */
     fun version(): String = nativeVersion()
@@ -37,4 +38,7 @@ object SealCore {
 
     /** Directory key for a phone number: {normalized, phone_commitment}. hash(phone) → address (off-chain). */
     fun phoneCommitment(phone: String): String = nativePhoneCommitment(phone)
+
+    /** Seal text to a contact's device pubkey (hex). Returns {ok, seal_id, recipient_device_commitment, ciphertext_len}. */
+    fun sealTo(devicePub: String, text: String, fast: Boolean): String = nativeSealTo(devicePub, text, fast)
 }

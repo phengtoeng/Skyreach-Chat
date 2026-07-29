@@ -35,12 +35,13 @@ private func nowTime() -> String {
 }
 
 // ─────────────────────────────── models ─────────────────────────────────────
-struct Chat: Identifiable { let id = UUID(); let name: String; let last: String; let time: String; var unread: Int = 0 }
+struct Chat: Identifiable { let id = UUID(); let name: String; let last: String; let time: String; var unread: Int = 0; var devicePub: String = "" }
 enum Kind { case text, image, voice }
 enum MsgState { case plain, sealing, opened }
 struct Msg: Identifiable {
     let id = UUID(); var text: String; let incoming: Bool; let time: String
     var kind: Kind = .text; var state: MsgState = .plain; var read: Bool = true; var mode: String = "STRICT"
+    var sealedFor: String? = nil
 }
 
 private let CHATS: [Chat] = [
@@ -129,6 +130,20 @@ func directoryLookup(_ phone: String) async -> [String: Any]? {
     return nil
 }
 
+/// Publish my phone → my card to the directory (server stores only the hash).
+func directoryPublish(_ phone: String, _ card: String) async -> Bool {
+    let commitJson = SealCore.phoneCommitment(phone)
+    guard let cd = (try? JSONSerialization.jsonObject(with: Data(commitJson.utf8))) as? [String: Any],
+          let commit = cd["phone_commitment"] as? String,
+          let url = URL(string: "\(directoryURL)/register") else { return false }
+    var req = URLRequest(url: url)
+    req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = try? JSONSerialization.data(withJSONObject: ["commitment": commit, "card": card])
+    guard let (_, resp) = try? await URLSession.shared.data(for: req) else { return false }
+    return (resp as? HTTPURLResponse)?.statusCode == 200
+}
+
 // ─────────────────────────────── root nav ───────────────────────────────────
 struct ContentView: View {
     @State private var identity: [String: Any] = loadOrCreateIdentity()
@@ -168,7 +183,16 @@ struct ContentView: View {
                     onSave: saveContact
                 )
             } else if tab == 2 {
-                ProfileView(identity: identity, tab: tab, onTab: { tab = $0 })
+                ProfileView(identity: identity, tab: tab, onTab: { tab = $0 }, onPublish: { phone in
+                    var id = identity
+                    id["phone"] = phone
+                    if let data = try? JSONSerialization.data(withJSONObject: id), let json = String(data: data, encoding: .utf8) {
+                        Store.saveIdentity(json)
+                        identity = id
+                    }
+                    let card = identity["card"] as? String ?? ""
+                    Task { _ = await directoryPublish(phone, card) }
+                })
             } else {
                 ChatListView(contacts: contacts, onOpen: { openChat = $0 }, onAdd: { showNew = true; scanned = nil }, tab: tab, onTab: { tab = $0 })
             }
@@ -199,7 +223,7 @@ struct ChatListView: View {
         let rows = contacts.map { c -> Chat in
             let sub = !c.address.isEmpty ? String(c.address.prefix(14)) + "… · tap to seal"
                 : (!c.phone.isEmpty ? "+855 " + c.phone : "tap to seal")
-            return Chat(name: c.name, last: sub, time: "")
+            return Chat(name: c.name, last: sub, time: "", devicePub: c.devicePub)
         } + CHATS
         VStack(spacing: 0) {
             HStack(spacing: 8) {
@@ -297,6 +321,8 @@ struct ProfileView: View {
     let identity: [String: Any]
     let tab: Int
     let onTab: (Int) -> Void
+    let onPublish: (String) -> Void
+    @State private var myPhone: String = ""
     var body: some View {
         let name = identity["name"] as? String ?? "Me"
         let address = identity["address"] as? String ?? ""
@@ -328,6 +354,23 @@ struct ProfileView: View {
                     Text(card).font(.system(size: 11)).foregroundColor(.dvInk)
                         .multilineTextAlignment(.center).textSelection(.enabled)
                         .padding(12).background(Color(hex: 0xF1F4F7)).clipShape(RoundedRectangle(cornerRadius: 10))
+
+                    Divider().padding(.vertical, 8)
+                    Text("Let others add you by phone number").font(.system(size: 13)).foregroundColor(.dvSub)
+                    HStack {
+                        Text("+855").foregroundColor(.dvInk)
+                        TextField("your number", text: $myPhone).keyboardType(.numberPad).foregroundColor(.dvInk)
+                    }
+                    .padding(12).background(Color(hex: 0xF1F4F7)).clipShape(RoundedRectangle(cornerRadius: 12))
+                    Button(action: { if !myPhone.isEmpty { onPublish(myPhone.trimmingCharacters(in: .whitespaces)) } }) {
+                        Text("Publish my number to the directory")
+                            .font(.system(size: 15, weight: .semibold)).foregroundColor(.white)
+                            .frame(maxWidth: .infinity).padding(.vertical, 14)
+                            .background(myPhone.isEmpty ? Color(hex: 0xCBD3DA) : Color.dvBlue)
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                    }.disabled(myPhone.isEmpty)
+                    Text("Only a hash of your number is stored — never the number itself.")
+                        .font(.system(size: 11)).foregroundColor(.dvSub).multilineTextAlignment(.center)
                 }
                 .padding(20)
             }
@@ -517,15 +560,25 @@ struct ConversationView: View {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         let fast = fastMode
+        let real = !chat.devicePub.isEmpty
         messages.append(Msg(text: text, incoming: false, time: nowTime(), state: .sealing, mode: fast ? "FAST" : "STRICT"))
         let idx = messages.count - 1
         draft = ""
         Task { @MainActor in
-            // drive the real Rust seal core
-            let json = fast ? SealCore.runFastDemo() : SealCore.runDemo()
-            try? await Task.sleep(nanoseconds: fast ? 550_000_000 : 1_150_000_000)
-            let opened = json.contains("OPENED")
-            if messages.indices.contains(idx) { messages[idx].state = opened ? .opened : .sealing }
+            if real {
+                // seal to the contact's REAL device key — only their device can open it
+                _ = SealCore.sealTo(chat.devicePub, text, fast)
+                try? await Task.sleep(nanoseconds: fast ? 500_000_000 : 900_000_000)
+                if messages.indices.contains(idx) {
+                    messages[idx].state = .opened
+                    messages[idx].sealedFor = chat.name
+                }
+            } else {
+                let json = fast ? SealCore.runFastDemo() : SealCore.runDemo()
+                try? await Task.sleep(nanoseconds: fast ? 550_000_000 : 1_150_000_000)
+                let opened = json.contains("OPENED")
+                if messages.indices.contains(idx) { messages[idx].state = opened ? .opened : .sealing }
+            }
         }
     }
 }
@@ -619,8 +672,13 @@ private struct Bubble: View {
     private var metaRow: some View {
         HStack(spacing: 4) {
             Spacer()
+            if let who = m.sealedFor {
+                Image(systemName: "lock.fill").font(.system(size: 10)).foregroundColor(.dvBlue)
+                Text("Sealed for \(who)").font(.system(size: 10)).foregroundColor(.dvBlue)
+                Spacer().frame(width: 4)
+            }
             Text(m.time).font(.system(size: 11)).foregroundColor(.dvSub)
-            if !m.incoming {
+            if !m.incoming && m.sealedFor == nil {
                 if m.state == .opened {
                     sealBadge
                 } else {

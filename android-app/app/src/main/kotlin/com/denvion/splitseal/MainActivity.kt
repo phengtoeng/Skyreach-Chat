@@ -75,7 +75,7 @@ private fun initials(name: String) =
     name.trim().split(" ").filter { it.isNotEmpty() }.take(2).joinToString("") { it.first().uppercase() }
 
 // ─────────────────────────────── models ─────────────────────────────────────
-private data class Chat(val name: String, val last: String, val time: String, val unread: Int = 0)
+private data class Chat(val name: String, val last: String, val time: String, val unread: Int = 0, val devicePub: String = "")
 
 private enum class Kind { TEXT, IMAGE, VOICE }
 private enum class State { PLAIN, SEALING, OPENED }
@@ -89,6 +89,7 @@ private data class Msg(
     val state: State = State.PLAIN,
     val read: Boolean = true,
     val mode: String = "STRICT",
+    val sealedFor: String? = null, // set when sealed to a real contact's device key
 )
 
 private val CHATS = listOf(
@@ -236,6 +237,20 @@ private fun App(proto: String) {
         )
     }
 
+    fun publishPhone(phone: String) {
+        identity.put("phone", phone)
+        store.saveIdentity(identity)
+        val card = identity.optString("card")
+        scope.launch {
+            val ok = withContext(Dispatchers.IO) { directoryPublish(phone, card) }
+            android.widget.Toast.makeText(
+                ctx,
+                if (ok) "Published — others can add you by number" else "Publish failed (is the directory running?)",
+                android.widget.Toast.LENGTH_SHORT,
+            ).show()
+        }
+    }
+
     val chat = openChat
     when {
         chat != null -> ConversationScreen(chat) { openChat = null }
@@ -268,7 +283,7 @@ private fun App(proto: String) {
                 showNew = false; scanned = null
             },
         )
-        tab == 2 -> ProfileScreen(identity, tab) { tab = it }
+        tab == 2 -> ProfileScreen(identity, tab, onTab = { tab = it }, onPublish = { publishPhone(it) })
         else -> ChatListScreen(
             contacts = contacts,
             onOpen = { openChat = it },
@@ -296,7 +311,7 @@ private fun ChatListScreen(
             it.phone.isNotBlank() -> "+855 " + it.phone
             else -> "tap to seal"
         }
-        Chat(it.name, sub, "")
+        Chat(it.name, sub, "", devicePub = it.devicePub)
     } + CHATS
     Column(Modifier.fillMaxSize().background(ScreenBg)) {
         Row(
@@ -391,12 +406,13 @@ private fun NavItem(
 
 // ───────────────────────────── profile / add ────────────────────────────────
 @Composable
-private fun ProfileScreen(identity: JSONObject, tab: Int, onTab: (Int) -> Unit) {
+private fun ProfileScreen(identity: JSONObject, tab: Int, onTab: (Int) -> Unit, onPublish: (String) -> Unit) {
     SystemBars(Blue, darkIcons = false)
     val name = identity.optString("name", "Me")
     val address = identity.optString("address")
     val card = identity.optString("card")
     val qr = remember(card) { runCatching { qrBitmap(card) }.getOrNull() }
+    var myPhone by remember { mutableStateOf(identity.optString("phone")) }
     Column(Modifier.fillMaxSize().background(ScreenBg)) {
         Row(
             Modifier.fillMaxWidth().background(Blue).padding(horizontal = 16.dp, vertical = 14.dp),
@@ -434,6 +450,40 @@ private fun ProfileScreen(identity: JSONObject, tab: Int, onTab: (Int) -> Unit) 
                     modifier = Modifier.clip(RoundedCornerShape(10.dp)).background(Color(0xFFF1F4F7)).padding(12.dp),
                 )
             }
+
+            Spacer(Modifier.height(24.dp))
+            Box(Modifier.fillMaxWidth().height(1.dp).background(Hair))
+            Spacer(Modifier.height(16.dp))
+            Text("Let others add you by phone number", fontSize = 13.sp, color = Sub, textAlign = TextAlign.Center)
+            Spacer(Modifier.height(10.dp))
+            Row(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Color(0xFFF1F4F7)).padding(horizontal = 14.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("+855", color = Ink, fontSize = 15.sp)
+                Spacer(Modifier.width(12.dp))
+                Box(Modifier.weight(1f)) {
+                    if (myPhone.isEmpty()) Text("your number", color = Sub, fontSize = 15.sp)
+                    BasicTextField(
+                        value = myPhone,
+                        onValueChange = { myPhone = it.filter { c -> c.isDigit() || c == ' ' } },
+                        textStyle = TextStyle(color = Ink, fontSize = 15.sp),
+                        cursorBrush = Brush.verticalGradient(listOf(Blue, Blue)),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            }
+            Spacer(Modifier.height(10.dp))
+            Box(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                    .background(if (myPhone.isNotBlank()) Blue else Color(0xFFCBD3DA))
+                    .clickable(enabled = myPhone.isNotBlank()) { onPublish(myPhone.trim()) }
+                    .padding(vertical = 14.dp),
+                contentAlignment = Alignment.Center,
+            ) { Text("Publish my number to the directory", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold) }
+            Spacer(Modifier.height(6.dp))
+            Text("Only a hash of your number is stored — never the number itself.", fontSize = 11.sp, color = Sub, textAlign = TextAlign.Center)
+            Spacer(Modifier.height(16.dp))
         }
         BottomBar(tab, onTab)
     }
@@ -579,18 +629,27 @@ private fun ConversationScreen(chat: Chat, onBack: () -> Unit) {
         val text = draft.trim()
         if (text.isEmpty()) return
         val fast = fastMode
+        val real = chat.devicePub.isNotBlank()
         messages.add(Msg(System.nanoTime(), text, false, now(), state = State.SEALING, mode = if (fast) "FAST" else "STRICT"))
         val idx = messages.lastIndex
         draft = ""
         scope.launch {
             listState.animateScrollToItem(messages.lastIndex)
-            // drive the real Rust seal core off the main thread
-            val transcript = runCatching {
-                withContext(Dispatchers.Default) { if (fast) SealCore.runFastDemo() else SealCore.runDemo() }
-            }.getOrNull()
-            delay(if (fast) 550 else 1150) // show the sealing state
-            val opened = transcript?.let { runCatching { JSONObject(it).getJSONArray("transcript").let { a -> a.toString().contains("OPENED") } }.getOrDefault(true) } ?: true
-            messages[idx] = messages[idx].copy(state = if (opened) State.OPENED else State.SEALING)
+            if (real) {
+                // seal to the contact's REAL device key — only their device can open it
+                val res = runCatching {
+                    withContext(Dispatchers.Default) { JSONObject(SealCore.sealTo(chat.devicePub, text, fast)) }
+                }.getOrNull()
+                delay(if (fast) 500 else 900)
+                messages[idx] = messages[idx].copy(state = State.OPENED, sealedFor = chat.name)
+            } else {
+                val transcript = runCatching {
+                    withContext(Dispatchers.Default) { if (fast) SealCore.runFastDemo() else SealCore.runDemo() }
+                }.getOrNull()
+                delay(if (fast) 550 else 1150)
+                val opened = transcript?.let { runCatching { JSONObject(it).getJSONArray("transcript").let { a -> a.toString().contains("OPENED") } }.getOrDefault(true) } ?: true
+                messages[idx] = messages[idx].copy(state = if (opened) State.OPENED else State.SEALING)
+            }
         }
     }
 
@@ -734,8 +793,14 @@ private fun VoiceContent(m: Msg) {
 @Composable
 private fun MetaRow(m: Msg) {
     Row(Modifier.fillMaxWidth().padding(top = 2.dp), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
+        m.sealedFor?.let {
+            Icon(Icons.Filled.Lock, null, tint = Blue, modifier = Modifier.size(11.dp))
+            Spacer(Modifier.width(3.dp))
+            Text("Sealed for $it", color = Blue, fontSize = 10.sp)
+            Spacer(Modifier.width(6.dp))
+        }
         Text(m.time, color = Sub, fontSize = 11.sp)
-        if (!m.incoming) {
+        if (!m.incoming && m.sealedFor == null) {
             Spacer(Modifier.width(4.dp))
             if (m.state == State.OPENED) {
                 SealBadge()

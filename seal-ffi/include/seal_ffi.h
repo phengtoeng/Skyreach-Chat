@@ -33,6 +33,10 @@ char *ss_parse_card(const char *code);
  * The raw number never goes on-chain; hash(phone) resolves to an address in the directory. */
 char *ss_phone_commitment(const char *phone);
 
+/* Seal text to a contact's device public key (hex). Openable only by that device.
+ *   { ok, seal_id, recipient_device_commitment, ciphertext_len }  (fast: 1=FastSeal, 0=StrictSeal) */
+char *ss_seal_to(const char *device_pub, const char *text, int fast);
+
 /* Free a string returned by any ss_* function. Safe on NULL. */
 void ss_free(char *ptr);
 
