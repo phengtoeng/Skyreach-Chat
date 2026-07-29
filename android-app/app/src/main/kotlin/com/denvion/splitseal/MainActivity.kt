@@ -232,14 +232,17 @@ private fun loadContacts(store: Store): List<Contact> {
 // "10.0.2.2" for services on the emulator's own host machine. Only a hostname/IP: the
 // ports are fixed. Nothing here is secret; the servers only ever see ciphertext + hashes.
 object Server {
-    const val DEFAULT_HOST = "51.79.176.134" // N6 — hosts the relay + directory
+    const val DEFAULT_HOST = "51.79.176.134" // N6 — hosts the directory
     @Volatile var host: String = DEFAULT_HOST
     val directory: String get() = "http://$host:9988"
-    val relay: String get() = "http://$host:9200"
+    // The seal backbone runs on all 3 nodes (N5, N6, N7) so no single node is a point of failure.
+    val nodeHosts = listOf("139.99.150.23", "51.79.176.134", "51.79.162.80")
+    // Replicated relays: ship the ciphertext to ALL, read from ALL (merge) — delivery survives
+    // any node outage as long as one relay that got the message is up.
+    val relays: List<String> get() = nodeHosts.map { "http://$it:9200" }
     // 3 INDEPENDENT gateways, one per node (t=2 of 3): no single machine holds all key shares,
-    // and any one gateway can be down and messages still open. N5, N6, N7 — all on :9201.
-    val gatewayHosts = listOf("139.99.150.23", "51.79.176.134", "51.79.162.80")
-    val gateways: List<String> get() = gatewayHosts.map { "http://$it:9201" }
+    // and any one gateway can be down and messages still open.
+    val gateways: List<String> get() = nodeHosts.map { "http://$it:9201" }
 }
 
 private fun directoryLookup(phone: String): JSONObject? {
@@ -299,28 +302,39 @@ private fun httpGet(url: String): String? = try {
     if (conn.responseCode == 200) conn.inputStream.bufferedReader().use { it.readText() } else null
 } catch (e: Exception) { null }
 
-/** Ship a shippable seal: {seal_id,bundle} → relay inbox, each share → a gateway (+ finalize).
- *  Returns true only if the relay actually accepted the ciphertext (so send can flag failures). */
+/** Ship a shippable seal: {seal_id,bundle} → ALL relays, each share → a gateway (+ finalize).
+ *  Returns true if AT LEAST ONE relay accepted the ciphertext (delivery survives node outages). */
 private fun shipSeal(ship: JSONObject): Boolean {
     val tag = ship.optString("mailbox_tag")
     val sealId = ship.optString("seal_id")
     // carry seal_id alongside the ciphertext so the recipient (who has neither) can collect shares.
     val item = JSONObject().put("seal_id", sealId).put("bundle", ship.getJSONObject("bundle"))
-    val relayCode = httpPost("${Server.relay}/inbox/$tag", item.toString())
+    // replicate the ciphertext to every relay so any one of them can serve the recipient.
+    var relayOk = false
+    for (r in Server.relays) if (httpPost("$r/inbox/$tag", item.toString()) in 200..299) relayOk = true
     val shares = ship.getJSONArray("shares")
     val gateways = Server.gateways
     for (i in 0 until minOf(shares.length(), gateways.size)) {
         httpPost("${gateways[i]}/deposit", shares.getJSONObject(i).toString())
         httpPost("${gateways[i]}/finalize/$sealId", "")
     }
-    return relayCode in 200..299
+    return relayOk
 }
 
-/** Fetch every {seal_id,bundle} item delivered to a mailbox tag (recipient polls this). */
+/** Fetch every {seal_id,bundle} item for a mailbox tag from ALL relays, merged + deduped by
+ *  seal_id — the recipient finds its messages on whichever relay(s) happen to be up. */
 private fun fetchInboxAll(tag: String): List<JSONObject> {
-    val body = httpGet("${Server.relay}/inbox/$tag") ?: return emptyList()
-    val arr = JSONArray(body)
-    return (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
+    val byId = LinkedHashMap<String, JSONObject>()
+    for (r in Server.relays) {
+        val body = httpGet("$r/inbox/$tag") ?: continue
+        val arr = runCatching { JSONArray(body) }.getOrNull() ?: continue
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val id = o.optString("seal_id")
+            if (id.isNotEmpty() && !byId.containsKey(id)) byId[id] = o
+        }
+    }
+    return byId.values.toList()
 }
 
 /** Collect released shares for a seal from all gateways. */

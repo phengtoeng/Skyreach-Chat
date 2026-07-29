@@ -12,21 +12,25 @@ use seal_crypto as sc;
 use serde_json::{json, Value};
 
 fn main() -> Result<()> {
-    let host = std::env::args().nth(1).unwrap_or_else(|| "51.79.176.134".to_string());
-    let relay = format!("http://{host}:9200");
+    // Replicated relays, one per node — ship the ciphertext to ALL, read from ALL (merge).
+    let relays = [
+        "http://139.99.150.23:9200".to_string(), // N5
+        "http://51.79.176.134:9200".to_string(), // N6
+        "http://51.79.162.80:9200".to_string(),  // N7
+    ];
     // 3 INDEPENDENT gateways, one per node (t=2 of 3) — the shares physically live on 3 machines.
     let gateways = [
         "http://139.99.150.23:9201".to_string(), // N5
         "http://51.79.176.134:9201".to_string(), // N6
         "http://51.79.162.80:9201".to_string(),  // N7
     ];
-    println!("gateways: N5 + N6 + N7 (t=2 of 3, each on :9201)");
+    println!("relays + gateways: N5 + N6 + N7 (relay replicated, gateways t=2 of 3)");
     let http = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
 
     let text = "meet at the safehouse, 9pm";
-    println!("== two-device transfer test against {host} ==");
+    println!("== two-device transfer test against the N5/N6/N7 seal cluster ==");
 
     // --- Bob: the recipient (his device seed opens; his device pub is the address) ---
     let bob = Identity::generate("Bob");
@@ -60,26 +64,39 @@ fn main() -> Result<()> {
     });
     println!("Alice sealed \"{text}\"  (seal {}…)", &seal_id_hex[..16]);
 
-    // --- SHIP: {seal_id,bundle} -> relay inbox (Bob's tag); shares -> gateways(+finalize) ---
+    // --- SHIP: {seal_id,bundle} -> EVERY relay (Bob's tag); shares -> gateways(+finalize) ---
     let item_json = json!({ "seal_id": seal_id_hex, "bundle": bundle });
-    http.post(format!("{relay}/inbox/{}", hex::encode(tag))).json(&item_json).send()?.error_for_status()?;
+    let mut relay_ok = 0;
+    for r in &relays {
+        if http.post(format!("{r}/inbox/{}", hex::encode(tag))).json(&item_json).send().and_then(|x| x.error_for_status()).is_ok() {
+            relay_ok += 1;
+        }
+    }
     for (i, share) in item.share_envelopes.iter().enumerate().take(3) {
         http.post(format!("{}/deposit", gateways[i])).json(share).send()?.error_for_status()?;
         http.post(format!("{}/finalize/{}", gateways[i], seal_id_hex)).send()?.error_for_status()?;
     }
-    println!("shipped: ciphertext -> relay, 3 shares -> gateways (finalized)");
+    println!("shipped: ciphertext -> {relay_ok}/3 relays, 3 shares -> gateways (finalized)");
 
     // --- Bob: poll HIS OWN mailbox tag, fetch bundle, collect released shares, open ---
     let my_tag = mailbox_tag(&bob_device_pub);
     if my_tag != tag {
         return Err(anyhow!("recipient's own tag must equal the ship target"));
     }
-    let inbox: Vec<Value> = http.get(format!("{relay}/inbox/{}", hex::encode(my_tag))).send()?.error_for_status()?.json()?;
+    // read from ALL relays and merge (finds the message on whichever relay is up).
+    let mut inbox: Vec<Value> = Vec::new();
+    for r in &relays {
+        if let Ok(resp) = http.get(format!("{r}/inbox/{}", hex::encode(my_tag))).send() {
+            if let Ok(items) = resp.json::<Vec<Value>>() {
+                inbox.extend(items);
+            }
+        }
+    }
     let got = inbox
         .iter()
         .find(|v| v.get("seal_id").and_then(Value::as_str) == Some(seal_id_hex.as_str()))
         .ok_or_else(|| anyhow!("Bob's inbox has no such seal"))?;
-    println!("Bob polled his inbox -> {} item(s)", inbox.len());
+    println!("Bob polled his inbox (all relays) -> {} item(s)", inbox.len());
 
     let mut shares: Vec<KeyShareEnvelope> = Vec::new();
     for gw in &gateways {

@@ -253,11 +253,14 @@ func directoryPublish(_ phone: String, _ card: String) async -> Bool {
     return (resp as? HTTPURLResponse)?.statusCode == 200
 }
 
-// Delivery services (see Server above). Ship ciphertext to the relay + shares to gateways.
-var relayURL: String { "http://\(Server.host):9200" }
+// The seal backbone runs on all 3 nodes (N5, N6, N7) so no single node is a point of failure.
+let nodeHosts = ["139.99.150.23", "51.79.176.134", "51.79.162.80"]
+// Replicated relays: ship the ciphertext to ALL, read from ALL (merge) — delivery survives any
+// node outage as long as one relay that got the message is up.
+var relayURLs: [String] { nodeHosts.map { "http://\($0):9200" } }
 // 3 INDEPENDENT gateways, one per node (t=2 of 3): no single machine holds all key shares,
-// and any one gateway can be down and messages still open. N5, N6, N7 — all on :9201.
-var gatewayURLs: [String] { ["139.99.150.23", "51.79.176.134", "51.79.162.80"].map { "http://\($0):9201" } }
+// and any one gateway can be down and messages still open.
+var gatewayURLs: [String] { nodeHosts.map { "http://\($0):9201" } }
 
 @discardableResult
 func httpPost(_ urlStr: String, _ body: String) async -> Int {
@@ -282,11 +285,14 @@ func shipSeal(_ ship: [String: Any]) async -> Bool {
     let sealId = ship["seal_id"] as? String ?? ""
     var relayOk = false
     // carry seal_id alongside the ciphertext so the recipient (who has neither) can collect shares.
+    // replicate to every relay so any one of them can serve the recipient.
     if let bundle = ship["bundle"] {
         let item: [String: Any] = ["seal_id": sealId, "bundle": bundle]
         if let d = try? JSONSerialization.data(withJSONObject: item), let s = String(data: d, encoding: .utf8) {
-            let code = await httpPost("\(relayURL)/inbox/\(tag)", s)
-            relayOk = (200..<300).contains(code)
+            for r in relayURLs {
+                let code = await httpPost("\(r)/inbox/\(tag)", s)
+                if (200..<300).contains(code) { relayOk = true }
+            }
         }
     }
     if let shares = ship["shares"] as? [Any] {
@@ -300,11 +306,19 @@ func shipSeal(_ ship: [String: Any]) async -> Bool {
     }
     return relayOk
 }
-/// Fetch every {seal_id, bundle} item delivered to a mailbox tag (recipient polls this).
+/// Fetch every {seal_id, bundle} item for a mailbox tag from ALL relays, merged + deduped by
+/// seal_id — the recipient finds its messages on whichever relay(s) happen to be up.
 func fetchInboxAll(_ tag: String) async -> [[String: Any]] {
-    guard let body = await httpGet("\(relayURL)/inbox/\(tag)"),
-          let arr = (try? JSONSerialization.jsonObject(with: Data(body.utf8))) as? [[String: Any]] else { return [] }
-    return arr
+    var byId = [String: [String: Any]]()
+    var order = [String]()
+    for r in relayURLs {
+        guard let body = await httpGet("\(r)/inbox/\(tag)"),
+              let arr = (try? JSONSerialization.jsonObject(with: Data(body.utf8))) as? [[String: Any]] else { continue }
+        for o in arr {
+            if let id = o["seal_id"] as? String, !id.isEmpty, byId[id] == nil { byId[id] = o; order.append(id) }
+        }
+    }
+    return order.compactMap { byId[$0] }
 }
 func collectShares(_ sealId: String) async -> String {
     var all: [Any] = []
