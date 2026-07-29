@@ -157,6 +157,21 @@ func loadOrCreateIdentity() -> [String: Any] {
     Store.saveIdentity(json)
     return ((try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any]) ?? [:]
 }
+/// Parse a pasted/scanned contact code, tolerant of copy noise: strips whitespace/newlines and
+/// auto-adds the "denvion:" prefix if the user copied only the card body. Returns nil if invalid.
+func tryParseCard(_ code: String) -> [String: Any]? {
+    let cleaned = code.components(separatedBy: .whitespacesAndNewlines).joined()
+    guard !cleaned.isEmpty else { return nil }
+    let candidates = cleaned.hasPrefix("denvion:") ? [cleaned] : [cleaned, "denvion:" + cleaned]
+    for cand in candidates {
+        let res = SealCore.parseCard(cand)
+        if let d = (try? JSONSerialization.jsonObject(with: Data(res.utf8))) as? [String: Any], (d["ok"] as? Bool) == true {
+            return d
+        }
+    }
+    return nil
+}
+
 func loadContacts() -> [Contact] {
     Store.contacts().map {
         Contact(name: $0["name"] as? String ?? "", address: $0["address"] as? String ?? "",
@@ -303,6 +318,7 @@ struct ContentView: View {
     @State private var showNew = false
     @State private var showScanner = false
     @State private var scanned: [String: Any]? = nil
+    @State private var codeError = false
     @State private var seenGlobal = Set<String>()
 
     /// My own inbox tag — every seal addressed to me lands here; also purged when I delete a chat.
@@ -422,10 +438,7 @@ struct ContentView: View {
                     onScan: { showScanner = true },
                     onLookup: { phone in Task { if let card = await directoryLookup(phone) { scanned = card } } },
                     onPasteCode: { c in
-                        let res = SealCore.parseCard(c)
-                        if let d = (try? JSONSerialization.jsonObject(with: Data(res.utf8))) as? [String: Any], (d["ok"] as? Bool) == true {
-                            scanned = d
-                        }
+                        if let d = tryParseCard(c) { scanned = d } else { codeError = true }
                     },
                     onCancel: { showNew = false; scanned = nil },
                     onSave: saveContact
@@ -449,13 +462,15 @@ struct ContentView: View {
             QRScannerView(
                 onFound: { code in
                     showScanner = false
-                    let res = SealCore.parseCard(code)
-                    if let d = (try? JSONSerialization.jsonObject(with: Data(res.utf8))) as? [String: Any], (d["ok"] as? Bool) == true {
-                        scanned = d
-                    }
+                    if let d = tryParseCard(code) { scanned = d } else { codeError = true }
                 },
                 onClose: { showScanner = false }
             )
+        }
+        .alert("Not a contact code", isPresented: $codeError) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("Copy the full \"denvion:…\" code from the other person's Settings (under \"Share this code\") — not their address.")
         }
         .onAppear { requestNotifs() }
         // run the always-on inbox poll whenever we're NOT inside a conversation
@@ -639,6 +654,12 @@ struct ProfileView: View {
                     Text(card).font(.system(size: 11)).foregroundColor(.dvInk)
                         .multilineTextAlignment(.center).textSelection(.enabled)
                         .padding(12).background(Color(hex: 0xF1F4F7)).clipShape(RoundedRectangle(cornerRadius: 10))
+                    Button(action: { UIPasteboard.general.string = card }) {
+                        Label("Copy my code", systemImage: "doc.on.doc")
+                            .font(.system(size: 13, weight: .semibold)).foregroundColor(.white)
+                            .padding(.horizontal, 18).padding(.vertical, 10)
+                            .background(Color.dvBlue).clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
 
                     Divider().padding(.vertical, 8)
                     Text("Let others add you by phone number").font(.system(size: 13)).foregroundColor(.dvSub)

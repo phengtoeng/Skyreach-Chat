@@ -191,6 +191,19 @@ private fun loadOrCreateIdentity(store: Store): JSONObject {
     return id
 }
 
+/** Parse a pasted/scanned contact code, tolerant of copy noise: strips whitespace/newlines and
+ *  auto-adds the "denvion:" prefix if the user copied only the card body. Returns null if invalid. */
+private fun tryParseCard(code: String): JSONObject? {
+    val cleaned = code.trim().replace(Regex("\\s"), "")
+    if (cleaned.isEmpty()) return null
+    val candidates = if (cleaned.startsWith("denvion:")) listOf(cleaned) else listOf(cleaned, "denvion:$cleaned")
+    for (cand in candidates) {
+        val r = runCatching { JSONObject(SealCore.parseCard(cand)) }.getOrNull() ?: continue
+        if (r.optBoolean("ok")) return r
+    }
+    return null
+}
+
 private fun loadContacts(store: Store): List<Contact> {
     val a = store.contacts()
     return (0 until a.length()).map {
@@ -494,9 +507,17 @@ private fun App(proto: String) {
                 }
             },
             onPasteCode = { c ->
-                val res = JSONObject(SealCore.parseCard(c))
-                if (res.optBoolean("ok")) scanned = res
-                else android.widget.Toast.makeText(ctx, res.optString("error", "invalid contact code"), android.widget.Toast.LENGTH_SHORT).show()
+                val res = tryParseCard(c)
+                if (res != null) {
+                    scanned = res
+                    android.widget.Toast.makeText(ctx, "Found ${res.optString("name", "contact")} — tap ✓ to save", android.widget.Toast.LENGTH_SHORT).show()
+                } else {
+                    android.widget.Toast.makeText(
+                        ctx,
+                        "That's not a contact code. Copy the full \"denvion:…\" code from the other person's Settings (under \"Share this code\") — not their address.",
+                        android.widget.Toast.LENGTH_LONG,
+                    ).show()
+                }
             },
             onCancel = { showNew = false; scanned = null },
             onSave = { first, last, phone ->
@@ -767,6 +788,24 @@ private fun ProfileScreen(
                     card, fontSize = 11.sp, color = Ink, textAlign = TextAlign.Center,
                     modifier = Modifier.clip(RoundedCornerShape(10.dp)).background(Color(0xFFF1F4F7)).padding(12.dp),
                 )
+            }
+            Spacer(Modifier.height(8.dp))
+            val ctxCopy = LocalContext.current
+            Box(
+                Modifier.clip(RoundedCornerShape(10.dp)).background(Blue)
+                    .clickable {
+                        val clip = ctxCopy.getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+                        clip?.setPrimaryClip(android.content.ClipData.newPlainText("denvion code", card))
+                        android.widget.Toast.makeText(ctxCopy, "Code copied — paste it on the other device", android.widget.Toast.LENGTH_SHORT).show()
+                    }
+                    .padding(horizontal = 18.dp, vertical = 10.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Filled.ContentCopy, null, tint = Color.White, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Copy my code", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                }
             }
 
             Spacer(Modifier.height(24.dp))
