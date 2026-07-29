@@ -3,7 +3,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Denvion SplitSeal"
+        android:label="Denvion"
         android:supportsRtl="true"
         android:theme="@style/Theme.SplitSeal">
         <activity
