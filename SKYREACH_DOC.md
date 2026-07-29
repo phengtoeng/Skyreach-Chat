@@ -160,6 +160,59 @@ The SplitSeal SDK talks to the real WCAHT chain (`PoASy3`). Facts learned the ha
 
 ---
 
+## 6b. Backend services on N6 + two-device testing
+
+The apps talk to five stateless HTTP services (ciphertext + hashes only — **never** keys or
+plaintext). They are DEPLOYED + LIVE on WCAHT node **N6** (`51.79.176.134`), in a directory
+**separate from the validator** (`~/skyreach/`, ports well clear of the node's 8901/8902):
+
+| service   | port | systemd unit         | role                                                  |
+|-----------|------|----------------------|-------------------------------------------------------|
+| relay     | 9200 | `skyreach-relay`     | store-and-forward ciphertext inbox (per mailbox tag)  |
+| gateway 1 | 9201 | `skyreach-gw1`       | holds share[0]; releases only after finality (425 until) |
+| gateway 2 | 9202 | `skyreach-gw2`       | holds share[1]                                        |
+| gateway 3 | 9203 | `skyreach-gw3`       | holds share[2]                                        |
+| directory | 9988 | `skyreach-directory` | `hash(phone) → contact card` (privacy-preserving)     |
+
+Each unit is `Restart=always`; logs are in `~/skyreach/logs/`. Manage:
+```bash
+ssh ubuntu@51.79.176.134
+sudo systemctl restart skyreach-relay skyreach-gw1 skyreach-gw2 skyreach-gw3 skyreach-directory
+tail -f ~/skyreach/logs/relay.log
+```
+Redeploy after a Rust change (N6 has a minimal toolchain, builds natively):
+```bash
+# from denvion-splitseal/
+tar czf /tmp/sk.tgz Cargo.toml Cargo.lock seal-crypto seal-core seal-ffi wcaht-seal-sdk
+scp /tmp/sk.tgz ubuntu@51.79.176.134:~/ && ssh ubuntu@51.79.176.134 '
+  rm -rf ~/skyreach-src && mkdir ~/skyreach-src && tar xzf ~/sk.tgz -C ~/skyreach-src &&
+  source ~/.cargo/env && cd ~/skyreach-src &&
+  cargo build -p wcaht-seal-sdk --bin wcaht-seal-relay --bin wcaht-seal-gateway --bin wcaht-seal-directory &&
+  cp target/debug/wcaht-seal-{relay,gateway,directory} ~/skyreach/bin/ &&
+  for n in relay gw1 gw2 gw3 directory; do sudo systemctl restart skyreach-$n; done'
+```
+
+### Configurable backend in the app
+Both apps default their server host to **N6** (`51.79.176.134`) — nothing to set up to use the
+live backend. To point elsewhere (e.g. `10.0.2.2` for services on the emulator's own machine,
+`127.0.0.1` on the iOS sim), open **Settings ▸ Server**, type the IP/host, Save. One host drives
+all five URLs; ports are fixed.
+
+### How the two-device test works
+1. Both phones keep the default server (N6), or set the **same** host in Settings ▸ Server.
+2. A and B each add the other: scan the QR on the other's **My Denvion ID** screen, **or** publish
+   a number (Profile) and look it up (New Contact).
+3. A opens the B conversation and sends. The app seals to B's device key, ships the ciphertext
+   `{seal_id, bundle}` to the relay under **B's mailbox tag** + the 3 shares to the gateways.
+4. B's app polls **its own** mailbox tag (`ss_mailbox_tag(my device_pub)`) every ~3 s, collects
+   the released shares, opens locally, shows the message. Received messages persist per device.
+
+Received messages are keyed by the recipient's mailbox tag (sender identity is ephemeral per seal,
+by design), so with several real contacts all inbound shows in each real conversation — fine for a
+1:1 test; per-sender routing is a later refinement.
+
+---
+
 ## 7. Non-negotiable constraints (from the spec — DO NOT violate)
 
 1. **No homemade cryptography.** All primitives go through `seal-crypto` (audited crates only).

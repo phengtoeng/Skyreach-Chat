@@ -16,6 +16,7 @@ object SealCore {
     private external fun nativeCardFor(identitySeed: String, deviceSeed: String, name: String): String
     private external fun nativeParseCard(code: String): String
     private external fun nativePhoneCommitment(phone: String): String
+    private external fun nativeMailboxTag(devicePub: String): String
     private external fun nativeSealTo(devicePub: String, text: String, fast: Boolean): String
     private external fun nativeSealShippable(devicePub: String, text: String, fast: Boolean): String
     private external fun nativeOpenReceived(deviceSeed: String, bundle: String, shares: String): String
@@ -40,6 +41,9 @@ object SealCore {
 
     /** Directory key for a phone number: {normalized, phone_commitment}. hash(phone) → address (off-chain). */
     fun phoneCommitment(phone: String): String = nativePhoneCommitment(phone)
+
+    /** My inbox tag {ok, mailbox_tag} from my device pubkey — poll the relay here for inbound seals. */
+    fun mailboxTag(devicePub: String): String = nativeMailboxTag(devicePub)
 
     /** Seal text to a contact's device pubkey (hex). Returns {ok, seal_id, recipient_device_commitment, ciphertext_len}. */
     fun sealTo(devicePub: String, text: String, fast: Boolean): String = nativeSealTo(devicePub, text, fast)

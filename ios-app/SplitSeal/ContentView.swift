@@ -85,6 +85,23 @@ enum Store {
             d.set(s, forKey: "contacts")
         }
     }
+
+    // received messages, persisted + deduped per mailbox tag (all my inbound share my tag).
+    static func inbox(_ tag: String) -> [[String: Any]] {
+        guard let s = d.string(forKey: "inbox_\(tag)"), let data = s.data(using: .utf8) else { return [] }
+        return ((try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]) ?? []
+    }
+    /// Append a received message; returns false if this seal_id was already stored.
+    @discardableResult
+    static func addInbox(_ tag: String, _ sealId: String, _ text: String) -> Bool {
+        var a = inbox(tag)
+        if a.contains(where: { ($0["id"] as? String) == sealId }) { return false }
+        a.append(["id": sealId, "text": text, "ts": Date().timeIntervalSince1970])
+        if let out = try? JSONSerialization.data(withJSONObject: a), let s = String(data: out, encoding: .utf8) {
+            d.set(s, forKey: "inbox_\(tag)")
+        }
+        return true
+    }
 }
 
 func loadOrCreateIdentity() -> [String: Any] {
@@ -108,10 +125,19 @@ func qrImage(_ text: String) -> Image? {
     return Image(decorative: cg, scale: 1, orientation: .up)
 }
 
-// Phone directory (privacy-preserving): send only hash(phone), never the number.
-// On the iOS simulator the host is 127.0.0.1; point at your directory server for real use.
+// ── Configurable backend: relay + 3 gateways + directory all live on ONE host. ──
+// Default = WCAHT node N6 (reachable from any device). Override it in Settings — e.g.
+// "127.0.0.1" for services on the simulator's own Mac. Only a hostname/IP; ports are fixed.
+// The servers only ever see ciphertext + hashes, never keys or plaintext.
 // (http needs an NSAppTransportSecurity / NSAllowsLocalNetworking exception in Info.plist.)
-let directoryURL = "http://127.0.0.1:9988"
+enum Server {
+    static let defaultHost = "51.79.176.134" // N6
+    static var host: String {
+        get { UserDefaults.standard.string(forKey: "server_host") ?? defaultHost }
+        set { UserDefaults.standard.set(newValue.trimmingCharacters(in: .whitespaces), forKey: "server_host") }
+    }
+}
+var directoryURL: String { "http://\(Server.host):9988" }
 
 func directoryLookup(_ phone: String) async -> [String: Any]? {
     let commitJson = SealCore.phoneCommitment(phone)
@@ -144,9 +170,9 @@ func directoryPublish(_ phone: String, _ card: String) async -> Bool {
     return (resp as? HTTPURLResponse)?.statusCode == 200
 }
 
-// Delivery services (iOS simulator → host). Ship ciphertext to the relay + shares to gateways.
-let relayURL = "http://127.0.0.1:9200"
-let gatewayURLs = ["http://127.0.0.1:9201", "http://127.0.0.1:9202", "http://127.0.0.1:9203"]
+// Delivery services (see Server above). Ship ciphertext to the relay + shares to gateways.
+var relayURL: String { "http://\(Server.host):9200" }
+var gatewayURLs: [String] { [9201, 9202, 9203].map { "http://\(Server.host):\($0)" } }
 
 func httpPost(_ urlStr: String, _ body: String) async {
     guard let url = URL(string: urlStr) else { return }
@@ -165,25 +191,28 @@ func httpGet(_ urlStr: String) async -> String? {
 func shipSeal(_ ship: [String: Any]) async {
     let tag = ship["mailbox_tag"] as? String ?? ""
     let sealId = ship["seal_id"] as? String ?? ""
-    if let bundle = ship["bundle"], let d = try? JSONSerialization.data(withJSONObject: bundle), let s = String(data: d, encoding: .utf8) {
-        await httpPost("\(relayURL)/inbox/\(tag)", s)
+    // carry seal_id alongside the ciphertext so the recipient (who has neither) can collect shares.
+    if let bundle = ship["bundle"] {
+        let item: [String: Any] = ["seal_id": sealId, "bundle": bundle]
+        if let d = try? JSONSerialization.data(withJSONObject: item), let s = String(data: d, encoding: .utf8) {
+            await httpPost("\(relayURL)/inbox/\(tag)", s)
+        }
     }
     if let shares = ship["shares"] as? [Any] {
-        for (i, sh) in shares.enumerated() where i < gatewayURLs.count {
+        let gws = gatewayURLs
+        for (i, sh) in shares.enumerated() where i < gws.count {
             if let d = try? JSONSerialization.data(withJSONObject: sh), let s = String(data: d, encoding: .utf8) {
-                await httpPost("\(gatewayURLs[i])/deposit", s)
-                await httpPost("\(gatewayURLs[i])/finalize/\(sealId)", "")
+                await httpPost("\(gws[i])/deposit", s)
+                await httpPost("\(gws[i])/finalize/\(sealId)", "")
             }
         }
     }
 }
-func fetchInbox(_ tag: String) async -> String? {
+/// Fetch every {seal_id, bundle} item delivered to a mailbox tag (recipient polls this).
+func fetchInboxAll(_ tag: String) async -> [[String: Any]] {
     guard let body = await httpGet("\(relayURL)/inbox/\(tag)"),
-          let arr = (try? JSONSerialization.jsonObject(with: Data(body.utf8))) as? [Any],
-          let last = arr.last,
-          let d = try? JSONSerialization.data(withJSONObject: last),
-          let s = String(data: d, encoding: .utf8) else { return nil }
-    return s
+          let arr = (try? JSONSerialization.jsonObject(with: Data(body.utf8))) as? [[String: Any]] else { return [] }
+    return arr
 }
 func collectShares(_ sealId: String) async -> String {
     var all: [Any] = []
@@ -225,7 +254,12 @@ struct ContentView: View {
     var body: some View {
         Group {
             if let c = openChat {
-                ConversationView(chat: c, myDeviceSeed: identity["device_seed"] as? String ?? "", onBack: { openChat = nil })
+                ConversationView(
+                    chat: c,
+                    myDeviceSeed: identity["device_seed"] as? String ?? "",
+                    myDevicePub: identity["device_pub"] as? String ?? "",
+                    onBack: { openChat = nil }
+                )
             } else if showNew {
                 NewContactView(
                     scanned: scanned,
@@ -375,6 +409,7 @@ struct ProfileView: View {
     let onTab: (Int) -> Void
     let onPublish: (String) -> Void
     @State private var myPhone: String = ""
+    @State private var host: String = Server.host
     var body: some View {
         let name = identity["name"] as? String ?? "Me"
         let address = identity["address"] as? String ?? ""
@@ -423,6 +458,24 @@ struct ProfileView: View {
                     }.disabled(myPhone.isEmpty)
                     Text("Only a hash of your number is stored — never the number itself.")
                         .font(.system(size: 11)).foregroundColor(.dvSub).multilineTextAlignment(.center)
+
+                    Divider().padding(.vertical, 8)
+                    Text("Server").font(.system(size: 13)).foregroundColor(.dvSub)
+                    Text("Host running the relay + gateways + directory. Both people must point at the same one.")
+                        .font(.system(size: 11)).foregroundColor(.dvSub).multilineTextAlignment(.center)
+                    TextField("server IP or hostname", text: $host)
+                        .textInputAutocapitalization(.never).foregroundColor(.dvInk)
+                        .padding(12).background(Color(hex: 0xF1F4F7)).clipShape(RoundedRectangle(cornerRadius: 12))
+                    Button(action: {
+                        let h = host.trimmingCharacters(in: .whitespaces)
+                        if !h.isEmpty { Server.host = h; host = h }
+                    }) {
+                        Text("Save server")
+                            .font(.system(size: 15, weight: .semibold)).foregroundColor(.white)
+                            .frame(maxWidth: .infinity).padding(.vertical, 14)
+                            .background(host.isEmpty ? Color(hex: 0xCBD3DA) : Color.dvBlue)
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                    }.disabled(host.isEmpty)
                 }
                 .padding(20)
             }
@@ -543,10 +596,17 @@ struct NewContactView: View {
 struct ConversationView: View {
     let chat: Chat
     let myDeviceSeed: String
+    let myDevicePub: String
     let onBack: () -> Void
-    @State private var messages: [Msg] = seedThread()
+    @State private var messages: [Msg] = []
     @State private var draft = ""
     @State private var fastMode = false
+    @State private var seen = Set<String>()
+    @State private var polling = false
+    @State private var myTag = ""
+
+    // A "real" conversation is linked to a contact's device key (vs. the demo threads).
+    private var real: Bool { !chat.devicePub.isEmpty }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -587,6 +647,29 @@ struct ConversationView: View {
         }
         .background(Color.dvConv)
         .navigationBarHidden(true)
+        .task {
+            // one-time: compute my inbox tag + restore persisted history, then live-poll
+            if myTag.isEmpty, !myDevicePub.isEmpty {
+                let j = SealCore.mailboxTag(myDevicePub)
+                if let d = (try? JSONSerialization.jsonObject(with: Data(j.utf8))) as? [String: Any] {
+                    myTag = d["mailbox_tag"] as? String ?? ""
+                }
+            }
+            if real {
+                if messages.isEmpty {
+                    for o in Store.inbox(myTag) {
+                        if let id = o["id"] as? String { seen.insert(id) }
+                        messages.append(Msg(text: o["text"] as? String ?? "", incoming: true, time: "", state: .opened))
+                    }
+                }
+                while !Task.isCancelled {
+                    await poll()
+                    try? await Task.sleep(nanoseconds: 3_000_000_000)
+                }
+            } else if messages.isEmpty {
+                messages = seedThread()
+            }
+        }
     }
 
     private var composer: some View {
@@ -609,37 +692,51 @@ struct ConversationView: View {
         .background(Color.white)
     }
 
+    // Poll my inbox: fetch delivered ciphertext, collect released shares, open, show. One at a time.
+    @MainActor private func poll() async {
+        guard real, !myTag.isEmpty, !polling else { return }
+        polling = true
+        defer { polling = false }
+        for item in await fetchInboxAll(myTag) {
+            guard let sealId = item["seal_id"] as? String, !sealId.isEmpty, !seen.contains(sealId),
+                  let bundle = item["bundle"],
+                  let bd = try? JSONSerialization.data(withJSONObject: bundle),
+                  let bundleStr = String(data: bd, encoding: .utf8) else { continue }
+            let shares = await collectShares(sealId)
+            let openStr = SealCore.openReceived(myDeviceSeed, bundleStr, shares)
+            if let r = (try? JSONSerialization.jsonObject(with: Data(openStr.utf8))) as? [String: Any],
+               (r["ok"] as? Bool) == true, let plain = r["plaintext"] as? String {
+                seen.insert(sealId)
+                if Store.addInbox(myTag, sealId, plain) { // persist; the dedup authority
+                    messages.append(Msg(text: plain, incoming: true, time: nowTime(), state: .opened))
+                }
+            }
+            // if not opened yet (shares still locked) leave it unseen to retry next poll
+        }
+    }
+
     private func send() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         let fast = fastMode
-        let real = !chat.devicePub.isEmpty
         messages.append(Msg(text: text, incoming: false, time: nowTime(), state: .sealing, mode: fast ? "FAST" : "STRICT"))
         let idx = messages.count - 1
         draft = ""
         Task { @MainActor in
             if real {
-                // seal + SHIP over the relay + gateways; loopback-receive proves the round-trip
-                var recv: [String: Any]? = nil
+                // seal + SHIP over the relay + gateways; the recipient's device polls + opens.
+                var ok = false
                 let shipStr = SealCore.sealShippable(chat.devicePub, text, fast)
                 if let ship = (try? JSONSerialization.jsonObject(with: Data(shipStr.utf8))) as? [String: Any], (ship["ok"] as? Bool) == true {
                     await shipSeal(ship)
-                    let tag = ship["mailbox_tag"] as? String ?? ""
-                    let sealId = ship["seal_id"] as? String ?? ""
-                    if let bundle = await fetchInbox(tag) {
-                        let shares = await collectShares(sealId)
-                        let openStr = SealCore.openReceived(myDeviceSeed, bundle, shares)
-                        recv = (try? JSONSerialization.jsonObject(with: Data(openStr.utf8))) as? [String: Any]
-                    }
+                    ok = true
                 }
-                try? await Task.sleep(nanoseconds: fast ? 500_000_000 : 900_000_000)
+                try? await Task.sleep(nanoseconds: fast ? 400_000_000 : 800_000_000)
                 if messages.indices.contains(idx) {
-                    messages[idx].state = .opened
+                    messages[idx].state = ok ? .opened : .sealing
                     messages[idx].sealedFor = chat.name
                 }
-                if let r = recv, (r["ok"] as? Bool) == true, let plain = r["plaintext"] as? String {
-                    messages.append(Msg(text: plain, incoming: true, time: nowTime(), state: .opened))
-                }
+                await poll() // pick up a self-loopback / any pending inbound right away
             } else {
                 let json = fast ? SealCore.runFastDemo() : SealCore.runDemo()
                 try? await Task.sleep(nanoseconds: fast ? 550_000_000 : 1_150_000_000)

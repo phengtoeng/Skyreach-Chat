@@ -33,6 +33,11 @@ enum SealCore {
         phone.withCString { copy(ss_phone_commitment($0)) }
     }
 
+    /// My inbox tag {ok, mailbox_tag} from my device pubkey — poll the relay here for inbound seals.
+    static func mailboxTag(_ devicePub: String) -> String {
+        devicePub.withCString { copy(ss_mailbox_tag($0)) }
+    }
+
     /// Seal text to a contact's device pubkey (hex). Returns {ok, seal_id, recipient_device_commitment, ciphertext_len}.
     static func sealTo(_ devicePub: String, _ text: String, _ fast: Bool) -> String {
         devicePub.withCString { d in text.withCString { t in copy(ss_seal_to(d, t, fast ? 1 : 0)) } }

@@ -33,6 +33,10 @@ char *ss_parse_card(const char *code);
  * The raw number never goes on-chain; hash(phone) resolves to an address in the directory. */
 char *ss_phone_commitment(const char *phone);
 
+/* Inbox tag for a device pubkey (hex): { ok, mailbox_tag }.
+ * A recipient computes this from its OWN device pubkey and polls the relay at that tag. */
+char *ss_mailbox_tag(const char *device_pub);
+
 /* Seal text to a contact's device public key (hex). Openable only by that device.
  *   { ok, seal_id, recipient_device_commitment, ciphertext_len }  (fast: 1=FastSeal, 0=StrictSeal) */
 char *ss_seal_to(const char *device_pub, const char *text, int fast);

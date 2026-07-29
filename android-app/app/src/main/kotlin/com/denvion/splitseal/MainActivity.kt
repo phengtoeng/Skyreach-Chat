@@ -121,6 +121,21 @@ private class Store(ctx: Context) {
     fun addContact(c: JSONObject) {
         val a = contacts(); a.put(c); p.edit().putString("contacts", a.toString()).apply()
     }
+
+    // backend host (relay + gateways + directory)
+    fun serverHost(): String = p.getString("server_host", Server.DEFAULT_HOST) ?: Server.DEFAULT_HOST
+    fun saveServerHost(h: String) = p.edit().putString("server_host", h.trim()).apply()
+
+    // received messages, persisted + deduped per mailbox tag (all my inbound share my tag).
+    fun inbox(tag: String): JSONArray = p.getString("inbox_$tag", null)?.let { JSONArray(it) } ?: JSONArray()
+    /** Append a received message; returns false if this seal_id was already stored. */
+    fun addInbox(tag: String, sealId: String, text: String): Boolean {
+        val a = inbox(tag)
+        for (i in 0 until a.length()) if (a.getJSONObject(i).optString("id") == sealId) return false
+        a.put(JSONObject().put("id", sealId).put("text", text).put("ts", System.currentTimeMillis()))
+        p.edit().putString("inbox_$tag", a.toString()).apply()
+        return true
+    }
 }
 
 private fun loadOrCreateIdentity(store: Store): JSONObject {
@@ -138,15 +153,23 @@ private fun loadContacts(store: Store): List<Contact> {
     }
 }
 
-// Phone directory (privacy-preserving): the app sends only hash(phone), never the number.
-// 10.0.2.2 = the host loopback from the Android emulator; point at your directory server.
-private const val DIRECTORY_URL = "http://10.0.2.2:9988"
+// ── Configurable backend: relay + 3 gateways + directory all live on ONE host. ──
+// Default = WCAHT node N6 (reachable from any device). Override it in Settings — e.g.
+// "10.0.2.2" for services on the emulator's own host machine. Only a hostname/IP: the
+// ports are fixed. Nothing here is secret; the servers only ever see ciphertext + hashes.
+object Server {
+    const val DEFAULT_HOST = "51.79.176.134" // N6
+    @Volatile var host: String = DEFAULT_HOST
+    val directory: String get() = "http://$host:9988"
+    val relay: String get() = "http://$host:9200"
+    val gateways: List<String> get() = listOf(9201, 9202, 9203).map { "http://$host:$it" }
+}
 
 private fun directoryLookup(phone: String): JSONObject? {
     return try {
         val commit = JSONObject(SealCore.phoneCommitment(phone)).optString("phone_commitment")
         if (commit.isEmpty()) return null
-        val conn = (java.net.URL("$DIRECTORY_URL/lookup/$commit").openConnection() as java.net.HttpURLConnection).apply {
+        val conn = (java.net.URL("${Server.directory}/lookup/$commit").openConnection() as java.net.HttpURLConnection).apply {
             connectTimeout = 4000; readTimeout = 4000
         }
         if (conn.responseCode == 200) {
@@ -162,7 +185,7 @@ private fun directoryLookup(phone: String): JSONObject? {
 private fun directoryPublish(phone: String, cardCode: String): Boolean {
     return try {
         val commit = JSONObject(SealCore.phoneCommitment(phone)).optString("phone_commitment")
-        val conn = (java.net.URL("$DIRECTORY_URL/register").openConnection() as java.net.HttpURLConnection).apply {
+        val conn = (java.net.URL("${Server.directory}/register").openConnection() as java.net.HttpURLConnection).apply {
             requestMethod = "POST"; doOutput = true; connectTimeout = 4000; readTimeout = 4000
             setRequestProperty("Content-Type", "application/json")
         }
@@ -184,10 +207,7 @@ private fun qrBitmap(text: String, size: Int = 480): androidx.compose.ui.graphic
     return bmp.asImageBitmap()
 }
 
-// Delivery services (emulator → host). Ship ciphertext to the relay + shares to gateways.
-private const val RELAY_URL = "http://10.0.2.2:9200"
-private val GATEWAY_URLS = listOf("http://10.0.2.2:9201", "http://10.0.2.2:9202", "http://10.0.2.2:9203")
-
+// Delivery services (see Server above). Ship ciphertext to the relay + shares to gateways.
 private fun httpPost(url: String, body: String): Int = try {
     val conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
         requestMethod = "POST"; doOutput = true; connectTimeout = 4000; readTimeout = 4000
@@ -202,29 +222,32 @@ private fun httpGet(url: String): String? = try {
     if (conn.responseCode == 200) conn.inputStream.bufferedReader().use { it.readText() } else null
 } catch (e: Exception) { null }
 
-/** Ship a shippable seal: bundle → relay inbox, each share → a gateway (+ finalize). */
+/** Ship a shippable seal: {seal_id,bundle} → relay inbox, each share → a gateway (+ finalize). */
 private fun shipSeal(ship: JSONObject) {
     val tag = ship.optString("mailbox_tag")
     val sealId = ship.optString("seal_id")
-    httpPost("$RELAY_URL/inbox/$tag", ship.getJSONObject("bundle").toString())
+    // carry seal_id alongside the ciphertext so the recipient (who has neither) can collect shares.
+    val item = JSONObject().put("seal_id", sealId).put("bundle", ship.getJSONObject("bundle"))
+    httpPost("${Server.relay}/inbox/$tag", item.toString())
     val shares = ship.getJSONArray("shares")
-    for (i in 0 until minOf(shares.length(), GATEWAY_URLS.size)) {
-        httpPost("${GATEWAY_URLS[i]}/deposit", shares.getJSONObject(i).toString())
-        httpPost("${GATEWAY_URLS[i]}/finalize/$sealId", "")
+    val gateways = Server.gateways
+    for (i in 0 until minOf(shares.length(), gateways.size)) {
+        httpPost("${gateways[i]}/deposit", shares.getJSONObject(i).toString())
+        httpPost("${gateways[i]}/finalize/$sealId", "")
     }
 }
 
-/** Fetch the latest bundle delivered to a mailbox tag. */
-private fun fetchInbox(tag: String): String? {
-    val body = httpGet("$RELAY_URL/inbox/$tag") ?: return null
+/** Fetch every {seal_id,bundle} item delivered to a mailbox tag (recipient polls this). */
+private fun fetchInboxAll(tag: String): List<JSONObject> {
+    val body = httpGet("${Server.relay}/inbox/$tag") ?: return emptyList()
     val arr = JSONArray(body)
-    return if (arr.length() > 0) arr.getJSONObject(arr.length() - 1).toString() else null
+    return (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
 }
 
 /** Collect released shares for a seal from all gateways. */
 private fun collectShares(sealId: String): String {
     val all = JSONArray()
-    for (gw in GATEWAY_URLS) {
+    for (gw in Server.gateways) {
         val body = httpGet("$gw/release/$sealId") ?: continue
         val arr = JSONArray(body)
         for (i in 0 until arr.length()) all.put(arr.getJSONObject(i))
@@ -236,6 +259,7 @@ private fun collectShares(sealId: String): String {
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Server.host = Store(this).serverHost() // apply the saved backend before any network call
         val proto = runCatching {
             JSONObject(SealCore.version()).let { "DSCP-${it.getInt("version")} · chain ${it.getLong("chain_id")}" }
         }.getOrDefault("DSCP-2")
@@ -301,7 +325,12 @@ private fun App(proto: String) {
 
     val chat = openChat
     when {
-        chat != null -> ConversationScreen(chat, identity.optString("device_seed")) { openChat = null }
+        chat != null -> ConversationScreen(
+            chat,
+            myDeviceSeed = identity.optString("device_seed"),
+            myDevicePub = identity.optString("device_pub"),
+            store = store,
+        ) { openChat = null }
         showNew -> NewContactScreen(
             scanned = scanned,
             onScan = { launchScan() },
@@ -331,7 +360,17 @@ private fun App(proto: String) {
                 showNew = false; scanned = null
             },
         )
-        tab == 2 -> ProfileScreen(identity, tab, onTab = { tab = it }, onPublish = { publishPhone(it) })
+        tab == 2 -> ProfileScreen(
+            identity, tab,
+            currentHost = Server.host,
+            onTab = { tab = it },
+            onPublish = { publishPhone(it) },
+            onSaveHost = { h ->
+                Server.host = h
+                store.saveServerHost(h)
+                android.widget.Toast.makeText(ctx, "Server set to $h", android.widget.Toast.LENGTH_SHORT).show()
+            },
+        )
         else -> ChatListScreen(
             contacts = contacts,
             onOpen = { openChat = it },
@@ -454,13 +493,21 @@ private fun NavItem(
 
 // ───────────────────────────── profile / add ────────────────────────────────
 @Composable
-private fun ProfileScreen(identity: JSONObject, tab: Int, onTab: (Int) -> Unit, onPublish: (String) -> Unit) {
+private fun ProfileScreen(
+    identity: JSONObject,
+    tab: Int,
+    currentHost: String,
+    onTab: (Int) -> Unit,
+    onPublish: (String) -> Unit,
+    onSaveHost: (String) -> Unit,
+) {
     SystemBars(Blue, darkIcons = false)
     val name = identity.optString("name", "Me")
     val address = identity.optString("address")
     val card = identity.optString("card")
     val qr = remember(card) { runCatching { qrBitmap(card) }.getOrNull() }
     var myPhone by remember { mutableStateOf(identity.optString("phone")) }
+    var host by remember { mutableStateOf(currentHost) }
     Column(Modifier.fillMaxSize().background(ScreenBg)) {
         Row(
             Modifier.fillMaxWidth().background(Blue).padding(horizontal = 16.dp, vertical = 14.dp),
@@ -531,6 +578,41 @@ private fun ProfileScreen(identity: JSONObject, tab: Int, onTab: (Int) -> Unit, 
             ) { Text("Publish my number to the directory", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold) }
             Spacer(Modifier.height(6.dp))
             Text("Only a hash of your number is stored — never the number itself.", fontSize = 11.sp, color = Sub, textAlign = TextAlign.Center)
+
+            Spacer(Modifier.height(24.dp))
+            Box(Modifier.fillMaxWidth().height(1.dp).background(Hair))
+            Spacer(Modifier.height(16.dp))
+            Text("Server", fontSize = 13.sp, color = Sub)
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "Host running the relay + gateways + directory. Both people must point at the same one.",
+                fontSize = 11.sp, color = Sub, textAlign = TextAlign.Center,
+            )
+            Spacer(Modifier.height(10.dp))
+            Row(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Color(0xFFF1F4F7)).padding(horizontal = 14.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(Modifier.weight(1f)) {
+                    if (host.isEmpty()) Text("server IP or hostname", color = Sub, fontSize = 15.sp)
+                    BasicTextField(
+                        value = host,
+                        onValueChange = { host = it.trim() },
+                        singleLine = true,
+                        textStyle = TextStyle(color = Ink, fontSize = 15.sp),
+                        cursorBrush = Brush.verticalGradient(listOf(Blue, Blue)),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            }
+            Spacer(Modifier.height(10.dp))
+            Box(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                    .background(if (host.isNotBlank()) Blue else Color(0xFFCBD3DA))
+                    .clickable(enabled = host.isNotBlank()) { onSaveHost(host.trim()) }
+                    .padding(vertical = 14.dp),
+                contentAlignment = Alignment.Center,
+            ) { Text("Save server", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold) }
             Spacer(Modifier.height(16.dp))
         }
         BottomBar(tab, onTab)
@@ -661,46 +743,103 @@ private fun FormField(placeholder: String, value: String, onChange: (String) -> 
 
 // ────────────────────────────── conversation ────────────────────────────────
 @Composable
-private fun ConversationScreen(chat: Chat, myDeviceSeed: String, onBack: () -> Unit) {
+private fun ConversationScreen(
+    chat: Chat,
+    myDeviceSeed: String,
+    myDevicePub: String,
+    store: Store,
+    onBack: () -> Unit,
+) {
     SystemBars(Color.White, darkIcons = true)
     BackHandler(onBack = onBack)
 
-    val messages = remember { mutableStateListOf<Msg>().apply { addAll(seedThread()) } }
+    // A "real" conversation is linked to a contact's device key (vs. the demo threads).
+    val real = chat.devicePub.isNotBlank()
+    // My own inbox tag: every message sealed TO me lands here, and I poll it to receive.
+    val myTag = remember(myDevicePub) {
+        if (myDevicePub.isBlank()) ""
+        else runCatching { JSONObject(SealCore.mailboxTag(myDevicePub)).optString("mailbox_tag") }.getOrDefault("")
+    }
+    val seen = remember { mutableSetOf<String>() }
+    val messages = remember {
+        mutableStateListOf<Msg>().apply {
+            if (real) {
+                // restore previously-received messages (deduped by seal_id)
+                val stored = store.inbox(myTag)
+                for (i in 0 until stored.length()) {
+                    val o = stored.getJSONObject(i)
+                    seen.add(o.optString("id"))
+                    add(Msg(System.nanoTime() + i, o.optString("text"), true, "", state = State.OPENED))
+                }
+            } else {
+                addAll(seedThread())
+            }
+        }
+    }
     var draft by remember { mutableStateOf("") }
     var fastMode by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
+    val polling = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
 
     LaunchedEffect(Unit) { if (messages.isNotEmpty()) listState.scrollToItem(messages.lastIndex) }
+
+    // Poll my inbox: fetch delivered ciphertext, collect released shares, open, show. One at a time.
+    suspend fun poll() {
+        if (!real || myTag.isBlank()) return
+        if (!polling.compareAndSet(false, true)) return
+        try {
+            val items = withContext(Dispatchers.IO) { fetchInboxAll(myTag) }
+            for (item in items) {
+                val sealId = item.optString("seal_id")
+                val bundle = item.optJSONObject("bundle") ?: continue
+                if (sealId.isBlank() || sealId in seen) continue
+                val shares = withContext(Dispatchers.IO) { collectShares(sealId) }
+                val opened = runCatching {
+                    withContext(Dispatchers.IO) { JSONObject(SealCore.openReceived(myDeviceSeed, bundle.toString(), shares)) }
+                }.getOrNull()
+                if (opened != null && opened.optBoolean("ok")) {
+                    seen.add(sealId)
+                    val text = opened.optString("plaintext")
+                    if (store.addInbox(myTag, sealId, text)) { // persist; the dedup authority
+                        messages.add(Msg(System.nanoTime(), text, true, now(), state = State.OPENED))
+                        listState.animateScrollToItem(messages.lastIndex)
+                    }
+                }
+                // if not opened yet (shares still locked) leave it unseen to retry next poll
+            }
+        } finally {
+            polling.set(false)
+        }
+    }
+
+    // live receive: poll every few seconds while the conversation is open
+    LaunchedEffect(myTag, real) {
+        if (real && myTag.isNotBlank()) while (true) { poll(); delay(3000) }
+    }
 
     fun send() {
         val text = draft.trim()
         if (text.isEmpty()) return
         val fast = fastMode
-        val real = chat.devicePub.isNotBlank()
         messages.add(Msg(System.nanoTime(), text, false, now(), state = State.SEALING, mode = if (fast) "FAST" else "STRICT"))
         val idx = messages.lastIndex
         draft = ""
         scope.launch {
             listState.animateScrollToItem(messages.lastIndex)
             if (real) {
-                // seal + SHIP over the relay + gateways; loopback-receive proves the round-trip
-                val received = runCatching {
+                // seal + SHIP over the relay + gateways; the recipient's device polls + opens.
+                val ok = runCatching {
                     withContext(Dispatchers.IO) {
                         val ship = JSONObject(SealCore.sealShippable(chat.devicePub, text, fast))
-                        if (!ship.optBoolean("ok")) return@withContext null
+                        if (!ship.optBoolean("ok")) return@withContext false
                         shipSeal(ship)
-                        val bundle = fetchInbox(ship.optString("mailbox_tag"))
-                        val shares = collectShares(ship.optString("seal_id"))
-                        if (bundle != null) JSONObject(SealCore.openReceived(myDeviceSeed, bundle, shares)) else null
+                        true
                     }
-                }.getOrNull()
-                delay(if (fast) 500 else 900)
-                messages[idx] = messages[idx].copy(state = State.OPENED, sealedFor = chat.name)
-                if (received != null && received.optBoolean("ok")) {
-                    messages.add(Msg(System.nanoTime(), received.optString("plaintext"), true, now(), state = State.OPENED))
-                    listState.animateScrollToItem(messages.lastIndex)
-                }
+                }.getOrDefault(false)
+                delay(if (fast) 400 else 800)
+                messages[idx] = messages[idx].copy(state = if (ok) State.OPENED else State.SEALING, sealedFor = chat.name)
+                poll() // pick up a self-loopback / any pending inbound right away
             } else {
                 val transcript = runCatching {
                     withContext(Dispatchers.Default) { if (fast) SealCore.runFastDemo() else SealCore.runDemo() }

@@ -166,6 +166,17 @@ fn phone_commitment_json(phone: &str) -> String {
     .to_string()
 }
 
+/// Deterministic relay/inbox address for a device public key (hex):
+/// `hash("DSCP-2/mailbox", device_pub)`. A recipient computes this from its OWN device
+/// pubkey to poll the relay for inbound sealed messages (senders address the same tag).
+fn mailbox_tag_json(device_pub_hex: &str) -> String {
+    let dp: Option<[u8; 32]> = hex::decode(device_pub_hex.trim()).ok().and_then(|v| v.try_into().ok());
+    match dp {
+        Some(device_pub) => json!({ "ok": true, "mailbox_tag": hex::encode(mailbox_tag(&device_pub)) }).to_string(),
+        None => json!({ "ok": false, "error": "bad device pubkey" }).to_string(),
+    }
+}
+
 /// Validate a scanned/pasted contact code into a contact.
 fn parse_card_json(code: &str) -> String {
     match ContactCard::decode(code) {
@@ -240,6 +251,16 @@ pub unsafe extern "C" fn ss_parse_card(code: *const c_char) -> *mut c_char {
 #[no_mangle]
 pub unsafe extern "C" fn ss_phone_commitment(phone: *const c_char) -> *mut c_char {
     to_c(phone_commitment_json(&cstr(phone)))
+}
+
+/// Inbox/mailbox tag for a device pubkey (hex): `{ ok, mailbox_tag }`. A recipient polls
+/// the delivery relay at this tag for inbound sealed messages.
+///
+/// # Safety
+/// `device_pub` must be null or a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn ss_mailbox_tag(device_pub: *const c_char) -> *mut c_char {
+    to_c(mailbox_tag_json(&cstr(device_pub)))
 }
 
 /// Seal `text` to a contact's device public key (hex). Returns
@@ -522,6 +543,16 @@ pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativePhoneCommitment
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeMailboxTag<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    device_pub: JString<'local>,
+) -> jstring {
+    let dp = jstr(&mut env, &device_pub);
+    ret(env, mailbox_tag_json(&dp))
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeSealTo<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
@@ -579,5 +610,49 @@ mod tests {
         assert!(s.contains("LOCKED"), "locked before any pre-confirmations: {s}");
         assert!(s.contains("OPENED"), "opens on the pre-conf quorum: {s}");
         assert!(s.contains("FastSeal") && s.contains("DSCP-2"), "labels the fast path: {s}");
+    }
+
+    #[test]
+    fn mailbox_tag_is_deterministic_and_matches_shippable() {
+        let bob: Value = serde_json::from_str(&new_identity_json("Bob")).unwrap();
+        let device_pub = bob["device_pub"].as_str().unwrap();
+
+        // a recipient computes its own inbox tag; it must be stable...
+        let t1: Value = serde_json::from_str(&mailbox_tag_json(device_pub)).unwrap();
+        let t2: Value = serde_json::from_str(&mailbox_tag_json(device_pub)).unwrap();
+        assert_eq!(t1["ok"], true);
+        assert_eq!(t1["mailbox_tag"], t2["mailbox_tag"]);
+
+        // ...and equal to the tag the SENDER ships to, so polling it receives the seal.
+        let ship: Value = serde_json::from_str(&seal_shippable_json(device_pub, "hi", false)).unwrap();
+        assert_eq!(ship["ok"], true);
+        assert_eq!(ship["mailbox_tag"], t1["mailbox_tag"]);
+
+        // a bad pubkey is rejected, not a panic.
+        let bad: Value = serde_json::from_str(&mailbox_tag_json("nothex")).unwrap();
+        assert_eq!(bad["ok"], false);
+    }
+
+    #[test]
+    fn app_receive_roundtrip_opens_shipped_seal() {
+        // mirrors the mobile path: sender seals to Bob's device_pub and ships {seal_id,bundle}
+        // + shares; Bob rebuilds his device from his stored seed and opens.
+        let bob: Value = serde_json::from_str(&new_identity_json("Bob")).unwrap();
+        let device_pub = bob["device_pub"].as_str().unwrap();
+        let device_seed = bob["device_seed"].as_str().unwrap();
+
+        let ship: Value = serde_json::from_str(&seal_shippable_json(device_pub, "meet at 9", false)).unwrap();
+        let bundle = ship["bundle"].to_string();
+        let shares = ship["shares"].to_string();
+
+        let opened: Value = serde_json::from_str(&open_received_json(device_seed, &bundle, &shares)).unwrap();
+        assert_eq!(opened["ok"], true, "should open: {opened}");
+        assert_eq!(opened["plaintext"], "meet at 9");
+
+        // the wrong device seed must NOT open it.
+        let mallory: Value = serde_json::from_str(&new_identity_json("Mallory")).unwrap();
+        let wrong_seed = mallory["device_seed"].as_str().unwrap();
+        let denied: Value = serde_json::from_str(&open_received_json(wrong_seed, &bundle, &shares)).unwrap();
+        assert_eq!(denied["ok"], false, "wrong device must be denied: {denied}");
     }
 }
