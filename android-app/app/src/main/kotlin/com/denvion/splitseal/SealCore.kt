@@ -12,6 +12,9 @@ object SealCore {
     private external fun nativeVersion(): String
     private external fun nativeRunDemo(): String
     private external fun nativeRunFastDemo(): String
+    private external fun nativeNewIdentity(name: String): String
+    private external fun nativeCardFor(identitySeed: String, deviceSeed: String, name: String): String
+    private external fun nativeParseCard(code: String): String
 
     /** `{ "protocol":"DSCP-2", "version":2, "chain_id":7789 }` */
     fun version(): String = nativeVersion()
@@ -21,4 +24,13 @@ object SealCore {
 
     /** FastSeal: seal -> (locked) -> gateway pre-confirmation quorum -> (opened before finality). */
     fun runFastDemo(): String = nativeRunFastDemo()
+
+    /** New account. Returns JSON {name,address,identity_seed,device_seed,identity_pub,device_pub,card}. Persist the seeds! */
+    fun newIdentity(name: String): String = nativeNewIdentity(name)
+
+    /** Rebuild {name,address,identity_pub,device_pub,card} from stored seeds. */
+    fun cardFor(identitySeed: String, deviceSeed: String, name: String): String = nativeCardFor(identitySeed, deviceSeed, name)
+
+    /** Validate a scanned/pasted contact code. Returns {ok,name,address,identity_pub,device_pub} or {ok:false,error}. */
+    fun parseCard(code: String): String = nativeParseCard(code)
 }

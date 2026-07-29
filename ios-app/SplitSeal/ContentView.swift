@@ -1,4 +1,5 @@
 import SwiftUI
+import CoreImage.CIFilterBuiltins
 
 // ─────────────────────────────── palette ────────────────────────────────────
 extension Color {
@@ -59,22 +60,93 @@ private func seedThread() -> [Msg] {
     ]
 }
 
+// ─────────────────────── identity + contacts (persisted) ────────────────────
+struct Contact: Identifiable { let id = UUID(); let name: String; let address: String; let devicePub: String }
+
+enum Store {
+    private static let d = UserDefaults.standard
+    static func identity() -> [String: Any]? {
+        guard let s = d.string(forKey: "identity"), let data = s.data(using: .utf8) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+    static func saveIdentity(_ json: String) { d.set(json, forKey: "identity") }
+    static func contacts() -> [[String: Any]] {
+        guard let s = d.string(forKey: "contacts"), let data = s.data(using: .utf8) else { return [] }
+        return ((try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]) ?? []
+    }
+    static func addContact(_ json: String) {
+        guard let data = json.data(using: .utf8),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
+        var a = contacts(); a.append(obj)
+        if let out = try? JSONSerialization.data(withJSONObject: a), let s = String(data: out, encoding: .utf8) {
+            d.set(s, forKey: "contacts")
+        }
+    }
+}
+
+func loadOrCreateIdentity() -> [String: Any] {
+    if let j = Store.identity() { return j }
+    let json = SealCore.newIdentity("Me")
+    Store.saveIdentity(json)
+    return ((try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any]) ?? [:]
+}
+func loadContacts() -> [Contact] {
+    Store.contacts().map {
+        Contact(name: $0["name"] as? String ?? "", address: $0["address"] as? String ?? "", devicePub: $0["device_pub"] as? String ?? "")
+    }
+}
+
+func qrImage(_ text: String) -> Image? {
+    let filter = CIFilter.qrCodeGenerator()
+    filter.message = Data(text.utf8)
+    guard let output = filter.outputImage?.transformed(by: CGAffineTransform(scaleX: 8, y: 8)),
+          let cg = CIContext().createCGImage(output, from: output.extent) else { return nil }
+    return Image(decorative: cg, scale: 1, orientation: .up)
+}
+
 // ─────────────────────────────── root nav ───────────────────────────────────
 struct ContentView: View {
+    @State private var identity: [String: Any] = loadOrCreateIdentity()
+    @State private var contacts: [Contact] = loadContacts()
     @State private var openChat: Chat? = nil
+    @State private var tab = 0
+    @State private var showAdd = false
+
     var body: some View {
-        if let c = openChat {
-            ConversationView(chat: c, onBack: { openChat = nil })
-        } else {
-            ChatListView(onOpen: { openChat = $0 })
+        Group {
+            if let c = openChat {
+                ConversationView(chat: c, onBack: { openChat = nil })
+            } else if tab == 2 {
+                ProfileView(identity: identity, tab: tab, onTab: { tab = $0 })
+            } else {
+                ChatListView(contacts: contacts, onOpen: { openChat = $0 }, onAdd: { showAdd = true }, tab: tab, onTab: { tab = $0 })
+            }
+        }
+        .sheet(isPresented: $showAdd) {
+            AddContactSheet(onCancel: { showAdd = false }, onAdd: { code in
+                let res = SealCore.parseCard(code)
+                let j = (try? JSONSerialization.jsonObject(with: Data(res.utf8))) as? [String: Any]
+                if (j?["ok"] as? Bool) == true {
+                    Store.addContact(res)
+                    contacts = loadContacts()
+                    showAdd = false
+                    return nil
+                }
+                return (j?["error"] as? String) ?? "invalid code"
+            })
         }
     }
 }
 
 // ─────────────────────────────── chat list ──────────────────────────────────
 struct ChatListView: View {
+    let contacts: [Contact]
     let onOpen: (Chat) -> Void
+    let onAdd: () -> Void
+    let tab: Int
+    let onTab: (Int) -> Void
     var body: some View {
+        let rows = contacts.map { Chat(name: $0.name, last: String($0.address.prefix(14)) + "… · tap to seal", time: "") } + CHATS
         VStack(spacing: 0) {
             HStack(spacing: 8) {
                 Image(systemName: "shield.fill").foregroundColor(.white).font(.system(size: 20))
@@ -89,20 +161,21 @@ struct ChatListView: View {
             ZStack(alignment: .bottomTrailing) {
                 ScrollView {
                     LazyVStack(spacing: 0) {
-                        ForEach(CHATS) { c in
+                        ForEach(rows.indices, id: \.self) { i in
+                            let c = rows[i]
                             ChatRow(c).contentShape(Rectangle()).onTapGesture { onOpen(c) }
                             Rectangle().fill(Color.dvHair).frame(height: 1).padding(.leading, 84)
                         }
                     }
                 }
-                Button(action: { onOpen(CHATS[0]) }) {
-                    Image(systemName: "square.and.pencil").foregroundColor(.white).font(.system(size: 22))
+                Button(action: onAdd) {
+                    Image(systemName: "person.badge.plus").foregroundColor(.white).font(.system(size: 22))
                         .frame(width: 56, height: 56).background(Color.dvBlue).clipShape(RoundedRectangle(cornerRadius: 16))
                         .shadow(color: .dvBlue.opacity(0.4), radius: 6, y: 3)
                 }.padding(20)
             }
 
-            BottomBar()
+            BottomBar(tab: tab, onTab: onTab)
         }
         .background(Color.white)
     }
@@ -134,13 +207,15 @@ private struct ChatRow: View {
 }
 
 private struct BottomBar: View {
+    let tab: Int
+    let onTab: (Int) -> Void
     var body: some View {
         VStack(spacing: 0) {
             Rectangle().fill(Color.dvHair).frame(height: 1)
             HStack {
-                NavItem(icon: "bubble.left.fill", label: "Chats", active: true)
-                NavItem(icon: "phone.fill", label: "Calls", active: false)
-                NavItem(icon: "gearshape.fill", label: "Settings", active: false)
+                NavItem(icon: "bubble.left.fill", label: "Chats", active: tab == 0) { onTab(0) }
+                NavItem(icon: "phone.fill", label: "Calls", active: tab == 1) { onTab(1) }
+                NavItem(icon: "gearshape.fill", label: "Settings", active: tab == 2) { onTab(2) }
             }
             .frame(maxWidth: .infinity)
             .padding(.top, 8).padding(.bottom, 4)
@@ -150,7 +225,7 @@ private struct BottomBar: View {
 }
 
 private struct NavItem: View {
-    let icon: String; let label: String; let active: Bool
+    let icon: String; let label: String; let active: Bool; let onTap: () -> Void
     var body: some View {
         VStack(spacing: 3) {
             Image(systemName: icon).font(.system(size: 21))
@@ -158,6 +233,78 @@ private struct NavItem: View {
         }
         .foregroundColor(active ? .dvBlue : .dvSub)
         .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onTap)
+    }
+}
+
+// ───────────────────────────── profile / add ────────────────────────────────
+struct ProfileView: View {
+    let identity: [String: Any]
+    let tab: Int
+    let onTab: (Int) -> Void
+    var body: some View {
+        let name = identity["name"] as? String ?? "Me"
+        let address = identity["address"] as? String ?? ""
+        let card = identity["card"] as? String ?? ""
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "shield.fill").foregroundColor(.white).font(.system(size: 20))
+                Text("My Denvion ID").font(.system(size: 20, weight: .bold)).foregroundColor(.white)
+                Spacer()
+            }
+            .padding(16).frame(maxWidth: .infinity)
+            .background(Color.dvBlue.ignoresSafeArea(edges: .top))
+
+            ScrollView {
+                VStack(spacing: 14) {
+                    Avatar(name, 76)
+                    Text(name).font(.system(size: 20, weight: .semibold)).foregroundColor(.dvInk)
+                    VStack(spacing: 2) {
+                        Text("WCAHT identity address").font(.system(size: 12)).foregroundColor(.dvSub)
+                        Text(address).font(.system(size: 13)).foregroundColor(.dvBlue)
+                            .multilineTextAlignment(.center).textSelection(.enabled)
+                    }
+                    if let qr = qrImage(card) {
+                        qr.interpolation(.none).resizable().frame(width: 230, height: 230)
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                            .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.dvHair))
+                    }
+                    Text("Share this code so others can add you").font(.system(size: 13)).foregroundColor(.dvSub)
+                    Text(card).font(.system(size: 11)).foregroundColor(.dvInk)
+                        .multilineTextAlignment(.center).textSelection(.enabled)
+                        .padding(12).background(Color(hex: 0xF1F4F7)).clipShape(RoundedRectangle(cornerRadius: 10))
+                }
+                .padding(20)
+            }
+
+            BottomBar(tab: tab, onTab: onTab)
+        }
+        .background(Color.white)
+    }
+}
+
+struct AddContactSheet: View {
+    let onCancel: () -> Void
+    let onAdd: (String) -> String?
+    @State private var code = ""
+    @State private var error: String? = nil
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Add contact").font(.system(size: 20, weight: .bold)).foregroundColor(.dvInk)
+            Text("Paste your contact's Denvion code.").font(.system(size: 13)).foregroundColor(.dvSub)
+            TextField("denvion:…", text: $code, axis: .vertical).lineLimit(2...5)
+                .padding(10).background(Color(hex: 0xF1F4F7)).clipShape(RoundedRectangle(cornerRadius: 10))
+            if let e = error { Text(e).font(.system(size: 12)).foregroundColor(.red) }
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel).foregroundColor(.dvSub)
+                Button("Add") { error = onAdd(code.trimmingCharacters(in: .whitespacesAndNewlines)) }
+                    .fontWeight(.semibold).foregroundColor(.dvBlue).padding(.leading, 16)
+            }
+        }
+        .padding(20)
+        .presentationDetents([.medium])
     }
 }
 

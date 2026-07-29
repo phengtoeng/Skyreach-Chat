@@ -503,3 +503,67 @@ fn slashed_gateway_cannot_help_open_fastseal() {
     assert_eq!(trusted.len(), 1);
     assert!(matches!(w.open_fast(&item, &shares, &trusted), OpenOutcome::Locked { .. }));
 }
+
+// ───────────────────────── identity / address / contacts ────────────────────
+
+#[test]
+fn identity_address_and_card_roundtrip() {
+    let me = Identity::generate("Maya");
+    // the address is the base58 WCAHT address of the identity pubkey
+    assert_eq!(me.address(), wcaht_address(&me.identity_pub()));
+    assert!(!me.address().is_empty());
+
+    // identity is deterministic from its seeds (so it can be persisted + restored)
+    let restored = Identity::from_seeds("Maya", me.identity_seed, me.device_seed);
+    assert_eq!(restored.identity_pub(), me.identity_pub());
+    assert_eq!(restored.device_pub(), me.device_pub());
+    assert_eq!(restored.address(), me.address());
+
+    // card encodes → decodes, binding the exact keys + chain + name
+    let card = me.card();
+    let code = card.encode();
+    assert!(code.starts_with("denvion:"));
+    let scanned = ContactCard::decode(&code).unwrap();
+    assert_eq!(scanned, card);
+    assert_eq!(scanned.address(), me.address());
+    assert_eq!(scanned.device_pub, me.device_pub());
+    assert_eq!(scanned.name, "Maya");
+}
+
+#[test]
+fn contact_card_rejects_wrong_chain_and_garbage() {
+    let card = Identity::generate("Bob").card();
+    // wrong chain id in the payload is rejected
+    let mut wrong = card.clone();
+    wrong.chain_id = 1;
+    assert!(ContactCard::decode(&wrong.encode()).is_err());
+    // unknown version
+    let mut vbad = card.clone();
+    vbad.version = 9;
+    assert!(ContactCard::decode(&vbad.encode()).is_err());
+    // non-base58 garbage
+    assert!(ContactCard::decode("denvion:0OIl!!!").is_err());
+    // too short
+    assert!(ContactCard::decode("denvion:2g").is_err());
+}
+
+#[test]
+fn i_can_seal_to_a_contact_i_added_from_their_card() {
+    // Alice adds Bob by scanning his card, then seals a message to his device key.
+    let bob = Identity::generate("Bob");
+    let bob_card = ContactCard::decode(&bob.card().encode()).unwrap();
+
+    let alice_id = sc::SignId::generate();
+    let alice_dev = sc::SignId::generate();
+    let gw_ids: Vec<[u8; 32]> = (0..3).map(|_| sc::random_32()).collect();
+    let item = seal_text(
+        b"only Bob's device can open this",
+        &alice_id, &alice_dev,
+        &bob_card.device_pub, // sealed TO the contact's real device key
+        sc::random_32(), &gw_ids, 2, 100, 1000,
+    )
+    .unwrap();
+    // the sealed leaf commits to Bob's device, addressed via his card
+    assert_eq!(item.signed_leaf.leaf.recipient_device_commitment, device_commitment(&bob_card.device_pub));
+    assert_eq!(bob_card.address(), bob.address());
+}

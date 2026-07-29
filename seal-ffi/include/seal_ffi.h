@@ -17,6 +17,18 @@ char *ss_run_demo(void);
 /* FastSeal: seal -> (locked) -> gateway pre-confirmation quorum -> (opened, pre-finality). */
 char *ss_run_fast_demo(void);
 
+/* Create a new account (identity + device keys). Returns JSON:
+ *   { name, address, identity_seed, device_seed, identity_pub, device_pub, card }
+ * The app MUST persist identity_seed + device_seed (platform keystore). */
+char *ss_new_identity(const char *name);
+
+/* Rebuild { name, address, identity_pub, device_pub, card } from stored seeds. */
+char *ss_card_for(const char *identity_seed, const char *device_seed, const char *name);
+
+/* Validate a scanned/pasted contact code ("denvion:…"):
+ *   { ok:true, name, address, identity_pub, device_pub }  or  { ok:false, error }. */
+char *ss_parse_card(const char *code);
+
 /* Free a string returned by any ss_* function. Safe on NULL. */
 void ss_free(char *ptr);
 

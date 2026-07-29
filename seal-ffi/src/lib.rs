@@ -6,7 +6,7 @@
 //! (keys, seal, submit, open against real relay/gateway/WCAHT services) is the next
 //! phase and slots in behind the same ABI.
 
-use std::ffi::{c_char, CString};
+use std::ffi::{c_char, CStr, CString};
 
 use seal_core::*;
 use seal_crypto as sc;
@@ -14,6 +14,72 @@ use serde_json::{json, Value};
 
 fn to_c(s: String) -> *mut c_char {
     CString::new(s).unwrap_or_else(|_| CString::new("{}").unwrap()).into_raw()
+}
+
+/// # Safety
+/// `p` must be null or a valid NUL-terminated C string.
+unsafe fn cstr(p: *const c_char) -> String {
+    if p.is_null() {
+        String::new()
+    } else {
+        CStr::from_ptr(p).to_string_lossy().into_owned()
+    }
+}
+
+fn seed_from_hex(s: &str) -> [u8; 32] {
+    let v = hex::decode(s.trim()).unwrap_or_default();
+    let mut out = [0u8; 32];
+    if v.len() == 32 {
+        out.copy_from_slice(&v);
+    }
+    out
+}
+
+// ── identity / contacts (shared by the C ABI and JNI) ──
+
+/// Create a fresh account. The app must PERSIST `identity_seed` + `device_seed` (in the
+/// platform keystore). Returns the address + shareable card.
+fn new_identity_json(name: &str) -> String {
+    let name = if name.trim().is_empty() { "Me" } else { name.trim() };
+    let id = Identity::generate(name);
+    json!({
+        "name": id.name,
+        "address": id.address(),
+        "identity_seed": hex::encode(id.identity_seed),
+        "device_seed": hex::encode(id.device_seed),
+        "identity_pub": hex::encode(id.identity_pub()),
+        "device_pub": hex::encode(id.device_pub()),
+        "card": id.card().encode(),
+    })
+    .to_string()
+}
+
+/// Rebuild the address + card from stored seeds (e.g. on app relaunch).
+fn card_for_json(identity_seed_hex: &str, device_seed_hex: &str, name: &str) -> String {
+    let id = Identity::from_seeds(name, seed_from_hex(identity_seed_hex), seed_from_hex(device_seed_hex));
+    json!({
+        "name": id.name,
+        "address": id.address(),
+        "identity_pub": hex::encode(id.identity_pub()),
+        "device_pub": hex::encode(id.device_pub()),
+        "card": id.card().encode(),
+    })
+    .to_string()
+}
+
+/// Validate a scanned/pasted contact code into a contact.
+fn parse_card_json(code: &str) -> String {
+    match ContactCard::decode(code) {
+        Ok(c) => json!({
+            "ok": true,
+            "name": c.name,
+            "address": c.address(),
+            "identity_pub": hex::encode(c.identity_pub),
+            "device_pub": hex::encode(c.device_pub),
+        })
+        .to_string(),
+        Err(e) => json!({ "ok": false, "error": e.to_string() }).to_string(),
+    }
 }
 
 /// Protocol identity: version + chain id.
@@ -34,6 +100,38 @@ pub extern "C" fn ss_run_demo() -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn ss_run_fast_demo() -> *mut c_char {
     to_c(run_fast_demo())
+}
+
+/// Create a new account (identity + device keys). Returns JSON with seeds to persist,
+/// the WCAHT address, and the shareable card.
+///
+/// # Safety
+/// `name` must be null or a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn ss_new_identity(name: *const c_char) -> *mut c_char {
+    to_c(new_identity_json(&cstr(name)))
+}
+
+/// Rebuild the address + card from previously-stored seeds.
+///
+/// # Safety
+/// All arguments must be null or valid NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn ss_card_for(
+    identity_seed: *const c_char,
+    device_seed: *const c_char,
+    name: *const c_char,
+) -> *mut c_char {
+    to_c(card_for_json(&cstr(identity_seed), &cstr(device_seed), &cstr(name)))
+}
+
+/// Validate a scanned/pasted contact code (`denvion:…`) into a contact.
+///
+/// # Safety
+/// `code` must be null or a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn ss_parse_card(code: *const c_char) -> *mut c_char {
+    to_c(parse_card_json(&cstr(code)))
 }
 
 /// Free a string returned by any `ss_*` function. Safe on null.
@@ -195,9 +293,19 @@ fn run_fast_demo() -> String {
 // Kotlin declares: external fun nativeVersion(): String / external fun nativeRunDemo(): String
 // The C ABI above serves the iOS/Swift side; these serve JVM/Android.
 
-use jni::objects::JClass;
+use jni::objects::{JClass, JString};
 use jni::sys::jstring;
 use jni::JNIEnv;
+
+fn jstr(env: &mut JNIEnv, s: &JString) -> String {
+    env.get_string(s).map(|v| v.into()).unwrap_or_default()
+}
+fn ret(env: JNIEnv, s: String) -> jstring {
+    match env.new_string(s) {
+        Ok(js) => js.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
 
 #[no_mangle]
 pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeVersion<'local>(
@@ -231,6 +339,40 @@ pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeRunFastDemo<'lo
         Ok(js) => js.into_raw(),
         Err(_) => std::ptr::null_mut(),
     }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeNewIdentity<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    name: JString<'local>,
+) -> jstring {
+    let name = jstr(&mut env, &name);
+    ret(env, new_identity_json(&name))
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeCardFor<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    identity_seed: JString<'local>,
+    device_seed: JString<'local>,
+    name: JString<'local>,
+) -> jstring {
+    let i = jstr(&mut env, &identity_seed);
+    let d = jstr(&mut env, &device_seed);
+    let n = jstr(&mut env, &name);
+    ret(env, card_for_json(&i, &d, &n))
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeParseCard<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    code: JString<'local>,
+) -> jstring {
+    let code = jstr(&mut env, &code);
+    ret(env, parse_card_json(&code))
 }
 
 #[cfg(test)]

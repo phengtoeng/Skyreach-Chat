@@ -10,3 +10,4 @@ seal-crypto = { path = "../seal-crypto" }
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 anyhow = "1"
+bs58 = "0.5"

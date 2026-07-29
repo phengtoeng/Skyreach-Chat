@@ -178,6 +178,116 @@ fn leaf_aad(leaf: &SealLeaf) -> [u8; 32] {
     )
 }
 
+// ───────────────────────── identity, address & contacts ─────────────────────
+
+/// Contact-card wire version (bump when the layout changes).
+pub const CONTACT_CARD_VERSION: u8 = 1;
+
+/// A user's on-chain identity **address** = base58 of their Ed25519 identity public key.
+/// This is a valid WCAHT address (a 32-byte ed25519 pubkey, base58-encoded), but it is
+/// the *identity* key — kept separate from any spending wallet and any device key.
+pub fn wcaht_address(identity_pub: &[u8; 32]) -> String {
+    bs58::encode(identity_pub).into_string()
+}
+
+/// A self-custodied account: a chat-identity key (Ed25519) + a device key (X25519),
+/// held as their 32-byte seeds so the app can persist them in the platform keystore and
+/// reconstruct the keys deterministically. Never mixed with the WCAHT wallet key.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Identity {
+    pub name: String,
+    pub identity_seed: [u8; 32],
+    pub device_seed: [u8; 32],
+}
+
+impl Identity {
+    pub fn generate(name: &str) -> Self {
+        Self { name: name.to_string(), identity_seed: sc::random_32(), device_seed: sc::random_32() }
+    }
+    pub fn from_seeds(name: &str, identity_seed: [u8; 32], device_seed: [u8; 32]) -> Self {
+        Self { name: name.to_string(), identity_seed, device_seed }
+    }
+    pub fn sign_id(&self) -> sc::SignId {
+        sc::SignId::from_seed(&self.identity_seed)
+    }
+    pub fn device(&self) -> sc::DeviceKey {
+        sc::DeviceKey::from_seed(self.device_seed)
+    }
+    pub fn identity_pub(&self) -> [u8; 32] {
+        self.sign_id().public()
+    }
+    pub fn device_pub(&self) -> [u8; 32] {
+        self.device().public()
+    }
+    /// The WCAHT identity address for this account.
+    pub fn address(&self) -> String {
+        wcaht_address(&self.identity_pub())
+    }
+    /// The shareable card a QR / invite encodes (what a contact scans to reach you).
+    pub fn card(&self) -> ContactCard {
+        ContactCard {
+            version: CONTACT_CARD_VERSION,
+            chain_id: CHAIN_ID,
+            name: self.name.clone(),
+            identity_pub: self.identity_pub(),
+            device_pub: self.device_pub(),
+        }
+    }
+}
+
+/// The public half of an identity: everything needed to seal a message TO someone and
+/// verify their seals. This is what you exchange (QR / invite code) to add a contact.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContactCard {
+    pub version: u8,
+    pub chain_id: u64,
+    pub name: String,
+    pub identity_pub: [u8; 32],
+    pub device_pub: [u8; 32],
+}
+
+impl ContactCard {
+    /// The contact's WCAHT identity address.
+    pub fn address(&self) -> String {
+        wcaht_address(&self.identity_pub)
+    }
+
+    /// Encode as a compact, scannable invite: `denvion:<base58(payload)>`.
+    /// Payload = version | chain_id(LE) | identity_pub(32) | device_pub(32) | name.
+    pub fn encode(&self) -> String {
+        let mut v = Vec::with_capacity(80 + self.name.len());
+        v.push(self.version);
+        v.extend_from_slice(&self.chain_id.to_le_bytes());
+        v.extend_from_slice(&self.identity_pub);
+        v.extend_from_slice(&self.device_pub);
+        v.extend_from_slice(self.name.as_bytes());
+        format!("denvion:{}", bs58::encode(v).into_string())
+    }
+
+    /// Parse + validate an invite string. Rejects a wrong chain id or unknown version.
+    pub fn decode(s: &str) -> Result<ContactCard> {
+        let b58 = s.trim().strip_prefix("denvion:").unwrap_or(s.trim());
+        let v = bs58::decode(b58).into_vec().map_err(|_| anyhow!("invalid contact code"))?;
+        if v.len() < 1 + 8 + 32 + 32 {
+            return Err(anyhow!("contact code too short"));
+        }
+        let version = v[0];
+        if version != CONTACT_CARD_VERSION {
+            return Err(anyhow!("unsupported card version {version}"));
+        }
+        let chain_id = u64::from_le_bytes(v[1..9].try_into().unwrap());
+        if chain_id != CHAIN_ID {
+            return Err(anyhow!("wrong chain id {chain_id} (expected {CHAIN_ID})"));
+        }
+        let mut identity_pub = [0u8; 32];
+        identity_pub.copy_from_slice(&v[9..41]);
+        let mut device_pub = [0u8; 32];
+        device_pub.copy_from_slice(&v[41..73]);
+        let name = String::from_utf8_lossy(&v[73..]).to_string();
+        Ok(ContactCard { version, chain_id, name, identity_pub, device_pub })
+    }
+}
+
 // ─────────────────────────── mock WCAHT seal chain ──────────────────────────
 
 /// Lifecycle exposed by RPC (spec §9.3). The client opens ONLY at `Finalised`.

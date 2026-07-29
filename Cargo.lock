@@ -1020,6 +1020,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bincode",
+ "bs58",
  "seal-crypto",
  "serde",
 ]
@@ -1042,6 +1043,7 @@ dependencies = [
 name = "seal-ffi"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "jni",
  "seal-core",
  "seal-crypto",

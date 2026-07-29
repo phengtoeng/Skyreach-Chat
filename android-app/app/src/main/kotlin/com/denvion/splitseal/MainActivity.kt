@@ -1,6 +1,7 @@
 package com.denvion.splitseal
 
 import android.app.Activity
+import android.content.Context
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -13,9 +14,15 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalContext
+import org.json.JSONArray
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
@@ -30,6 +37,7 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -98,6 +106,45 @@ private fun seedThread(): List<Msg> = listOf(
     Msg(5, "Maybe dinner. I'll let you know!", true, "9:28 AM"),
 )
 
+// ─────────────────────── identity + contacts (persisted) ────────────────────
+private data class Contact(val name: String, val address: String, val devicePub: String)
+
+private class Store(ctx: Context) {
+    private val p = ctx.getSharedPreferences("denvion", Context.MODE_PRIVATE)
+    fun identity(): JSONObject? = p.getString("identity", null)?.let { JSONObject(it) }
+    fun saveIdentity(j: JSONObject) = p.edit().putString("identity", j.toString()).apply()
+    fun contacts(): JSONArray = p.getString("contacts", null)?.let { JSONArray(it) } ?: JSONArray()
+    fun addContact(c: JSONObject) {
+        val a = contacts(); a.put(c); p.edit().putString("contacts", a.toString()).apply()
+    }
+}
+
+private fun loadOrCreateIdentity(store: Store): JSONObject {
+    store.identity()?.let { return it }
+    val id = JSONObject(SealCore.newIdentity("Me"))
+    store.saveIdentity(id)
+    return id
+}
+
+private fun loadContacts(store: Store): List<Contact> {
+    val a = store.contacts()
+    return (0 until a.length()).map {
+        val o = a.getJSONObject(it)
+        Contact(o.optString("name"), o.optString("address"), o.optString("device_pub"))
+    }
+}
+
+private fun qrBitmap(text: String, size: Int = 480): androidx.compose.ui.graphics.ImageBitmap {
+    val matrix = com.google.zxing.qrcode.QRCodeWriter().encode(text, com.google.zxing.BarcodeFormat.QR_CODE, size, size)
+    val pixels = IntArray(size * size)
+    for (y in 0 until size) for (x in 0 until size) {
+        pixels[y * size + x] = if (matrix.get(x, y)) 0xFF000000.toInt() else 0xFFFFFFFF.toInt()
+    }
+    val bmp = android.graphics.Bitmap.createBitmap(size, size, android.graphics.Bitmap.Config.ARGB_8888)
+    bmp.setPixels(pixels, 0, size, 0, 0, size, size)
+    return bmp.asImageBitmap()
+}
+
 // ─────────────────────────────── activity ───────────────────────────────────
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -123,21 +170,58 @@ private fun SystemBars(color: Color, darkIcons: Boolean) {
 
 @Composable
 private fun App(proto: String) {
+    val ctx = LocalContext.current
+    val store = remember { Store(ctx) }
+    val identity = remember { loadOrCreateIdentity(store) }
+    var contacts by remember { mutableStateOf(loadContacts(store)) }
     var openChat by remember { mutableStateOf<Chat?>(null) }
+    var tab by remember { mutableStateOf(0) }
+    var showAdd by remember { mutableStateOf(false) }
+
     val chat = openChat
-    if (chat == null) {
-        ChatListScreen(proto) { openChat = it }
-    } else {
-        ConversationScreen(chat) { openChat = null }
+    when {
+        chat != null -> ConversationScreen(chat) { openChat = null }
+        tab == 2 -> ProfileScreen(identity, tab) { tab = it }
+        else -> ChatListScreen(
+            contacts = contacts,
+            onOpen = { openChat = it },
+            onAdd = { showAdd = true },
+            tab = tab,
+            onTab = { tab = it },
+        )
+    }
+
+    if (showAdd) {
+        AddContactDialog(
+            onDismiss = { showAdd = false },
+            onSubmit = { code ->
+                val res = JSONObject(SealCore.parseCard(code))
+                if (res.optBoolean("ok")) {
+                    store.addContact(res)
+                    contacts = loadContacts(store)
+                    showAdd = false
+                    null
+                } else {
+                    res.optString("error", "invalid code")
+                }
+            },
+        )
     }
 }
 
 // ─────────────────────────────── chat list ──────────────────────────────────
 @Composable
-private fun ChatListScreen(proto: String, onOpen: (Chat) -> Unit) {
+private fun ChatListScreen(
+    contacts: List<Contact>,
+    onOpen: (Chat) -> Unit,
+    onAdd: () -> Unit,
+    tab: Int,
+    onTab: (Int) -> Unit,
+) {
     SystemBars(Blue, darkIcons = false)
+    // real contacts first (address as subtitle), then the demo threads
+    val rows = contacts.map { Chat(it.name, it.address.take(14) + "… · tap to seal", "") } + CHATS
     Column(Modifier.fillMaxSize().background(ScreenBg)) {
-        // top bar
         Row(
             Modifier.fillMaxWidth().background(Blue).padding(horizontal = 16.dp, vertical = 14.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -148,22 +232,21 @@ private fun ChatListScreen(proto: String, onOpen: (Chat) -> Unit) {
             Spacer(Modifier.weight(1f))
             Icon(Icons.Filled.Search, "Search", tint = Color.White, modifier = Modifier.size(24.dp))
         }
-        // list
         Box(Modifier.weight(1f)) {
             LazyColumn(Modifier.fillMaxSize()) {
-                items(CHATS) { c ->
+                items(rows) { c ->
                     ChatRow(c) { onOpen(c) }
                     Box(Modifier.padding(start = 84.dp).fillMaxWidth().height(1.dp).background(Hair))
                 }
             }
             FloatingActionButton(
-                onClick = { onOpen(CHATS.first()) },
+                onClick = onAdd,
                 containerColor = Blue,
                 contentColor = Color.White,
                 modifier = Modifier.align(Alignment.BottomEnd).padding(20.dp),
-            ) { Icon(Icons.Filled.Edit, "New chat") }
+            ) { Icon(Icons.Filled.PersonAdd, "Add contact") }
         }
-        BottomBar()
+        BottomBar(tab, onTab)
     }
 }
 
@@ -197,31 +280,114 @@ private fun ChatRow(c: Chat, onClick: () -> Unit) {
 }
 
 @Composable
-private fun BottomBar() {
-    Row(
-        Modifier.fillMaxWidth().background(ScreenBg).padding(top = 8.dp, bottom = 12.dp),
-        horizontalArrangement = Arrangement.SpaceEvenly,
-    ) {
+private fun BottomBar(tab: Int, onTab: (Int) -> Unit) {
+    Column(Modifier.fillMaxWidth().background(ScreenBg)) {
         Box(Modifier.fillMaxWidth().height(1.dp).background(Hair))
-    }
-    Row(
-        Modifier.fillMaxWidth().background(ScreenBg).padding(bottom = 10.dp),
-        horizontalArrangement = Arrangement.SpaceEvenly,
-    ) {
-        NavItem(Icons.Filled.ChatBubble, "Chats", true)
-        NavItem(Icons.Filled.Call, "Calls", false)
-        NavItem(Icons.Filled.Settings, "Settings", false)
+        Row(
+            Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 10.dp),
+            horizontalArrangement = Arrangement.SpaceEvenly,
+        ) {
+            NavItem(Icons.Filled.ChatBubble, "Chats", tab == 0) { onTab(0) }
+            NavItem(Icons.Filled.Call, "Calls", tab == 1) { onTab(1) }
+            NavItem(Icons.Filled.Settings, "Settings", tab == 2) { onTab(2) }
+        }
     }
 }
 
 @Composable
-private fun NavItem(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, active: Boolean) {
+private fun NavItem(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    active: Boolean,
+    onClick: () -> Unit,
+) {
     val c = if (active) Blue else Sub
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier.clickable(onClick = onClick).padding(horizontal = 22.dp, vertical = 2.dp),
+    ) {
         Icon(icon, null, tint = c, modifier = Modifier.size(24.dp))
         Spacer(Modifier.height(3.dp))
         Text(label, color = c, fontSize = 11.sp, fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal)
     }
+}
+
+// ───────────────────────────── profile / add ────────────────────────────────
+@Composable
+private fun ProfileScreen(identity: JSONObject, tab: Int, onTab: (Int) -> Unit) {
+    SystemBars(Blue, darkIcons = false)
+    val name = identity.optString("name", "Me")
+    val address = identity.optString("address")
+    val card = identity.optString("card")
+    val qr = remember(card) { runCatching { qrBitmap(card) }.getOrNull() }
+    Column(Modifier.fillMaxSize().background(ScreenBg)) {
+        Row(
+            Modifier.fillMaxWidth().background(Blue).padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(Icons.Filled.Shield, null, tint = Color.White, modifier = Modifier.size(24.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("My Denvion ID", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+        }
+        Column(
+            Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(20.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Avatar(name, 76.dp)
+            Spacer(Modifier.height(10.dp))
+            Text(name, fontSize = 20.sp, fontWeight = FontWeight.SemiBold, color = Ink)
+            Spacer(Modifier.height(18.dp))
+            Text("WCAHT identity address", fontSize = 12.sp, color = Sub)
+            Spacer(Modifier.height(2.dp))
+            SelectionContainer { Text(address, fontSize = 13.sp, color = Blue, textAlign = TextAlign.Center) }
+            Spacer(Modifier.height(20.dp))
+            if (qr != null) {
+                Image(
+                    bitmap = qr,
+                    contentDescription = "My QR code",
+                    modifier = Modifier.size(230.dp).clip(RoundedCornerShape(12.dp)).border(1.dp, Hair, RoundedCornerShape(12.dp)),
+                )
+            }
+            Spacer(Modifier.height(18.dp))
+            Text("Share this code so others can add you", fontSize = 13.sp, color = Sub, textAlign = TextAlign.Center)
+            Spacer(Modifier.height(6.dp))
+            SelectionContainer {
+                Text(
+                    card, fontSize = 11.sp, color = Ink, textAlign = TextAlign.Center,
+                    modifier = Modifier.clip(RoundedCornerShape(10.dp)).background(Color(0xFFF1F4F7)).padding(12.dp),
+                )
+            }
+        }
+        BottomBar(tab, onTab)
+    }
+}
+
+@Composable
+private fun AddContactDialog(onDismiss: () -> Unit, onSubmit: (String) -> String?) {
+    var code by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf<String?>(null) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Add contact") },
+        text = {
+            Column {
+                Text("Paste your contact's Denvion code.", fontSize = 13.sp, color = Sub)
+                Spacer(Modifier.height(10.dp))
+                OutlinedTextField(
+                    value = code,
+                    onValueChange = { code = it; error = null },
+                    placeholder = { Text("denvion:…") },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                error?.let {
+                    Spacer(Modifier.height(6.dp))
+                    Text(it, color = Color(0xFFD9534F), fontSize = 12.sp)
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = { error = onSubmit(code.trim()) }) { Text("Add") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 // ────────────────────────────── conversation ────────────────────────────────
