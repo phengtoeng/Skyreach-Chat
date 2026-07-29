@@ -9,10 +9,10 @@
 //!   POST /mailbox                     body = EncryptedEnvelope JSON  → 200
 //!   GET  /mailbox/<hex mailbox_tag>   → JSON array of EncryptedEnvelope
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write as _;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use seal_core::EncryptedEnvelope;
@@ -46,7 +46,10 @@ pub fn serve_relay(addr: &str) -> Result<()> {
     let data_dir = std::env::var("WCAHT_RELAY_DATA").unwrap_or_else(|_| "relay-data".to_string());
     std::fs::create_dir_all(&data_dir).ok();
     let log_path = format!("{data_dir}/inbox.log");
-    load_inbox(&log_path, &inbox, &seen);
+    // live metrics for the status dashboard: cumulative total + per-minute buckets of new messages.
+    let total = Arc::new(Mutex::new(0u64));
+    let buckets: Arc<Mutex<BTreeMap<i64, u64>>> = Arc::new(Mutex::new(BTreeMap::new()));
+    *total.lock().unwrap() = load_inbox(&log_path, &inbox, &seen) as u64;
     if !peers.is_empty() {
         println!("relay: {} peer(s) for gossip: {}", peers.len(), peers.join(", "));
     }
@@ -109,6 +112,11 @@ pub fn serve_relay(addr: &str) -> Result<()> {
                     };
                     if newly {
                         persist(&log_path, &tag, &buf); // survive a restart
+                        {
+                            *total.lock().unwrap() += 1;
+                            let minute = (now_unix() / 60) * 60;
+                            *buckets.lock().unwrap().entry(minute).or_default() += 1;
+                        }
                         if !from_gossip {
                             if let Some(c) = &gossip_http {
                                 gossip(c.clone(), peers.clone(), tag.clone(), buf.clone()); // spread to peers
@@ -122,6 +130,29 @@ pub fn serve_relay(addr: &str) -> Result<()> {
                 let tag = &path["/inbox/".len()..];
                 let items = inbox.lock().unwrap().get(tag).cloned().unwrap_or_default();
                 (200, format!("[{}]", items.join(",")))
+            }
+            // live metrics for the status dashboard (this node's view).
+            (tiny_http::Method::Get, "/stats") => {
+                let now_min = (now_unix() / 60) * 60;
+                let per_minute: Vec<Value> = {
+                    let b = buckets.lock().unwrap();
+                    (0..60)
+                        .rev()
+                        .map(|i| {
+                            let t = now_min - i * 60;
+                            serde_json::json!({ "t": t, "n": b.get(&t).copied().unwrap_or(0) })
+                        })
+                        .collect()
+                };
+                (
+                    200,
+                    serde_json::json!({
+                        "node_total": *total.lock().unwrap(),
+                        "mailboxes": inbox.lock().unwrap().len(),
+                        "per_minute": per_minute,
+                    })
+                    .to_string(),
+                )
             }
             _ => (404, json_err("not found")),
         };
@@ -154,13 +185,13 @@ fn persist(log_path: &str, tag: &str, item: &str) {
     }
 }
 
-/// Reload the durable log into memory on startup (deduped by seal-id).
+/// Reload the durable log into memory on startup (deduped by seal-id). Returns the count loaded.
 fn load_inbox(
     log_path: &str,
     inbox: &Arc<Mutex<HashMap<String, Vec<String>>>>,
     seen: &Arc<Mutex<HashMap<String, HashSet<String>>>>,
-) {
-    let Ok(content) = std::fs::read_to_string(log_path) else { return };
+) -> usize {
+    let Ok(content) = std::fs::read_to_string(log_path) else { return 0 };
     let mut ib = inbox.lock().unwrap();
     let mut sn = seen.lock().unwrap();
     let mut n = 0usize;
@@ -183,6 +214,12 @@ fn load_inbox(
     if n > 0 {
         println!("relay: reloaded {n} persisted message(s)");
     }
+    n
+}
+
+/// Seconds since the Unix epoch.
+fn now_unix() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
 /// Fan a client write out to peer relays (marked X-Gossip so they don't re-forward). Fire-and-forget.

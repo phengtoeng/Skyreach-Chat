@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 pub mod directory;
 pub mod gateway_service;
 pub mod relay;
+pub mod stats;
 
 // ───────────────────────────── live RPC client ──────────────────────────────
 
