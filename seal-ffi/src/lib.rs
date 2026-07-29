@@ -613,6 +613,27 @@ mod tests {
     }
 
     #[test]
+    fn ffi_helpers_never_panic_on_untrusted_input() {
+        // Anything the mobile fields can feed in must NEVER panic — a panic unwinding across
+        // the JNI/C boundary aborts the whole app (the "app crash" the user hit).
+        let long = "z".repeat(5000);
+        let junk = [
+            "", "   ", "denvion:", "denvion:!!!", "denvion:2g", "not a code at all",
+            "D1os7GLQJUunBL", "😀🔒", "denvion:0OIl", "0x1234", "855 12 345 678",
+            "+855123", "deadbeef", "denvion:z", long.as_str(),
+        ];
+        for s in junk {
+            let _ = parse_card_json(s);
+            let _ = mailbox_tag_json(s);
+            let _ = phone_commitment_json(s);
+            let _ = seal_to_json(s, s, false);
+            let _ = seal_shippable_json(s, s, true);
+            let _ = card_for_json(s, s, s);
+            let _ = open_received_json(s, s, s);
+        }
+    }
+
+    #[test]
     fn mailbox_tag_is_deterministic_and_matches_shippable() {
         let bob: Value = serde_json::from_str(&new_identity_json("Bob")).unwrap();
         let device_pub = bob["device_pub"].as_str().unwrap();

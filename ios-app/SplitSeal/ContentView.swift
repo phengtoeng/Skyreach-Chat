@@ -2,6 +2,8 @@ import SwiftUI
 import CoreImage.CIFilterBuiltins
 import AVFoundation
 import UIKit
+import Contacts
+import ContactsUI
 
 // ─────────────────────────────── palette ────────────────────────────────────
 extension Color {
@@ -504,6 +506,12 @@ struct NewContactView: View {
     @State private var phone = ""
     @State private var sync = true
     @State private var code = ""
+    @State private var country = iosCountries[0]
+    @State private var showSync = false
+
+    private func doSave() {
+        onSave(first.trimmingCharacters(in: .whitespaces), last.trimmingCharacters(in: .whitespaces), phone.trimmingCharacters(in: .whitespaces))
+    }
 
     var body: some View {
         let canSave = !first.trimmingCharacters(in: .whitespaces).isEmpty || scanned != nil
@@ -517,9 +525,9 @@ struct NewContactView: View {
                 Text("New Contact").font(.system(size: 17, weight: .semibold)).foregroundColor(.dvInk)
                 Spacer()
                 Button(action: {
-                    if canSave {
-                        onSave(first.trimmingCharacters(in: .whitespaces), last.trimmingCharacters(in: .whitespaces), phone.trimmingCharacters(in: .whitespaces))
-                    }
+                    guard canSave else { return }
+                    let n = [first, last].map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }.joined(separator: " ")
+                    if sync && (!n.isEmpty || !phone.isEmpty) { showSync = true } else { doSave() }
                 }) {
                     Image(systemName: "checkmark").foregroundColor(.white)
                         .frame(width: 36, height: 36).background(canSave ? Color.dvBlue : Color(hex: 0xCBD3DA)).clipShape(Circle())
@@ -537,14 +545,21 @@ struct NewContactView: View {
                     .background(Color.white).clipShape(RoundedRectangle(cornerRadius: 14))
 
                     VStack(spacing: 0) {
-                        HStack {
-                            Text("🇰🇭  Cambodia").foregroundColor(.dvInk)
-                            Spacer()
-                            Image(systemName: "chevron.right").foregroundColor(.dvSub)
-                        }.padding(16)
+                        Menu {
+                            ForEach(iosCountries) { c in
+                                Button("\(c.flag)  \(c.name)  +\(c.dial)") { country = c }
+                            }
+                        } label: {
+                            HStack {
+                                Text("\(country.flag)  \(country.name)").foregroundColor(.dvInk)
+                                Spacer()
+                                Text("+\(country.dial)").foregroundColor(.dvSub)
+                                Image(systemName: "chevron.down").foregroundColor(.dvSub)
+                            }.padding(16)
+                        }
                         Divider().padding(.leading, 16)
                         HStack {
-                            Text("+855").foregroundColor(.dvInk)
+                            Text("+\(country.dial)").foregroundColor(.dvInk)
                             Spacer().frame(width: 16)
                             TextField("00 000 0000", text: $phone).keyboardType(.numberPad).foregroundColor(.dvInk)
                         }.padding(16)
@@ -573,13 +588,23 @@ struct NewContactView: View {
                         TextField("denvion:…", text: $code)
                             .textInputAutocapitalization(.never).autocorrectionDisabled().foregroundColor(.dvInk)
                             .padding(12).background(Color(hex: 0xF1F4F7)).clipShape(RoundedRectangle(cornerRadius: 10))
-                        Button(action: { let c = code.trimmingCharacters(in: .whitespacesAndNewlines); if !c.isEmpty { onPasteCode(c) } }) {
-                            Text("Add by code")
-                                .font(.system(size: 15, weight: .semibold)).foregroundColor(.white)
-                                .frame(maxWidth: .infinity).padding(.vertical, 12)
-                                .background(code.isEmpty ? Color(hex: 0xCBD3DA) : Color.dvBlue)
-                                .clipShape(RoundedRectangle(cornerRadius: 10))
-                        }.disabled(code.isEmpty)
+                        HStack(spacing: 10) {
+                            Button(action: {
+                                if let s = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty { code = s }
+                            }) {
+                                Text("Paste")
+                                    .font(.system(size: 15, weight: .semibold)).foregroundColor(.dvBlue)
+                                    .frame(maxWidth: .infinity).padding(.vertical, 12)
+                                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.dvBlue))
+                            }
+                            Button(action: { let c = code.trimmingCharacters(in: .whitespacesAndNewlines); if !c.isEmpty { onPasteCode(c) } }) {
+                                Text("Add by code")
+                                    .font(.system(size: 15, weight: .semibold)).foregroundColor(.white)
+                                    .frame(maxWidth: .infinity).padding(.vertical, 12)
+                                    .background(code.isEmpty ? Color(hex: 0xCBD3DA) : Color.dvBlue)
+                                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                            }.disabled(code.isEmpty)
+                        }
                     }
                     .padding(16).background(Color.white).clipShape(RoundedRectangle(cornerRadius: 14))
 
@@ -612,6 +637,62 @@ struct NewContactView: View {
         .background(Color(hex: 0xF2F3F5).ignoresSafeArea())
         .onChange(of: (scanned?["address"] as? String) ?? "") { addr in
             if !addr.isEmpty, first.isEmpty, let n = scanned?["name"] as? String { first = n }
+        }
+        .sheet(isPresented: $showSync, onDismiss: { doSave() }) {
+            AddToContactsSheet(
+                name: [first, last].map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }.joined(separator: " "),
+                phone: phone.isEmpty ? "" : "+\(country.dial)\(phone.filter { $0.isNumber })",
+                onDone: { showSync = false }
+            )
+        }
+    }
+}
+
+struct IOSCountry: Identifiable {
+    let id = UUID(); let flag: String; let name: String; let dial: String
+}
+let iosCountries: [IOSCountry] = [
+    IOSCountry(flag: "🇰🇭", name: "Cambodia", dial: "855"),
+    IOSCountry(flag: "🇺🇸", name: "United States", dial: "1"),
+    IOSCountry(flag: "🇬🇧", name: "United Kingdom", dial: "44"),
+    IOSCountry(flag: "🇻🇳", name: "Vietnam", dial: "84"),
+    IOSCountry(flag: "🇹🇭", name: "Thailand", dial: "66"),
+    IOSCountry(flag: "🇸🇬", name: "Singapore", dial: "65"),
+    IOSCountry(flag: "🇮🇳", name: "India", dial: "91"),
+    IOSCountry(flag: "🇦🇺", name: "Australia", dial: "61"),
+    IOSCountry(flag: "🇯🇵", name: "Japan", dial: "81"),
+    IOSCountry(flag: "🇨🇳", name: "China", dial: "86"),
+]
+
+/// Presents the system "new contact" editor pre-filled (mirrors Android's ACTION_INSERT).
+/// Presenting needs no permission; the user taps Done to save into their contacts.
+struct AddToContactsSheet: UIViewControllerRepresentable {
+    let name: String
+    let phone: String
+    let onDone: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(onDone: onDone) }
+
+    func makeUIViewController(context: Context) -> UINavigationController {
+        let c = CNMutableContact()
+        let parts = name.split(separator: " ", maxSplits: 1).map(String.init)
+        c.givenName = parts.first ?? name
+        if parts.count > 1 { c.familyName = parts[1] }
+        if !phone.isEmpty {
+            c.phoneNumbers = [CNLabeledValue(label: CNLabelPhoneNumberMobile, value: CNPhoneNumber(string: phone))]
+        }
+        let vc = CNContactViewController(forNewContact: c)
+        vc.delegate = context.coordinator
+        return UINavigationController(rootViewController: vc)
+    }
+
+    func updateUIViewController(_ vc: UINavigationController, context: Context) {}
+
+    final class Coordinator: NSObject, CNContactViewControllerDelegate {
+        let onDone: () -> Void
+        init(onDone: @escaping () -> Void) { self.onDone = onDone }
+        func contactViewController(_ vc: CNContactViewController, didCompleteWith contact: CNContact?) {
+            onDone()
         }
     }
 }

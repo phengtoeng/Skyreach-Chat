@@ -21,7 +21,9 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
@@ -635,12 +637,29 @@ private fun NewContactScreen(
 ) {
     val bg = Color(0xFFF2F3F5)
     SystemBars(bg, darkIcons = true)
+    val ctx = LocalContext.current
     var first by remember(scanned) { mutableStateOf(scanned?.optString("name") ?: "") }
     var last by remember { mutableStateOf("") }
     var phone by remember { mutableStateOf("") }
     var sync by remember { mutableStateOf(true) }
     var code by remember { mutableStateOf("") }
+    var country by remember { mutableStateOf(COUNTRIES[0]) }
+    var countryMenu by remember { mutableStateOf(false) }
     val canSave = first.isNotBlank() || scanned != null
+
+    fun syncToPhone() {
+        if (!sync) return
+        runCatching {
+            val name = listOf(first, last).filter { it.isNotBlank() }.joinToString(" ").ifBlank { scanned?.optString("name") ?: "" }
+            val i = android.content.Intent(android.content.Intent.ACTION_INSERT).apply {
+                type = android.provider.ContactsContract.Contacts.CONTENT_TYPE
+                if (name.isNotBlank()) putExtra(android.provider.ContactsContract.Intents.Insert.NAME, name)
+                if (phone.isNotBlank()) putExtra(android.provider.ContactsContract.Intents.Insert.PHONE, "+${country.dial}${phone.filter { it.isDigit() }}")
+                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            ctx.startActivity(i)
+        }
+    }
 
     Column(Modifier.fillMaxSize().background(bg)) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -653,46 +672,44 @@ private fun NewContactScreen(
             Spacer(Modifier.weight(1f))
             Box(
                 Modifier.size(36.dp).clip(CircleShape).background(if (canSave) Blue else Color(0xFFCBD3DA))
-                    .clickable(enabled = canSave) { onSave(first.trim(), last.trim(), phone.trim()) },
+                    .clickable(enabled = canSave) { syncToPhone(); onSave(first.trim(), last.trim(), phone.trim()) },
                 contentAlignment = Alignment.Center,
             ) { Icon(Icons.Filled.Check, "Save", tint = Color.White, modifier = Modifier.size(20.dp)) }
         }
 
         Column(Modifier.verticalScroll(rememberScrollState()).padding(16.dp)) {
-            Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color.White).padding(horizontal = 16.dp)) {
-                FormField("First Name", first) { first = it }
-                Box(Modifier.fillMaxWidth().height(1.dp).background(Hair))
-                FormField("Last Name", last) { last = it }
-            }
+            FormField("First name", first, KeyboardType.Text) { first = it }
+            Spacer(Modifier.height(10.dp))
+            FormField("Last name", last, KeyboardType.Text) { last = it }
             Spacer(Modifier.height(18.dp))
 
-            Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color.White)) {
-                Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text("🇰🇭  Cambodia", color = Ink, fontSize = 16.sp)
+            // working country picker
+            Box {
+                Row(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).border(1.dp, Hair, RoundedCornerShape(12.dp))
+                        .clickable { countryMenu = true }.padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("${country.flag}  ${country.name}", color = Ink, fontSize = 16.sp)
                     Spacer(Modifier.weight(1f))
-                    Icon(Icons.Filled.ChevronRight, null, tint = Sub)
+                    Text("+${country.dial}", color = Sub, fontSize = 15.sp)
+                    Icon(Icons.Filled.ArrowDropDown, null, tint = Sub)
                 }
-                Box(Modifier.padding(start = 16.dp).fillMaxWidth().height(1.dp).background(Hair))
-                Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text("+855", color = Ink, fontSize = 16.sp)
-                    Spacer(Modifier.width(16.dp))
-                    Box(Modifier.weight(1f)) {
-                        if (phone.isEmpty()) Text("00 000 0000", color = Sub, fontSize = 16.sp)
-                        BasicTextField(
-                            value = phone,
-                            onValueChange = { phone = it.filter { c -> c.isDigit() || c == ' ' } },
-                            textStyle = TextStyle(color = Ink, fontSize = 16.sp),
-                            cursorBrush = Brush.verticalGradient(listOf(Blue, Blue)),
-                            modifier = Modifier.fillMaxWidth(),
-                        )
+                DropdownMenu(expanded = countryMenu, onDismissRequest = { countryMenu = false }) {
+                    COUNTRIES.forEach { c ->
+                        DropdownMenuItem(text = { Text("${c.flag}  ${c.name}  +${c.dial}") }, onClick = { country = c; countryMenu = false })
                     }
                 }
             }
+            Spacer(Modifier.height(10.dp))
+            FormField("Phone number", phone, KeyboardType.Phone) { phone = it.filter { c -> c.isDigit() || c == ' ' } }
             Spacer(Modifier.height(18.dp))
 
             Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color.White).padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text("Sync Contact to Phone", color = Ink, fontSize = 16.sp)
-                Spacer(Modifier.weight(1f))
+                Column(Modifier.weight(1f)) {
+                    Text("Sync Contact to Phone", color = Ink, fontSize = 16.sp)
+                    Text("Also save it to your phone's contacts", color = Sub, fontSize = 12.sp)
+                }
                 Switch(checked = sync, onCheckedChange = { sync = it })
             }
             Spacer(Modifier.height(18.dp))
@@ -706,29 +723,25 @@ private fun NewContactScreen(
                 Text("Add via QR Code", color = Blue, fontSize = 16.sp)
             }
 
-            // Paste the denvion: contact code directly — no camera needed (easiest between two emulators).
+            // Add by the denvion: contact code — a Paste button reads the clipboard directly
+            // (no long-press, so no emulator text-magnifier crash). Easiest between two emulators.
             Spacer(Modifier.height(18.dp))
             Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color.White).padding(16.dp)) {
                 Text("Or add by contact code", color = Sub, fontSize = 13.sp)
                 Spacer(Modifier.height(8.dp))
-                Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(Color(0xFFF1F4F7)).padding(12.dp)) {
-                    if (code.isBlank()) Text("denvion:…", color = Sub, fontSize = 15.sp)
-                    BasicTextField(
-                        value = code,
-                        onValueChange = { code = it },
-                        textStyle = TextStyle(color = Ink, fontSize = 15.sp),
-                        cursorBrush = Brush.verticalGradient(listOf(Blue, Blue)),
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                }
+                FormField("denvion:…", code, KeyboardType.Text) { code = it }
                 Spacer(Modifier.height(10.dp))
-                Box(
-                    Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
-                        .background(if (code.isNotBlank()) Blue else Color(0xFFCBD3DA))
-                        .clickable(enabled = code.isNotBlank()) { onPasteCode(code.trim()) }
-                        .padding(vertical = 12.dp),
-                    contentAlignment = Alignment.Center,
-                ) { Text("Add by code", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold) }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    OutlinedButton(
+                        onClick = {
+                            val clip = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+                            val t = clip?.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.text?.toString()?.trim().orEmpty()
+                            if (t.isNotEmpty()) code = t
+                        },
+                        modifier = Modifier.weight(1f),
+                    ) { Text("Paste") }
+                    Button(onClick = { onPasteCode(code.trim()) }, enabled = code.isNotBlank(), modifier = Modifier.weight(1f)) { Text("Add by code") }
+                }
             }
 
             if (phone.isNotBlank() && scanned == null) {
@@ -759,18 +772,46 @@ private fun NewContactScreen(
     }
 }
 
+private data class Country(val flag: String, val name: String, val dial: String)
+
+private val COUNTRIES = listOf(
+    Country("🇰🇭", "Cambodia", "855"),
+    Country("🇺🇸", "United States", "1"),
+    Country("🇬🇧", "United Kingdom", "44"),
+    Country("🇻🇳", "Vietnam", "84"),
+    Country("🇹🇭", "Thailand", "66"),
+    Country("🇸🇬", "Singapore", "65"),
+    Country("🇮🇳", "India", "91"),
+    Country("🇦🇺", "Australia", "61"),
+    Country("🇯🇵", "Japan", "81"),
+    Country("🇨🇳", "China", "86"),
+)
+
 @Composable
-private fun FormField(placeholder: String, value: String, onChange: (String) -> Unit) {
-    Box(Modifier.fillMaxWidth().padding(vertical = 15.dp)) {
-        if (value.isEmpty()) Text(placeholder, color = Sub, fontSize = 16.sp)
-        BasicTextField(
-            value = value,
-            onValueChange = onChange,
-            textStyle = TextStyle(color = Ink, fontSize = 16.sp),
-            cursorBrush = Brush.verticalGradient(listOf(Blue, Blue)),
-            modifier = Modifier.fillMaxWidth(),
-        )
-    }
+private fun FormField(
+    placeholder: String,
+    value: String,
+    keyboardType: KeyboardType = KeyboardType.Text,
+    onChange: (String) -> Unit,
+) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = onChange,
+        placeholder = { Text(placeholder, color = Sub) },
+        singleLine = true,
+        keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
+        shape = RoundedCornerShape(12.dp),
+        colors = OutlinedTextFieldDefaults.colors(
+            focusedBorderColor = Blue,
+            unfocusedBorderColor = Hair,
+            focusedContainerColor = Color.White,
+            unfocusedContainerColor = Color.White,
+            cursorColor = Blue,
+            focusedTextColor = Ink,
+            unfocusedTextColor = Ink,
+        ),
+        modifier = Modifier.fillMaxWidth(),
+    )
 }
 
 // ────────────────────────────── conversation ────────────────────────────────
