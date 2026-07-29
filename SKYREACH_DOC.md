@@ -55,7 +55,7 @@ Two release modes, both bound into the signed seal leaf so they can't be silentl
 | Gateway staking / slashing registry + on-chain anchors | ✅ done, full loop verified live |
 | Real WCAHT finality read + anchor/stake/slash txs (`wcaht-seal-sdk`) | ✅ done, 3 txs landed on-chain |
 | FFI: C ABI (iOS) + JNI (Android) | ✅ done, 2 tests |
-| Native apps (SwiftUI + Kotlin/Compose) with StrictSeal/FastSeal toggle | ✅ code done; **needs Xcode/Android SDK to compile** |
+| Native apps (SwiftUI + Kotlin/Compose) with StrictSeal/FastSeal toggle | ✅ done; iOS builds + runs via `xcodegen` (§6b), two-device send/receive verified live |
 | Total Rust tests | **27 green** |
 | Production gateway/relay services, device linking, media/groups/calls, audit | ❌ Phase 3 |
 
@@ -104,11 +104,12 @@ cargo install cargo-ndk
 cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 \
   -o android-app/app/src/main/jniLibs build --release -p seal-ffi
 
-# iOS: build the static lib, then link libseal_ffi.a in Xcode with the bridging header
-cargo build --release -p seal-ffi --target aarch64-apple-ios
+# iOS: generate the project (project.yml wires the FFI + builds it as a prebuild step)
+brew install xcodegen && cd ios-app && xcodegen generate
 ```
 
-See `README.md` for the full Xcode wiring (`-force_load`, bridging header, header search path).
+The iOS `.xcodeproj` is generated, not committed — see §6b for the full build. `README.md`'s
+manual Xcode wiring is superseded by `ios-app/project.yml`.
 
 ---
 
@@ -199,17 +200,35 @@ live backend. To point elsewhere (e.g. `10.0.2.2` for services on the emulator's
 all five URLs; ports are fixed.
 
 ### iOS build (on the Mac, after `git pull`)
-The iOS app is source-only in the repo (no committed `.a`/`.xcodeproj`) — build the Rust core fresh:
-1. `cd denvion-splitseal && cargo build -p seal-ffi --target aarch64-apple-ios-sim`
-   (use `x86_64-apple-ios` on an Intel Mac).
-2. In Xcode: add the 4 files under `ios-app/SplitSeal/`; **Link Binary With Libraries** →
-   `libseal_ffi.a` (from `target/<triple>/debug/`); Build Settings ▸ **Other Linker Flags** =
-   `-force_load $(PROJECT_DIR)/libseal_ffi.a`; set **Objective-C Bridging Header** =
-   `SplitSeal-Bridging-Header.h` and add `seal-ffi/include/` to Header Search Paths.
-3. Info.plist keys: `NSAppTransportSecurity ▸ NSAllowsArbitraryLoads = YES` (N6 is plain http),
-   `NSCameraUsageDescription` (QR scan), `NSContactsUsageDescription` (Sync to Phone).
-4. Android side: on a FRESH (non-emulator) checkout, rebuild the `.so` once —
-   `cargo ndk -t x86_64 -o android-app/app/src/main/jniLibs build --release -p seal-ffi`.
+The Xcode project is **generated from `ios-app/project.yml`** by [XcodeGen] — the `.xcodeproj` is
+gitignored, so there is no manual Xcode wiring to redo. `project.yml` already carries the linker
+flags (`-force_load`), the bridging header, the header search path, the Info.plist keys, and a
+preBuildScript that builds the Rust core, so a clean checkout is:
+
+```bash
+brew install xcodegen                 # once
+cd ios-app && xcodegen generate       # writes SplitSeal.xcodeproj + SplitSeal/Info.plist
+xcodebuild -project SplitSeal.xcodeproj -scheme SplitSeal \
+  -sdk iphonesimulator -derivedDataPath DerivedData build
+```
+
+`scripts/build_rust_ios.sh` runs as a prebuild step and lipos the `x86_64-apple-ios` +
+`aarch64-apple-ios-sim` static libs into `ios-app/build/libseal_ffi_sim.a`. For a device build
+swap in `aarch64-apple-ios`. **Edit `project.yml`, never the generated project** — `xcodegen
+generate` overwrites both the `.xcodeproj` and `SplitSeal/Info.plist`.
+
+Android side: on a FRESH (non-emulator) checkout, rebuild the `.so` once —
+`cargo ndk -t x86_64 -o android-app/app/src/main/jniLibs build --release -p seal-ffi`.
+
+[XcodeGen]: https://github.com/yonaskolb/XcodeGen
+
+> **Do not drop `NSAppTransportSecurity ▸ NSAllowsArbitraryLoads` from `project.yml`.** The five
+> services are plain http on a raw IP, so without it iOS silently refuses every `URLSession`
+> call and the app looks broken in a very confusing way: sends hang on "Sealing…" forever and
+> the inbox poll returns nothing, while adding a contact still works (add-by-code is a purely
+> local `ss_parse_card` call, no network). `httpPost`/`httpGet` swallow errors with `try?`, so
+> nothing is logged. A domain exception can't replace it — the host is user-configurable in
+> Settings. Revisit once the backend has TLS.
 
 ### How the two-device test works (Android ↔ iOS)
 1. Both apps default to the **N6** backend — no setup (Settings ▸ Server to change; must match).
@@ -313,8 +332,18 @@ without a client rewrite. Keep new release gates composable the same way.
 - **N1 finality lag:** the local observer finalizes ~24–40 slots (~10–16s) behind wall-clock and its
   `recent_blockhash` can transiently 503 when it lags. Read finality from it, but submit elsewhere.
 - **Don't trust a single `/health` read** on a WCAHT node right after a restart (stale-read fallback).
-- **The mobile UI can't be compiled on the current dev machine** (no Xcode/Android SDK). The Swift/
-  Kotlin is written against the tested FFI output but has not been compiled — do that in the IDEs.
+- **iOS ATS silently kills the whole app.** Plain-http backend + no `NSAllowsArbitraryLoads` =
+  every `URLSession` call fails before it leaves the device, with no log line, because
+  `httpPost`/`httpGet` use `try?`. It presents as "sending is stuck / I never receive anything"
+  while contact-add still works. See the warning in §6b. First thing to check on any iOS
+  networking bug: `plutil -extract NSAppTransportSecurity xml1 -o - <App>.app/Info.plist`.
+- **Failed sends still look sent.** `ConversationView.send()` writes the outgoing message to the
+  transcript via `Store.addThreadMsg` BEFORE it knows whether `shipSeal` succeeded, then on
+  failure leaves the bubble on "Sealing…" forever with no retry and no error. A message in your
+  own transcript is NOT evidence it reached the relay — check the peer's mailbox on the relay.
+- **The relay + gateways are in-memory only** (`relay.rs`, `gateway_service.rs` both use a plain
+  `HashMap`). Restarting a `skyreach-*` unit on N6 drops every queued ciphertext and every
+  finalized share, so undelivered messages are gone for good. Fix before any real use.
 
 ---
 

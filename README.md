@@ -167,17 +167,23 @@ cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 \
 (`Java_com_denvion_splitseal_SealCore_native*`).
 
 ### iOS (SwiftUI) — `ios-app/`
+The Xcode project is generated from `ios-app/project.yml` by [XcodeGen]; the `.xcodeproj` is
+gitignored, so there is nothing to wire up by hand:
+
 ```bash
-cargo build --release -p seal-ffi --target aarch64-apple-ios          # device
-cargo build --release -p seal-ffi --target aarch64-apple-ios-sim      # simulator (Apple Silicon)
+brew install xcodegen                 # once
+cd ios-app && xcodegen generate       # writes SplitSeal.xcodeproj + SplitSeal/Info.plist
+open SplitSeal.xcodeproj
 ```
-In Xcode, create an iOS **App** target and add the three `ios-app/SplitSeal/*.swift`
-files, then:
-- **Link Binary With Libraries** ▸ add `libseal_ffi.a`,
-- Build Settings ▸ **Objective-C Bridging Header** = `SplitSeal-Bridging-Header.h`,
-- copy `seal-ffi/include/seal_ffi.h` into the project (or add its dir to Header Search Paths),
-- Build Settings ▸ **Other Linker Flags**: `-force_load $(PROJECT_DIR)/libseal_ffi.a`
-  (stops the linker dead-stripping the `ss_*` symbols).
+
+`project.yml` already sets the bridging header, the `seal-ffi/include` header search path, and
+`-force_load` (which stops the linker dead-stripping the `ss_*` symbols), and runs
+`scripts/build_rust_ios.sh` as a prebuild step to compile + lipo the Rust core for the simulator.
+It also carries the Info.plist keys the app needs at runtime — `NSAppTransportSecurity ▸
+NSAllowsArbitraryLoads` (the backend is plain http), plus the camera and contacts usage
+descriptions. **Edit `project.yml`, not the generated project.**
+
+[XcodeGen]: https://github.com/yonaskolb/XcodeGen
 
 ### Run
 Launch on a simulator/device. A segmented control at the top switches the release mode:
