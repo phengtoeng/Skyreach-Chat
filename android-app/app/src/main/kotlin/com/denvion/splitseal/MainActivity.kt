@@ -184,6 +184,54 @@ private fun qrBitmap(text: String, size: Int = 480): androidx.compose.ui.graphic
     return bmp.asImageBitmap()
 }
 
+// Delivery services (emulator → host). Ship ciphertext to the relay + shares to gateways.
+private const val RELAY_URL = "http://10.0.2.2:9200"
+private val GATEWAY_URLS = listOf("http://10.0.2.2:9201", "http://10.0.2.2:9202", "http://10.0.2.2:9203")
+
+private fun httpPost(url: String, body: String): Int = try {
+    val conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
+        requestMethod = "POST"; doOutput = true; connectTimeout = 4000; readTimeout = 4000
+        setRequestProperty("Content-Type", "application/json")
+    }
+    conn.outputStream.use { it.write(body.toByteArray()) }
+    conn.responseCode
+} catch (e: Exception) { -1 }
+
+private fun httpGet(url: String): String? = try {
+    val conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply { connectTimeout = 4000; readTimeout = 4000 }
+    if (conn.responseCode == 200) conn.inputStream.bufferedReader().use { it.readText() } else null
+} catch (e: Exception) { null }
+
+/** Ship a shippable seal: bundle → relay inbox, each share → a gateway (+ finalize). */
+private fun shipSeal(ship: JSONObject) {
+    val tag = ship.optString("mailbox_tag")
+    val sealId = ship.optString("seal_id")
+    httpPost("$RELAY_URL/inbox/$tag", ship.getJSONObject("bundle").toString())
+    val shares = ship.getJSONArray("shares")
+    for (i in 0 until minOf(shares.length(), GATEWAY_URLS.size)) {
+        httpPost("${GATEWAY_URLS[i]}/deposit", shares.getJSONObject(i).toString())
+        httpPost("${GATEWAY_URLS[i]}/finalize/$sealId", "")
+    }
+}
+
+/** Fetch the latest bundle delivered to a mailbox tag. */
+private fun fetchInbox(tag: String): String? {
+    val body = httpGet("$RELAY_URL/inbox/$tag") ?: return null
+    val arr = JSONArray(body)
+    return if (arr.length() > 0) arr.getJSONObject(arr.length() - 1).toString() else null
+}
+
+/** Collect released shares for a seal from all gateways. */
+private fun collectShares(sealId: String): String {
+    val all = JSONArray()
+    for (gw in GATEWAY_URLS) {
+        val body = httpGet("$gw/release/$sealId") ?: continue
+        val arr = JSONArray(body)
+        for (i in 0 until arr.length()) all.put(arr.getJSONObject(i))
+    }
+    return all.toString()
+}
+
 // ─────────────────────────────── activity ───────────────────────────────────
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -253,7 +301,7 @@ private fun App(proto: String) {
 
     val chat = openChat
     when {
-        chat != null -> ConversationScreen(chat) { openChat = null }
+        chat != null -> ConversationScreen(chat, identity.optString("device_seed")) { openChat = null }
         showNew -> NewContactScreen(
             scanned = scanned,
             onScan = { launchScan() },
@@ -613,7 +661,7 @@ private fun FormField(placeholder: String, value: String, onChange: (String) -> 
 
 // ────────────────────────────── conversation ────────────────────────────────
 @Composable
-private fun ConversationScreen(chat: Chat, onBack: () -> Unit) {
+private fun ConversationScreen(chat: Chat, myDeviceSeed: String, onBack: () -> Unit) {
     SystemBars(Color.White, darkIcons = true)
     BackHandler(onBack = onBack)
 
@@ -636,12 +684,23 @@ private fun ConversationScreen(chat: Chat, onBack: () -> Unit) {
         scope.launch {
             listState.animateScrollToItem(messages.lastIndex)
             if (real) {
-                // seal to the contact's REAL device key — only their device can open it
-                val res = runCatching {
-                    withContext(Dispatchers.Default) { JSONObject(SealCore.sealTo(chat.devicePub, text, fast)) }
+                // seal + SHIP over the relay + gateways; loopback-receive proves the round-trip
+                val received = runCatching {
+                    withContext(Dispatchers.IO) {
+                        val ship = JSONObject(SealCore.sealShippable(chat.devicePub, text, fast))
+                        if (!ship.optBoolean("ok")) return@withContext null
+                        shipSeal(ship)
+                        val bundle = fetchInbox(ship.optString("mailbox_tag"))
+                        val shares = collectShares(ship.optString("seal_id"))
+                        if (bundle != null) JSONObject(SealCore.openReceived(myDeviceSeed, bundle, shares)) else null
+                    }
                 }.getOrNull()
                 delay(if (fast) 500 else 900)
                 messages[idx] = messages[idx].copy(state = State.OPENED, sealedFor = chat.name)
+                if (received != null && received.optBoolean("ok")) {
+                    messages.add(Msg(System.nanoTime(), received.optString("plaintext"), true, now(), state = State.OPENED))
+                    listState.animateScrollToItem(messages.lastIndex)
+                }
             } else {
                 val transcript = runCatching {
                     withContext(Dispatchers.Default) { if (fast) SealCore.runFastDemo() else SealCore.runDemo() }

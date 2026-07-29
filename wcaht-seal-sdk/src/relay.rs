@@ -22,6 +22,8 @@ type Store = Arc<Mutex<HashMap<[u8; 32], Vec<EncryptedEnvelope>>>>;
 pub fn serve_relay(addr: &str) -> Result<()> {
     let server = tiny_http::Server::http(addr).map_err(|e| anyhow!("relay bind {addr}: {e}"))?;
     let store: Store = Arc::new(Mutex::new(HashMap::new()));
+    // generic bundle inbox: hex mailbox tag -> [bundle JSON string], for full delivery.
+    let inbox: Arc<Mutex<HashMap<String, Vec<String>>>> = Arc::new(Mutex::new(HashMap::new()));
 
     for mut req in server.incoming_requests() {
         let method = req.method().clone();
@@ -54,6 +56,22 @@ pub fn serve_relay(addr: &str) -> Result<()> {
                     }
                     Err(e) => (400, json_err(&e.to_string())),
                 }
+            }
+            // full-delivery bundle inbox (opaque JSON, keyed by hex mailbox tag)
+            (tiny_http::Method::Post, path) if path.starts_with("/inbox/") => {
+                let tag = path["/inbox/".len()..].to_string();
+                let mut buf = String::new();
+                if req.as_reader().read_to_string(&mut buf).is_err() {
+                    (400, json_err("unreadable body"))
+                } else {
+                    inbox.lock().unwrap().entry(tag).or_default().push(buf);
+                    (200, r#"{"status":"delivered"}"#.to_string())
+                }
+            }
+            (tiny_http::Method::Get, path) if path.starts_with("/inbox/") => {
+                let tag = &path["/inbox/".len()..];
+                let items = inbox.lock().unwrap().get(tag).cloned().unwrap_or_default();
+                (200, format!("[{}]", items.join(",")))
             }
             _ => (404, json_err("not found")),
         };

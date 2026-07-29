@@ -38,6 +38,16 @@ enum SealCore {
         devicePub.withCString { d in text.withCString { t in copy(ss_seal_to(d, t, fast ? 1 : 0)) } }
     }
 
+    /// Seal + return {ok, seal_id, mailbox_tag, bundle, shares} to ship over the relay + gateways.
+    static func sealShippable(_ devicePub: String, _ text: String, _ fast: Bool) -> String {
+        devicePub.withCString { d in text.withCString { t in copy(ss_seal_shippable(d, t, fast ? 1 : 0)) } }
+    }
+
+    /// Open a collected message with the recipient's device seed. Returns {ok, plaintext} or {ok:false, reason}.
+    static func openReceived(_ deviceSeed: String, _ bundle: String, _ shares: String) -> String {
+        deviceSeed.withCString { s in bundle.withCString { b in shares.withCString { sh in copy(ss_open_received(s, b, sh)) } } }
+    }
+
     /// Copy a Rust-owned C string into a Swift String and free the original.
     private static func copy(_ ptr: UnsafeMutablePointer<CChar>?) -> String {
         guard let ptr = ptr else { return "{}" }

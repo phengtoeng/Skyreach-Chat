@@ -37,6 +37,14 @@ char *ss_phone_commitment(const char *phone);
  *   { ok, seal_id, recipient_device_commitment, ciphertext_len }  (fast: 1=FastSeal, 0=StrictSeal) */
 char *ss_seal_to(const char *device_pub, const char *text, int fast);
 
+/* Seal + return artifacts to SHIP over the services (real cross-device delivery):
+ *   { ok, seal_id, mailbox_tag, bundle, shares }  (bundle → relay, shares[i] → gateway i) */
+char *ss_seal_shippable(const char *device_pub, const char *text, int fast);
+
+/* Open a message COLLECTED from the services:
+ *   { ok, plaintext }  or  { ok:false, reason }  (device_seed = recipient's stored seed). */
+char *ss_open_received(const char *device_seed, const char *bundle, const char *shares);
+
 /* Free a string returned by any ss_* function. Safe on NULL. */
 void ss_free(char *ptr);
 

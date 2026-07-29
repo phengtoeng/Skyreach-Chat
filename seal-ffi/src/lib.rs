@@ -90,6 +90,72 @@ fn seal_to_json(device_pub_hex: &str, text: &str, fast: bool) -> String {
     }
 }
 
+/// Seal `text` to a device and return the artifacts to SHIP over the services:
+/// the ciphertext `bundle` (→ delivery relay, keyed by `mailbox_tag`) and the `shares`
+/// (one → each gateway). This is real cross-device delivery, not an in-process demo.
+fn seal_shippable_json(device_pub_hex: &str, text: &str, fast: bool) -> String {
+    let dp: Option<[u8; 32]> = hex::decode(device_pub_hex.trim()).ok().and_then(|v| v.try_into().ok());
+    let Some(device_pub) = dp else {
+        return json!({ "ok": false, "error": "bad device pubkey" }).to_string();
+    };
+    let sender_id = sc::SignId::generate();
+    let sender_dev = sc::SignId::generate();
+    let gw_ids: Vec<[u8; 32]> = (0..3).map(|_| sc::random_32()).collect();
+    let tag = mailbox_tag(&device_pub);
+    let mode = if fast { SealMode::FastSeal } else { SealMode::StrictSeal };
+    let item = match seal_text_with_mode(text.as_bytes(), &sender_id, &sender_dev, &device_pub, tag, &gw_ids, 2, 100, 100_000, mode) {
+        Ok(i) => i,
+        Err(e) => return json!({ "ok": false, "error": e.to_string() }).to_string(),
+    };
+    let bundle = json!({
+        "envelope": serde_json::to_value(&item.envelope).unwrap_or(Value::Null),
+        "signed_leaf": serde_json::to_value(&item.signed_leaf).unwrap_or(Value::Null),
+        "sender_id_pub": hex::encode(sender_id.public()),
+    });
+    let shares: Vec<Value> = item.share_envelopes.iter().filter_map(|s| serde_json::to_value(s).ok()).collect();
+    json!({
+        "ok": true,
+        "seal_id": hex::encode(item.signed_leaf.leaf.seal_id),
+        "mailbox_tag": hex::encode(tag),
+        "bundle": bundle,
+        "shares": shares,
+    })
+    .to_string()
+}
+
+/// Open a message the recipient COLLECTED from the services: reconstruct the recipient
+/// device from `device_seed`, then open the `bundle` (from the relay) with the `shares`
+/// (from the gateways). By the time shares are in hand the gateways have already gated
+/// on finality, so this treats the seal as finalised.
+fn open_received_json(device_seed_hex: &str, bundle_str: &str, shares_str: &str) -> String {
+    let recipient = sc::DeviceKey::from_seed(seed_from_hex(device_seed_hex));
+    let Ok(bundle): Result<Value, _> = serde_json::from_str(bundle_str) else {
+        return json!({ "ok": false, "reason": "bad bundle" }).to_string();
+    };
+    let envelope: Option<EncryptedEnvelope> = serde_json::from_value(bundle.get("envelope").cloned().unwrap_or(Value::Null)).ok();
+    let signed_leaf: Option<SignedLeaf> = serde_json::from_value(bundle.get("signed_leaf").cloned().unwrap_or(Value::Null)).ok();
+    let sender_pub: Option<[u8; 32]> = bundle
+        .get("sender_id_pub")
+        .and_then(Value::as_str)
+        .and_then(|s| hex::decode(s).ok())
+        .and_then(|v| v.try_into().ok());
+    let shares: Vec<KeyShareEnvelope> = serde_json::from_str(shares_str).unwrap_or_default();
+    let (Some(envelope), Some(signed_leaf), Some(sender_pub)) = (envelope, signed_leaf, sender_pub) else {
+        return json!({ "ok": false, "reason": "incomplete bundle" }).to_string();
+    };
+
+    // gateways already enforced finality before releasing, so mark the seal finalised.
+    let mut chain = MockSealChain::new(1000);
+    let _ = chain.submit_leaf(&signed_leaf, &sender_pub);
+    let _ = chain.finalize(&signed_leaf.leaf.seal_id);
+
+    match try_open(&envelope, &signed_leaf, &sender_pub, &recipient, &shares, &chain) {
+        OpenOutcome::Opened { plaintext } => json!({ "ok": true, "plaintext": String::from_utf8_lossy(&plaintext) }).to_string(),
+        OpenOutcome::Locked { reason, .. } => json!({ "ok": false, "reason": reason }).to_string(),
+        OpenOutcome::Rejected { reason } => json!({ "ok": false, "reason": reason }).to_string(),
+    }
+}
+
 /// Privacy-preserving directory key for a phone number (never the raw number, never
 /// on-chain). `hash(normalized phone)` — what resolves to a WCAHT address in the directory.
 fn phone_commitment_json(phone: &str) -> String {
@@ -184,6 +250,24 @@ pub unsafe extern "C" fn ss_phone_commitment(phone: *const c_char) -> *mut c_cha
 #[no_mangle]
 pub unsafe extern "C" fn ss_seal_to(device_pub: *const c_char, text: *const c_char, fast: i32) -> *mut c_char {
     to_c(seal_to_json(&cstr(device_pub), &cstr(text), fast != 0))
+}
+
+/// Seal + return shippable artifacts: `{ ok, seal_id, mailbox_tag, bundle, shares }`.
+///
+/// # Safety
+/// `device_pub` and `text` must be null or valid NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn ss_seal_shippable(device_pub: *const c_char, text: *const c_char, fast: i32) -> *mut c_char {
+    to_c(seal_shippable_json(&cstr(device_pub), &cstr(text), fast != 0))
+}
+
+/// Open a collected message: `{ ok, plaintext }` or `{ ok:false, reason }`.
+///
+/// # Safety
+/// All arguments must be null or valid NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn ss_open_received(device_seed: *const c_char, bundle: *const c_char, shares: *const c_char) -> *mut c_char {
+    to_c(open_received_json(&cstr(device_seed), &cstr(bundle), &cstr(shares)))
 }
 
 /// Free a string returned by any `ss_*` function. Safe on null.
@@ -448,6 +532,33 @@ pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeSealTo<'local>(
     let dp = jstr(&mut env, &device_pub);
     let t = jstr(&mut env, &text);
     ret(env, seal_to_json(&dp, &t, fast != 0))
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeSealShippable<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    device_pub: JString<'local>,
+    text: JString<'local>,
+    fast: jni::sys::jboolean,
+) -> jstring {
+    let dp = jstr(&mut env, &device_pub);
+    let t = jstr(&mut env, &text);
+    ret(env, seal_shippable_json(&dp, &t, fast != 0))
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeOpenReceived<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    device_seed: JString<'local>,
+    bundle: JString<'local>,
+    shares: JString<'local>,
+) -> jstring {
+    let ds = jstr(&mut env, &device_seed);
+    let b = jstr(&mut env, &bundle);
+    let s = jstr(&mut env, &shares);
+    ret(env, open_received_json(&ds, &b, &s))
 }
 
 #[cfg(test)]

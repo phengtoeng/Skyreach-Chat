@@ -144,6 +144,58 @@ func directoryPublish(_ phone: String, _ card: String) async -> Bool {
     return (resp as? HTTPURLResponse)?.statusCode == 200
 }
 
+// Delivery services (iOS simulator → host). Ship ciphertext to the relay + shares to gateways.
+let relayURL = "http://127.0.0.1:9200"
+let gatewayURLs = ["http://127.0.0.1:9201", "http://127.0.0.1:9202", "http://127.0.0.1:9203"]
+
+func httpPost(_ urlStr: String, _ body: String) async {
+    guard let url = URL(string: urlStr) else { return }
+    var req = URLRequest(url: url)
+    req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = body.data(using: .utf8)
+    _ = try? await URLSession.shared.data(for: req)
+}
+func httpGet(_ urlStr: String) async -> String? {
+    guard let url = URL(string: urlStr),
+          let (data, resp) = try? await URLSession.shared.data(from: url),
+          (resp as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+    return String(data: data, encoding: .utf8)
+}
+func shipSeal(_ ship: [String: Any]) async {
+    let tag = ship["mailbox_tag"] as? String ?? ""
+    let sealId = ship["seal_id"] as? String ?? ""
+    if let bundle = ship["bundle"], let d = try? JSONSerialization.data(withJSONObject: bundle), let s = String(data: d, encoding: .utf8) {
+        await httpPost("\(relayURL)/inbox/\(tag)", s)
+    }
+    if let shares = ship["shares"] as? [Any] {
+        for (i, sh) in shares.enumerated() where i < gatewayURLs.count {
+            if let d = try? JSONSerialization.data(withJSONObject: sh), let s = String(data: d, encoding: .utf8) {
+                await httpPost("\(gatewayURLs[i])/deposit", s)
+                await httpPost("\(gatewayURLs[i])/finalize/\(sealId)", "")
+            }
+        }
+    }
+}
+func fetchInbox(_ tag: String) async -> String? {
+    guard let body = await httpGet("\(relayURL)/inbox/\(tag)"),
+          let arr = (try? JSONSerialization.jsonObject(with: Data(body.utf8))) as? [Any],
+          let last = arr.last,
+          let d = try? JSONSerialization.data(withJSONObject: last),
+          let s = String(data: d, encoding: .utf8) else { return nil }
+    return s
+}
+func collectShares(_ sealId: String) async -> String {
+    var all: [Any] = []
+    for gw in gatewayURLs {
+        if let body = await httpGet("\(gw)/release/\(sealId)"), let arr = (try? JSONSerialization.jsonObject(with: Data(body.utf8))) as? [Any] {
+            all.append(contentsOf: arr)
+        }
+    }
+    if let d = try? JSONSerialization.data(withJSONObject: all), let s = String(data: d, encoding: .utf8) { return s }
+    return "[]"
+}
+
 // ─────────────────────────────── root nav ───────────────────────────────────
 struct ContentView: View {
     @State private var identity: [String: Any] = loadOrCreateIdentity()
@@ -173,7 +225,7 @@ struct ContentView: View {
     var body: some View {
         Group {
             if let c = openChat {
-                ConversationView(chat: c, onBack: { openChat = nil })
+                ConversationView(chat: c, myDeviceSeed: identity["device_seed"] as? String ?? "", onBack: { openChat = nil })
             } else if showNew {
                 NewContactView(
                     scanned: scanned,
@@ -490,6 +542,7 @@ struct NewContactView: View {
 // ────────────────────────────── conversation ────────────────────────────────
 struct ConversationView: View {
     let chat: Chat
+    let myDeviceSeed: String
     let onBack: () -> Void
     @State private var messages: [Msg] = seedThread()
     @State private var draft = ""
@@ -566,12 +619,26 @@ struct ConversationView: View {
         draft = ""
         Task { @MainActor in
             if real {
-                // seal to the contact's REAL device key — only their device can open it
-                _ = SealCore.sealTo(chat.devicePub, text, fast)
+                // seal + SHIP over the relay + gateways; loopback-receive proves the round-trip
+                var recv: [String: Any]? = nil
+                let shipStr = SealCore.sealShippable(chat.devicePub, text, fast)
+                if let ship = (try? JSONSerialization.jsonObject(with: Data(shipStr.utf8))) as? [String: Any], (ship["ok"] as? Bool) == true {
+                    await shipSeal(ship)
+                    let tag = ship["mailbox_tag"] as? String ?? ""
+                    let sealId = ship["seal_id"] as? String ?? ""
+                    if let bundle = await fetchInbox(tag) {
+                        let shares = await collectShares(sealId)
+                        let openStr = SealCore.openReceived(myDeviceSeed, bundle, shares)
+                        recv = (try? JSONSerialization.jsonObject(with: Data(openStr.utf8))) as? [String: Any]
+                    }
+                }
                 try? await Task.sleep(nanoseconds: fast ? 500_000_000 : 900_000_000)
                 if messages.indices.contains(idx) {
                     messages[idx].state = .opened
                     messages[idx].sealedFor = chat.name
+                }
+                if let r = recv, (r["ok"] as? Bool) == true, let plain = r["plaintext"] as? String {
+                    messages.append(Msg(text: plain, incoming: true, time: nowTime(), state: .opened))
                 }
             } else {
                 let json = fast ? SealCore.runFastDemo() : SealCore.runDemo()

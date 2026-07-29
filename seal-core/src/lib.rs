@@ -303,6 +303,14 @@ pub fn phone_commitment(phone: &str) -> [u8; 32] {
     sc::hash("DSCP-2/phone", normalize_phone(phone).as_bytes())
 }
 
+/// Deterministic delivery-relay mailbox address for a device. The sender derives it
+/// from the recipient's device pubkey to address the ciphertext; the recipient derives
+/// the same value from their own key to poll for it. (v1: derivable from the device key
+/// — rotating/blinded tags are a privacy follow-up.)
+pub fn mailbox_tag(device_pub: &[u8; 32]) -> [u8; 32] {
+    sc::hash("DSCP-2/mailbox", device_pub)
+}
+
 /// Off-chain phone directory: maps a phone COMMITMENT to the owner's contact card
 /// (address + device key). The raw number is never stored and never goes on-chain. The
 /// production directory is a registered service (SMS proof-of-ownership + a signed
