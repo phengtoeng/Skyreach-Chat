@@ -265,6 +265,12 @@ struct ContentView: View {
                     scanned: scanned,
                     onScan: { showScanner = true },
                     onLookup: { phone in Task { if let card = await directoryLookup(phone) { scanned = card } } },
+                    onPasteCode: { c in
+                        let res = SealCore.parseCard(c)
+                        if let d = (try? JSONSerialization.jsonObject(with: Data(res.utf8))) as? [String: Any], (d["ok"] as? Bool) == true {
+                            scanned = d
+                        }
+                    },
                     onCancel: { showNew = false; scanned = nil },
                     onSave: saveContact
                 )
@@ -490,12 +496,14 @@ struct NewContactView: View {
     let scanned: [String: Any]?
     let onScan: () -> Void
     let onLookup: (String) -> Void
+    let onPasteCode: (String) -> Void
     let onCancel: () -> Void
     let onSave: (String, String, String) -> Void
     @State private var first = ""
     @State private var last = ""
     @State private var phone = ""
     @State private var sync = true
+    @State private var code = ""
 
     var body: some View {
         let canSave = !first.trimmingCharacters(in: .whitespaces).isEmpty || scanned != nil
@@ -558,6 +566,22 @@ struct NewContactView: View {
                         }.foregroundColor(.dvBlue).padding(16)
                     }
                     .background(Color.white).clipShape(RoundedRectangle(cornerRadius: 14))
+
+                    // Paste the denvion: contact code directly — no camera needed (easiest between two simulators).
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Or add by contact code").font(.system(size: 13)).foregroundColor(.dvSub)
+                        TextField("denvion:…", text: $code)
+                            .textInputAutocapitalization(.never).autocorrectionDisabled().foregroundColor(.dvInk)
+                            .padding(12).background(Color(hex: 0xF1F4F7)).clipShape(RoundedRectangle(cornerRadius: 10))
+                        Button(action: { let c = code.trimmingCharacters(in: .whitespacesAndNewlines); if !c.isEmpty { onPasteCode(c) } }) {
+                            Text("Add by code")
+                                .font(.system(size: 15, weight: .semibold)).foregroundColor(.white)
+                                .frame(maxWidth: .infinity).padding(.vertical, 12)
+                                .background(code.isEmpty ? Color(hex: 0xCBD3DA) : Color.dvBlue)
+                                .clipShape(RoundedRectangle(cornerRadius: 10))
+                        }.disabled(code.isEmpty)
+                    }
+                    .padding(16).background(Color.white).clipShape(RoundedRectangle(cornerRadius: 14))
 
                     if !phone.isEmpty && scanned == nil {
                         Button(action: { onLookup(phone) }) {

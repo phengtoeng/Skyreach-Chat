@@ -345,6 +345,11 @@ private fun App(proto: String) {
                     }
                 }
             },
+            onPasteCode = { c ->
+                val res = JSONObject(SealCore.parseCard(c))
+                if (res.optBoolean("ok")) scanned = res
+                else android.widget.Toast.makeText(ctx, res.optString("error", "invalid contact code"), android.widget.Toast.LENGTH_SHORT).show()
+            },
             onCancel = { showNew = false; scanned = null },
             onSave = { first, last, phone ->
                 val nm = listOf(first, last).filter { it.isNotBlank() }.joinToString(" ")
@@ -624,6 +629,7 @@ private fun NewContactScreen(
     scanned: JSONObject?,
     onScan: () -> Unit,
     onLookup: (String) -> Unit,
+    onPasteCode: (String) -> Unit,
     onCancel: () -> Unit,
     onSave: (String, String, String) -> Unit,
 ) {
@@ -633,6 +639,7 @@ private fun NewContactScreen(
     var last by remember { mutableStateOf("") }
     var phone by remember { mutableStateOf("") }
     var sync by remember { mutableStateOf(true) }
+    var code by remember { mutableStateOf("") }
     val canSave = first.isNotBlank() || scanned != null
 
     Column(Modifier.fillMaxSize().background(bg)) {
@@ -697,6 +704,31 @@ private fun NewContactScreen(
                 Icon(Icons.Filled.QrCode2, null, tint = Blue)
                 Spacer(Modifier.width(12.dp))
                 Text("Add via QR Code", color = Blue, fontSize = 16.sp)
+            }
+
+            // Paste the denvion: contact code directly — no camera needed (easiest between two emulators).
+            Spacer(Modifier.height(18.dp))
+            Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color.White).padding(16.dp)) {
+                Text("Or add by contact code", color = Sub, fontSize = 13.sp)
+                Spacer(Modifier.height(8.dp))
+                Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(Color(0xFFF1F4F7)).padding(12.dp)) {
+                    if (code.isBlank()) Text("denvion:…", color = Sub, fontSize = 15.sp)
+                    BasicTextField(
+                        value = code,
+                        onValueChange = { code = it },
+                        textStyle = TextStyle(color = Ink, fontSize = 15.sp),
+                        cursorBrush = Brush.verticalGradient(listOf(Blue, Blue)),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+                Spacer(Modifier.height(10.dp))
+                Box(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+                        .background(if (code.isNotBlank()) Blue else Color(0xFFCBD3DA))
+                        .clickable(enabled = code.isNotBlank()) { onPasteCode(code.trim()) }
+                        .padding(vertical = 12.dp),
+                    contentAlignment = Alignment.Center,
+                ) { Text("Add by code", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold) }
             }
 
             if (phone.isNotBlank() && scanned == null) {

@@ -60,3 +60,7 @@ path = "src/bin/gateway_server.rs"
 [[bin]]
 name = "wcaht-seal-e2e"
 path = "src/bin/e2e.rs"
+
+[[bin]]
+name = "wcaht-seal-n6-e2e"
+path = "src/bin/n6_e2e.rs"
