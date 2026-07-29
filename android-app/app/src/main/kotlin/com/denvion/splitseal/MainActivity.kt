@@ -182,6 +182,21 @@ private class Store(ctx: Context) {
         }
         p.edit().putString("inbox_$tag", out.toString()).apply()
     }
+
+    // Per-conversation transcript (BOTH directions), keyed by the peer's identity_pub — the durable
+    // chat history. (inbox_<tag> above is only the opened-seal dedup set for incoming.)
+    fun thread(peer: String): JSONArray =
+        if (peer.isBlank()) JSONArray() else p.getString("thread_$peer", null)?.let { JSONArray(it) } ?: JSONArray()
+    /** Append a message to a conversation (dedup by id); false if already stored. */
+    fun addThreadMsg(peer: String, id: String, text: String, incoming: Boolean): Boolean {
+        if (peer.isBlank()) return false
+        val a = thread(peer)
+        for (i in 0 until a.length()) if (a.getJSONObject(i).optString("id") == id) return false
+        a.put(JSONObject().put("id", id).put("text", text).put("incoming", incoming).put("ts", System.currentTimeMillis()))
+        p.edit().putString("thread_$peer", a.toString()).apply()
+        return true
+    }
+    fun clearThread(peer: String) { if (peer.isNotBlank()) p.edit().remove("thread_$peer").apply() }
 }
 
 private fun loadOrCreateIdentity(store: Store): JSONObject {
@@ -281,19 +296,21 @@ private fun httpGet(url: String): String? = try {
     if (conn.responseCode == 200) conn.inputStream.bufferedReader().use { it.readText() } else null
 } catch (e: Exception) { null }
 
-/** Ship a shippable seal: {seal_id,bundle} → relay inbox, each share → a gateway (+ finalize). */
-private fun shipSeal(ship: JSONObject) {
+/** Ship a shippable seal: {seal_id,bundle} → relay inbox, each share → a gateway (+ finalize).
+ *  Returns true only if the relay actually accepted the ciphertext (so send can flag failures). */
+private fun shipSeal(ship: JSONObject): Boolean {
     val tag = ship.optString("mailbox_tag")
     val sealId = ship.optString("seal_id")
     // carry seal_id alongside the ciphertext so the recipient (who has neither) can collect shares.
     val item = JSONObject().put("seal_id", sealId).put("bundle", ship.getJSONObject("bundle"))
-    httpPost("${Server.relay}/inbox/$tag", item.toString())
+    val relayCode = httpPost("${Server.relay}/inbox/$tag", item.toString())
     val shares = ship.getJSONArray("shares")
     val gateways = Server.gateways
     for (i in 0 until minOf(shares.length(), gateways.size)) {
         httpPost("${gateways[i]}/deposit", shares.getJSONObject(i).toString())
         httpPost("${gateways[i]}/finalize/$sealId", "")
     }
+    return relayCode in 200..299
 }
 
 /** Fetch every {seal_id,bundle} item delivered to a mailbox tag (recipient polls this). */
@@ -414,7 +431,10 @@ private fun App(proto: String) {
                             if (store.addContactFromCard(parsed)) contacts = loadContacts(store)
                         }
                     }
-                    if (store.addInbox(myTag, sealId, text, sender)) notifyMessage(ctx, senderName, text)
+                    if (store.addInbox(myTag, sealId, text, sender)) {
+                        store.addThreadMsg(sender, sealId, text, true)
+                        notifyMessage(ctx, senderName, text)
+                    }
                 }
             }
             delay(3000)
@@ -446,6 +466,7 @@ private fun App(proto: String) {
         if (c.isContact) {
             store.removeContact(c.identityPub, c.name)
             store.clearInboxFrom(myTag, c.identityPub)
+            store.clearThread(c.identityPub)
             contacts = loadContacts(store)
         } else {
             store.hideChat(c.name)
@@ -1096,18 +1117,18 @@ private fun ConversationScreen(
         else runCatching { JSONObject(SealCore.mailboxTag(myDevicePub)).optString("mailbox_tag") }.getOrDefault("")
     }
     val seen = remember { mutableSetOf<String>() }
+    val ctx = LocalContext.current
     val messages = remember {
         mutableStateListOf<Msg>().apply {
             if (real) {
-                // restore received messages, but only the ones FROM this contact (by sender identity).
-                // seed `seen` with every stored id (any sender) so the poll never re-opens them.
+                // seed `seen` with every opened-seal id so the poll never re-opens them.
                 val stored = store.inbox(myTag)
-                for (i in 0 until stored.length()) {
-                    val o = stored.getJSONObject(i)
-                    seen.add(o.optString("id"))
-                    if (o.optString("sender") == chat.identityPub) {
-                        add(Msg(System.nanoTime() + i, o.optString("text"), true, "", state = State.OPENED))
-                    }
+                for (i in 0 until stored.length()) seen.add(stored.getJSONObject(i).optString("id"))
+                // restore the durable transcript for THIS peer (both directions, in order).
+                val t = store.thread(chat.identityPub)
+                for (i in 0 until t.length()) {
+                    val o = t.getJSONObject(i)
+                    add(Msg(System.nanoTime() + i, o.optString("text"), o.optBoolean("incoming"), "", state = State.OPENED))
                 }
             } else {
                 addAll(seedThread())
@@ -1140,10 +1161,13 @@ private fun ConversationScreen(
                     seen.add(sealId)
                     val text = opened.optString("plaintext")
                     val sender = bundle.optString("sender_id_pub") // sender's stable identity_pub
-                    // persist under my inbox tagged by sender; only SHOW it in this contact's chat.
-                    if (store.addInbox(myTag, sealId, text, sender) && sender == chat.identityPub) {
-                        messages.add(Msg(System.nanoTime(), text, true, now(), state = State.OPENED))
-                        listState.animateScrollToItem(messages.lastIndex)
+                    // dedup on the opened seal, persist to the sender's transcript, show if it's THIS chat.
+                    if (store.addInbox(myTag, sealId, text, sender)) {
+                        store.addThreadMsg(sender, sealId, text, true)
+                        if (sender == chat.identityPub) {
+                            messages.add(Msg(System.nanoTime(), text, true, now(), state = State.OPENED))
+                            listState.animateScrollToItem(messages.lastIndex)
+                        }
                     }
                 }
                 // if not opened yet (shares still locked) leave it unseen to retry next poll
@@ -1163,22 +1187,25 @@ private fun ConversationScreen(
         if (text.isEmpty()) return
         val fast = fastMode
         messages.add(Msg(System.nanoTime(), text, false, now(), state = State.SEALING, mode = if (fast) "FAST" else "STRICT"))
+        // persist the outgoing message immediately so it survives leaving/reopening the chat.
+        if (real) store.addThreadMsg(chat.identityPub, "out-" + System.nanoTime(), text, false)
         val idx = messages.lastIndex
         draft = ""
         scope.launch {
             listState.animateScrollToItem(messages.lastIndex)
             if (real) {
                 // seal + SHIP over the relay + gateways; the recipient's device polls + opens.
+                // `ok` now means the RELAY actually accepted the ciphertext (real delivery signal).
                 val ok = runCatching {
                     withContext(Dispatchers.IO) {
                         val ship = JSONObject(SealCore.sealShippable(myIdentitySeed, myCard, chat.devicePub, text, fast))
                         if (!ship.optBoolean("ok")) return@withContext false
                         shipSeal(ship)
-                        true
                     }
                 }.getOrDefault(false)
                 delay(if (fast) 400 else 800)
                 messages[idx] = messages[idx].copy(state = if (ok) State.OPENED else State.SEALING, sealedFor = chat.name)
+                if (!ok) android.widget.Toast.makeText(ctx, "Couldn't reach the server — message not sent", android.widget.Toast.LENGTH_SHORT).show()
                 poll() // pick up a self-loopback / any pending inbound right away
             } else {
                 val transcript = runCatching {

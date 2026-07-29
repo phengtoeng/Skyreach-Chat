@@ -149,6 +149,26 @@ enum Store {
             d.set(s, forKey: "inbox_\(tag)")
         }
     }
+
+    // Per-conversation transcript (BOTH directions), keyed by the peer's identity_pub — the durable
+    // chat history. (inbox_<tag> above is only the opened-seal dedup set for incoming.)
+    static func thread(_ peer: String) -> [[String: Any]] {
+        guard !peer.isEmpty, let s = d.string(forKey: "thread_\(peer)"), let data = s.data(using: .utf8) else { return [] }
+        return ((try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]) ?? []
+    }
+    /// Append a message to a conversation (dedup by id); false if already stored.
+    @discardableResult
+    static func addThreadMsg(_ peer: String, _ id: String, _ text: String, _ incoming: Bool) -> Bool {
+        guard !peer.isEmpty else { return false }
+        var a = thread(peer)
+        if a.contains(where: { ($0["id"] as? String) == id }) { return false }
+        a.append(["id": id, "text": text, "incoming": incoming, "ts": Date().timeIntervalSince1970])
+        if let out = try? JSONSerialization.data(withJSONObject: a), let s = String(data: out, encoding: .utf8) {
+            d.set(s, forKey: "thread_\(peer)")
+        }
+        return true
+    }
+    static func clearThread(_ peer: String) { if !peer.isEmpty { d.removeObject(forKey: "thread_\(peer)") } }
 }
 
 func loadOrCreateIdentity() -> [String: Any] {
@@ -237,13 +257,15 @@ func directoryPublish(_ phone: String, _ card: String) async -> Bool {
 var relayURL: String { "http://\(Server.host):9200" }
 var gatewayURLs: [String] { [9201, 9202, 9203].map { "http://\(Server.host):\($0)" } }
 
-func httpPost(_ urlStr: String, _ body: String) async {
-    guard let url = URL(string: urlStr) else { return }
+@discardableResult
+func httpPost(_ urlStr: String, _ body: String) async -> Int {
+    guard let url = URL(string: urlStr) else { return -1 }
     var req = URLRequest(url: url)
     req.httpMethod = "POST"
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
     req.httpBody = body.data(using: .utf8)
-    _ = try? await URLSession.shared.data(for: req)
+    guard let (_, resp) = try? await URLSession.shared.data(for: req) else { return -1 }
+    return (resp as? HTTPURLResponse)?.statusCode ?? -1
 }
 func httpGet(_ urlStr: String) async -> String? {
     guard let url = URL(string: urlStr),
@@ -251,14 +273,18 @@ func httpGet(_ urlStr: String) async -> String? {
           (resp as? HTTPURLResponse)?.statusCode == 200 else { return nil }
     return String(data: data, encoding: .utf8)
 }
-func shipSeal(_ ship: [String: Any]) async {
+/// Ship a seal; returns true only if the relay actually accepted the ciphertext (delivery signal).
+@discardableResult
+func shipSeal(_ ship: [String: Any]) async -> Bool {
     let tag = ship["mailbox_tag"] as? String ?? ""
     let sealId = ship["seal_id"] as? String ?? ""
+    var relayOk = false
     // carry seal_id alongside the ciphertext so the recipient (who has neither) can collect shares.
     if let bundle = ship["bundle"] {
         let item: [String: Any] = ["seal_id": sealId, "bundle": bundle]
         if let d = try? JSONSerialization.data(withJSONObject: item), let s = String(data: d, encoding: .utf8) {
-            await httpPost("\(relayURL)/inbox/\(tag)", s)
+            let code = await httpPost("\(relayURL)/inbox/\(tag)", s)
+            relayOk = (200..<300).contains(code)
         }
     }
     if let shares = ship["shares"] as? [Any] {
@@ -270,6 +296,7 @@ func shipSeal(_ ship: [String: Any]) async {
             }
         }
     }
+    return relayOk
 }
 /// Fetch every {seal_id, bundle} item delivered to a mailbox tag (recipient polls this).
 func fetchInboxAll(_ tag: String) async -> [[String: Any]] {
@@ -333,6 +360,7 @@ struct ContentView: View {
         if c.isContact {
             Store.removeContact(identityPub: c.identityPub, name: c.name)
             Store.clearInbox(tag: myMailboxTag(), sender: c.identityPub)
+            Store.clearThread(c.identityPub)
             contacts = loadContacts()
         } else {
             Store.hideChat(c.name)
@@ -414,7 +442,10 @@ struct ContentView: View {
                             if Store.addContactFromCard(pj) { contacts = loadContacts() }
                         }
                     }
-                    if Store.addInbox(tag, sealId, plain, sender) { notifyMessage(senderName, plain) }
+                    if Store.addInbox(tag, sealId, plain, sender) {
+                        Store.addThreadMsg(sender, sealId, plain, true)
+                        notifyMessage(senderName, plain)
+                    }
                 }
             }
             try? await Task.sleep(nanoseconds: 3_000_000_000)
@@ -963,12 +994,11 @@ struct ConversationView: View {
             }
             if real {
                 if messages.isEmpty {
-                    // restore only messages FROM this contact; seed `seen` with every id so poll skips them.
-                    for o in Store.inbox(myTag) {
-                        if let id = o["id"] as? String { seen.insert(id) }
-                        if (o["sender"] as? String) == chat.identityPub {
-                            messages.append(Msg(text: o["text"] as? String ?? "", incoming: true, time: "", state: .opened))
-                        }
+                    // seed `seen` with every opened-seal id so poll skips them...
+                    for o in Store.inbox(myTag) { if let id = o["id"] as? String { seen.insert(id) } }
+                    // ...then restore the durable transcript for THIS peer (both directions, in order).
+                    for o in Store.thread(chat.identityPub) {
+                        messages.append(Msg(text: o["text"] as? String ?? "", incoming: (o["incoming"] as? Bool) ?? false, time: "", state: .opened))
                     }
                 }
                 while !Task.isCancelled {
@@ -1017,9 +1047,12 @@ struct ConversationView: View {
             if let r = (try? JSONSerialization.jsonObject(with: Data(openStr.utf8))) as? [String: Any],
                (r["ok"] as? Bool) == true, let plain = r["plaintext"] as? String {
                 seen.insert(sealId)
-                // persist under my inbox tagged by sender; only SHOW it in this contact's chat.
-                if Store.addInbox(myTag, sealId, plain, sender) && sender == chat.identityPub {
-                    messages.append(Msg(text: plain, incoming: true, time: nowTime(), state: .opened))
+                // dedup on the opened seal, persist to the sender's transcript, show if it's THIS chat.
+                if Store.addInbox(myTag, sealId, plain, sender) {
+                    Store.addThreadMsg(sender, sealId, plain, true)
+                    if sender == chat.identityPub {
+                        messages.append(Msg(text: plain, incoming: true, time: nowTime(), state: .opened))
+                    }
                 }
             }
             // if not opened yet (shares still locked) leave it unseen to retry next poll
@@ -1031,16 +1064,18 @@ struct ConversationView: View {
         guard !text.isEmpty else { return }
         let fast = fastMode
         messages.append(Msg(text: text, incoming: false, time: nowTime(), state: .sealing, mode: fast ? "FAST" : "STRICT"))
+        // persist the outgoing message immediately so it survives leaving/reopening the chat.
+        if real { Store.addThreadMsg(chat.identityPub, "out-\(UUID().uuidString)", text, false) }
         let idx = messages.count - 1
         draft = ""
         Task { @MainActor in
             if real {
                 // seal + SHIP over the relay + gateways; the recipient's device polls + opens.
+                // `ok` now means the RELAY actually accepted the ciphertext (real delivery signal).
                 var ok = false
                 let shipStr = SealCore.sealShippable(myIdentitySeed, myCard, chat.devicePub, text, fast)
                 if let ship = (try? JSONSerialization.jsonObject(with: Data(shipStr.utf8))) as? [String: Any], (ship["ok"] as? Bool) == true {
-                    await shipSeal(ship)
-                    ok = true
+                    ok = await shipSeal(ship)
                 }
                 try? await Task.sleep(nanoseconds: fast ? 400_000_000 : 800_000_000)
                 if messages.indices.contains(idx) {
