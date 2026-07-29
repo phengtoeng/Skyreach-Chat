@@ -1,0 +1,55 @@
+name: SplitSeal
+options:
+  deploymentTarget:
+    iOS: "18.1"
+settings:
+  base:
+    PRODUCT_BUNDLE_IDENTIFIER: com.denvion.splitseal
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "18.1"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    DEVELOPMENT_TEAM: ""
+targets:
+  SplitSeal:
+    type: application
+    platform: iOS
+    sources:
+      - path: SplitSeal
+    # The five backend services (relay/gateways/directory) are plain http on a raw IP and the
+    # host is user-configurable in Settings, so no NSExceptionDomains entry can cover it.
+    # Without this, ATS silently kills every URLSession call: sends hang on "Sealing…" and the
+    # inbox poll never returns anything. Revisit when the backend gets TLS.
+    info:
+      path: SplitSeal/Info.plist
+      properties:
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+    settings:
+      base:
+        PRODUCT_NAME: SplitSeal
+        GENERATE_INFOPLIST_FILE: true
+        INFOPLIST_KEY_NSCameraUsageDescription: "Scan a contact's Denvion QR code to add them."
+        INFOPLIST_KEY_NSContactsUsageDescription: "Save a Denvion contact to your phone's address book."
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: true
+        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: true
+        INFOPLIST_KEY_UILaunchScreen_Generation: true
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        HEADER_SEARCH_PATHS:
+          - "$(SRCROOT)/../seal-ffi/include"
+        SWIFT_OBJC_BRIDGING_HEADER: "$(SRCROOT)/SplitSeal/SplitSeal-Bridging-Header.h"
+        OTHER_LDFLAGS:
+          - "-force_load"
+          - "$(SRCROOT)/build/libseal_ffi_sim.a"
+    preBuildScripts:
+      - name: Build Rust FFI
+        script: |
+          set -euo pipefail
+          "${SRCROOT}/scripts/build_rust_ios.sh"

@@ -909,7 +909,7 @@ struct AddToContactsSheet: UIViewControllerRepresentable {
         c.givenName = parts.first ?? name
         if parts.count > 1 { c.familyName = parts[1] }
         if !phone.isEmpty {
-            c.phoneNumbers = [CNLabeledValue(label: CNLabelPhoneNumberMobile, value: CNPhoneNumber(string: phone))]
+            c.phoneNumbers = [CNLabeledValue(label: CNLabelPhoneNumberMobile, value: CNPhoneNumber(stringValue: phone))]
         }
         let vc = CNContactViewController(forNewContact: c)
         vc.delegate = context.coordinator
