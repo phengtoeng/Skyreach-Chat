@@ -74,6 +74,16 @@ private val AvatarColors = listOf(
 )
 
 private fun now(): String = SimpleDateFormat("h:mm a", Locale.US).format(Date())
+/** Short "time from now" label for a unix-seconds target, e.g. "10m", "1h", "1d". */
+private fun relLabel(targetUnixSecs: Long): String {
+    val s = targetUnixSecs - System.currentTimeMillis() / 1000
+    if (s <= 0) return "now"
+    return when {
+        s < 3600 -> "${(s / 60).coerceAtLeast(1)}m"
+        s < 86400 -> "${s / 3600}h"
+        else -> "${s / 86400}d"
+    }
+}
 private fun avatarColor(name: String) = AvatarColors[(name.hashCode() and 0x7fffffff) % AvatarColors.size]
 private fun initials(name: String) =
     name.trim().split(" ").filter { it.isNotEmpty() }.take(2).joinToString("") { it.first().uppercase() }
@@ -94,6 +104,8 @@ private data class Msg(
     val read: Boolean = true,
     val mode: String = "STRICT",
     val sealedFor: String? = null, // set when sealed to a real contact's device key
+    val revealAt: Long = 0, // unix secs: timelocked to open at/after this time (0 = none)
+    val destroyAt: Long = 0, // unix secs: self-destructs after this time (0 = none)
 )
 
 private val CHATS = listOf(
@@ -323,9 +335,11 @@ private fun shipSeal(ship: JSONObject): Boolean {
     for (r in Server.relays) if (httpPost("$r/inbox/$tag", item.toString()) in 200..299) relayOk = true
     val shares = ship.getJSONArray("shares")
     val gateways = Server.gateways
+    // the timelock window travels to the gateways: they withhold shares before reveal_at / after destroy_at.
+    val window = JSONObject().put("reveal_at", ship.optLong("reveal_at")).put("destroy_at", ship.optLong("destroy_at")).toString()
     for (i in 0 until minOf(shares.length(), gateways.size)) {
         httpPost("${gateways[i]}/deposit", shares.getJSONObject(i).toString())
-        httpPost("${gateways[i]}/finalize/$sealId", "")
+        httpPost("${gateways[i]}/finalize/$sealId", window)
     }
     return relayOk
 }
@@ -1163,6 +1177,10 @@ private fun ConversationScreen(
     }
     var draft by remember { mutableStateOf("") }
     var fastMode by remember { mutableStateOf(false) }
+    // one-shot timelock for the NEXT message (unix secs, 0 = none); set via the clock in the composer.
+    var revealAt by remember { mutableStateOf(0L) }
+    var destroyAt by remember { mutableStateOf(0L) }
+    var showTimer by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val polling = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
@@ -1195,8 +1213,10 @@ private fun ConversationScreen(
                             listState.animateScrollToItem(messages.lastIndex)
                         }
                     }
+                } else if (opened?.optString("reason") == "destroyed") {
+                    seen.add(sealId) // self-destructed before it was opened → stop retrying, never shows
                 }
-                // if not opened yet (shares still locked) leave it unseen to retry next poll
+                // timelocked ("locked") or shares still gathering → leave unseen; it opens when the window does
             }
         } finally {
             polling.set(false)
@@ -1212,11 +1232,12 @@ private fun ConversationScreen(
         val text = draft.trim()
         if (text.isEmpty()) return
         val fast = fastMode
-        messages.add(Msg(System.nanoTime(), text, false, now(), state = State.SEALING, mode = if (fast) "FAST" else "STRICT"))
+        val rv = revealAt; val dz = destroyAt // capture the one-shot timelock for THIS message
+        messages.add(Msg(System.nanoTime(), text, false, now(), state = State.SEALING, mode = if (fast) "FAST" else "STRICT", revealAt = rv, destroyAt = dz))
         // persist the outgoing message immediately so it survives leaving/reopening the chat.
         if (real) store.addThreadMsg(chat.identityPub, "out-" + System.nanoTime(), text, false)
         val idx = messages.lastIndex
-        draft = ""
+        draft = ""; revealAt = 0L; destroyAt = 0L // reset the timelock after each send
         scope.launch {
             listState.animateScrollToItem(messages.lastIndex)
             if (real) {
@@ -1224,7 +1245,7 @@ private fun ConversationScreen(
                 // `ok` now means the RELAY actually accepted the ciphertext (real delivery signal).
                 val ok = runCatching {
                     withContext(Dispatchers.IO) {
-                        val ship = JSONObject(SealCore.sealShippable(myIdentitySeed, myCard, chat.devicePub, text, fast))
+                        val ship = JSONObject(SealCore.sealShippable(myIdentitySeed, myCard, chat.devicePub, text, fast, rv, dz))
                         if (!ship.optBoolean("ok")) return@withContext false
                         shipSeal(ship)
                     }
@@ -1279,8 +1300,70 @@ private fun ConversationScreen(
             items(messages) { m -> Bubble(m) }
         }
 
-        Composer(draft, { draft = it }, ::send)
+        val timerLabel = when {
+            revealAt > 0 -> "🔒 Opens in ${relLabel(revealAt)}"
+            destroyAt > 0 -> "💥 Destroys in ${relLabel(destroyAt)}"
+            else -> null
+        }
+        Composer(draft, { draft = it }, timerLabel, { showTimer = true }, { revealAt = 0L; destroyAt = 0L }, ::send)
     }
+
+    if (showTimer) TimedSealDialog(
+        onDismiss = { showTimer = false },
+        onPick = { r, d -> revealAt = r; destroyAt = d; showTimer = false },
+    )
+}
+
+@Composable
+private fun TimedSealDialog(onDismiss: () -> Unit, onPick: (Long, Long) -> Unit) {
+    var mode by remember { mutableStateOf(0) } // 0 = timelock (opens later), 1 = self-destruct
+    val presets = listOf("1 min" to 60L, "10 min" to 600L, "1 hour" to 3600L, "1 day" to 86400L)
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Timed seal") },
+        text = {
+            Column {
+                Text(
+                    "The gateways enforce this — the key can't be assembled outside the window, so it's cryptographic, not just \"please delete\".",
+                    color = Sub, fontSize = 12.sp,
+                )
+                Spacer(Modifier.height(14.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    ModeChip("🔒 Opens later", mode == 0) { mode = 0 }
+                    ModeChip("💥 Self-destruct", mode == 1) { mode = 1 }
+                }
+                Spacer(Modifier.height(16.dp))
+                Text(if (mode == 0) "Opens after" else "Destroys after", color = Ink, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.height(8.dp))
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    presets.chunked(2).forEach { row ->
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            row.forEach { (label, secs) ->
+                                Box(
+                                    Modifier.weight(1f).clip(RoundedCornerShape(10.dp)).background(Color(0xFFF1F4F7))
+                                        .clickable {
+                                            val t = System.currentTimeMillis() / 1000 + secs
+                                            if (mode == 0) onPick(t, 0L) else onPick(0L, t)
+                                        }.padding(vertical = 12.dp),
+                                    contentAlignment = Alignment.Center,
+                                ) { Text(label, color = Ink, fontSize = 14.sp) }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel", color = Sub) } },
+    )
+}
+
+@Composable
+private fun ModeChip(label: String, active: Boolean, onClick: () -> Unit) {
+    Box(
+        Modifier.clip(RoundedCornerShape(20.dp)).background(if (active) Blue else Color(0xFFF1F4F7))
+            .clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 8.dp),
+    ) { Text(label, color = if (active) Color.White else Ink, fontSize = 13.sp, fontWeight = FontWeight.SemiBold) }
 }
 
 @Composable
@@ -1384,6 +1467,15 @@ private fun VoiceContent(m: Msg) {
 @Composable
 private fun MetaRow(m: Msg) {
     Row(Modifier.fillMaxWidth().padding(top = 2.dp), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
+        if (m.revealAt > 0) {
+            Icon(Icons.Filled.Schedule, null, tint = Blue, modifier = Modifier.size(11.dp))
+            Spacer(Modifier.width(3.dp))
+            Text("Opens in ${relLabel(m.revealAt)}", color = Blue, fontSize = 10.sp)
+            Spacer(Modifier.width(6.dp))
+        } else if (m.destroyAt > 0) {
+            Text("💥 ${relLabel(m.destroyAt)}", color = Color(0xFFE0403A), fontSize = 10.sp)
+            Spacer(Modifier.width(6.dp))
+        }
         m.sealedFor?.let {
             Icon(Icons.Filled.Lock, null, tint = Blue, modifier = Modifier.size(11.dp))
             Spacer(Modifier.width(3.dp))
@@ -1410,11 +1502,34 @@ private fun SealBadge() {
 }
 
 @Composable
-private fun Composer(value: String, onChange: (String) -> Unit, onSend: () -> Unit) {
+private fun Composer(
+    value: String,
+    onChange: (String) -> Unit,
+    timerLabel: String?,
+    onClock: () -> Unit,
+    onClearTimer: () -> Unit,
+    onSend: () -> Unit,
+) {
+  Column(Modifier.fillMaxWidth().background(Color.White)) {
+    if (timerLabel != null) {
+        Row(
+            Modifier.fillMaxWidth().padding(start = 14.dp, end = 14.dp, top = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                Modifier.clip(RoundedCornerShape(12.dp)).background(Color(0xFFEAF3FF)).padding(horizontal = 10.dp, vertical = 5.dp),
+            ) { Text(timerLabel, color = Blue, fontSize = 12.sp, fontWeight = FontWeight.SemiBold) }
+            Spacer(Modifier.width(6.dp))
+            Icon(Icons.Filled.Close, "Clear timer", tint = Sub, modifier = Modifier.size(16.dp).clickable(onClick = onClearTimer))
+        }
+    }
     Row(
-        Modifier.fillMaxWidth().background(Color.White).padding(horizontal = 10.dp, vertical = 8.dp),
+        Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        IconButton(onClick = onClock) {
+            Icon(Icons.Filled.Schedule, "Timed seal", tint = if (timerLabel != null) Blue else Sub, modifier = Modifier.size(23.dp))
+        }
         OutlinedTextField(
             value = value,
             onValueChange = onChange,
@@ -1442,6 +1557,7 @@ private fun Composer(value: String, onChange: (String) -> Unit, onSend: () -> Un
             Icon(if (active) Icons.Filled.Send else Icons.Filled.Mic, "Send", tint = Color.White, modifier = Modifier.size(22.dp))
         }
     }
+  }
 }
 
 // ─────────────────────────────── avatar ─────────────────────────────────────

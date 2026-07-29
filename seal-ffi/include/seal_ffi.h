@@ -46,7 +46,10 @@ char *ss_seal_to(const char *device_pub, const char *text, int fast);
  * identity_seed = the SENDER's stored identity seed; bundle.sender_id_pub = sender identity_pub.
  * sender_card = the SENDER's own contact card, embedded in the bundle (bundle.sender_card) so the
  * recipient can identify + REPLY without adding the sender first (self-describing message). */
-char *ss_seal_shippable(const char *identity_seed, const char *sender_card, const char *device_pub, const char *text, int fast);
+/* reveal_at / destroy_at are unix seconds (0 = none): a timelock window. The gateways withhold
+ * the key shares before reveal_at and drop them after destroy_at (self-destruct), so the recipient
+ * cannot reconstruct the key outside the window; open_received enforces it too (defense-in-depth). */
+char *ss_seal_shippable(const char *identity_seed, const char *sender_card, const char *device_pub, const char *text, int fast, long long reveal_at, long long destroy_at);
 
 /* Open a message COLLECTED from the services:
  *   { ok, plaintext }  or  { ok:false, reason }  (device_seed = recipient's stored seed). */

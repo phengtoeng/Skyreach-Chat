@@ -18,7 +18,7 @@ object SealCore {
     private external fun nativePhoneCommitment(phone: String): String
     private external fun nativeMailboxTag(devicePub: String): String
     private external fun nativeSealTo(devicePub: String, text: String, fast: Boolean): String
-    private external fun nativeSealShippable(identitySeed: String, senderCard: String, devicePub: String, text: String, fast: Boolean): String
+    private external fun nativeSealShippable(identitySeed: String, senderCard: String, devicePub: String, text: String, fast: Boolean, revealAt: Long, destroyAt: Long): String
     private external fun nativeOpenReceived(deviceSeed: String, bundle: String, shares: String): String
 
     /** `{ "protocol":"DSCP-2", "version":2, "chain_id":7789 }` */
@@ -49,9 +49,10 @@ object SealCore {
     fun sealTo(devicePub: String, text: String, fast: Boolean): String = nativeSealTo(devicePub, text, fast)
 
     /** Seal (signed by MY identitySeed, with MY card embedded so the peer can reply) + return
-     *  {ok, seal_id, mailbox_tag, bundle, shares}. bundle.sender_card = senderCard. */
-    fun sealShippable(identitySeed: String, senderCard: String, devicePub: String, text: String, fast: Boolean): String =
-        nativeSealShippable(identitySeed, senderCard, devicePub, text, fast)
+     *  {ok, seal_id, mailbox_tag, bundle, shares, reveal_at, destroy_at}. revealAt/destroyAt are
+     *  unix secs (0 = none) — a timelock window enforced by the gateways. */
+    fun sealShippable(identitySeed: String, senderCard: String, devicePub: String, text: String, fast: Boolean, revealAt: Long = 0, destroyAt: Long = 0): String =
+        nativeSealShippable(identitySeed, senderCard, devicePub, text, fast, revealAt, destroyAt)
 
     /** Open a collected message with the recipient's device seed. Returns {ok, plaintext} or {ok:false, reason}. */
     fun openReceived(deviceSeed: String, bundle: String, shares: String): String = nativeOpenReceived(deviceSeed, bundle, shares)

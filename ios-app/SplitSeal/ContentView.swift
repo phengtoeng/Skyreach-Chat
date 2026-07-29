@@ -45,6 +45,17 @@ struct Msg: Identifiable {
     let id = UUID(); var text: String; let incoming: Bool; let time: String
     var kind: Kind = .text; var state: MsgState = .plain; var read: Bool = true; var mode: String = "STRICT"
     var sealedFor: String? = nil
+    var revealAt: Int64 = 0  // unix secs: timelocked to open at/after this time (0 = none)
+    var destroyAt: Int64 = 0 // unix secs: self-destructs after this time (0 = none)
+}
+
+/// Short "time from now" label for a unix-seconds target, e.g. "10m", "1h", "1d".
+func relLabel(_ target: Int64) -> String {
+    let s = target - Int64(Date().timeIntervalSince1970)
+    if s <= 0 { return "now" }
+    if s < 3600 { return "\(max(1, s / 60))m" }
+    if s < 86400 { return "\(s / 3600)h" }
+    return "\(s / 86400)d"
 }
 
 private let CHATS: [Chat] = [
@@ -304,12 +315,17 @@ func shipSeal(_ ship: [String: Any]) async -> Bool {
             }
         }
     }
+    // the timelock window travels to the gateways: they withhold shares before reveal_at / after destroy_at.
+    let revealAt = ship["reveal_at"] as? Int64 ?? 0
+    let destroyAt = ship["destroy_at"] as? Int64 ?? 0
+    let window = (try? JSONSerialization.data(withJSONObject: ["reveal_at": revealAt, "destroy_at": destroyAt]))
+        .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
     if let shares = ship["shares"] as? [Any] {
         let gws = gatewayURLs
         for (i, sh) in shares.enumerated() where i < gws.count {
             if let d = try? JSONSerialization.data(withJSONObject: sh), let s = String(data: d, encoding: .utf8) {
                 await httpPost("\(gws[i])/deposit", s)
-                await httpPost("\(gws[i])/finalize/\(sealId)", "")
+                await httpPost("\(gws[i])/finalize/\(sealId)", window)
             }
         }
     }
@@ -966,6 +982,10 @@ struct ConversationView: View {
     @State private var seen = Set<String>()
     @State private var polling = false
     @State private var myTag = ""
+    // one-shot timelock for the NEXT message (unix secs, 0 = none); set via the clock in the composer.
+    @State private var revealAt: Int64 = 0
+    @State private var destroyAt: Int64 = 0
+    @State private var showTimer = false
 
     // A "real" conversation is linked to a contact's device key (vs. the demo threads).
     private var real: Bool { !chat.devicePub.isEmpty }
@@ -1034,25 +1054,47 @@ struct ConversationView: View {
                 messages = seedThread()
             }
         }
+        .sheet(isPresented: $showTimer) {
+            TimedSealSheet(onPick: { r, d in revealAt = r; destroyAt = d; showTimer = false },
+                           onCancel: { showTimer = false })
+        }
     }
 
     private var composer: some View {
-        HStack(spacing: 8) {
-            HStack(spacing: 8) {
-                Image(systemName: "face.smiling").foregroundColor(.dvSub).font(.system(size: 20))
-                TextField("Message", text: $draft, axis: .vertical)
-                    .lineLimit(1...4).font(.system(size: 15)).foregroundColor(.dvInk)
+        VStack(spacing: 0) {
+            if revealAt > 0 || destroyAt > 0 {
+                HStack(spacing: 6) {
+                    Text(revealAt > 0 ? "🔒 Opens in \(relLabel(revealAt))" : "💥 Destroys in \(relLabel(destroyAt))")
+                        .font(.system(size: 12, weight: .semibold)).foregroundColor(.dvBlue)
+                        .padding(.horizontal, 10).padding(.vertical, 5)
+                        .background(Color(hex: 0xEAF3FF)).clipShape(RoundedRectangle(cornerRadius: 12))
+                    Button(action: { revealAt = 0; destroyAt = 0 }) {
+                        Image(systemName: "xmark").font(.system(size: 12)).foregroundColor(.dvSub)
+                    }
+                    Spacer()
+                }.padding(.horizontal, 14).padding(.top, 8)
             }
-            .padding(.horizontal, 12).padding(.vertical, 10)
-            .background(Color(hex: 0xF1F4F7)).clipShape(RoundedRectangle(cornerRadius: 22))
+            HStack(spacing: 8) {
+                Button(action: { showTimer = true }) {
+                    Image(systemName: "clock").font(.system(size: 21))
+                        .foregroundColor(revealAt > 0 || destroyAt > 0 ? .dvBlue : .dvSub)
+                }
+                HStack(spacing: 8) {
+                    Image(systemName: "face.smiling").foregroundColor(.dvSub).font(.system(size: 20))
+                    TextField("Message", text: $draft, axis: .vertical)
+                        .lineLimit(1...4).font(.system(size: 15)).foregroundColor(.dvInk)
+                }
+                .padding(.horizontal, 12).padding(.vertical, 10)
+                .background(Color(hex: 0xF1F4F7)).clipShape(RoundedRectangle(cornerRadius: 22))
 
-            let active = !draft.trimmingCharacters(in: .whitespaces).isEmpty
-            Button(action: send) {
-                Image(systemName: active ? "paperplane.fill" : "mic.fill").foregroundColor(.white).font(.system(size: 19))
-                    .frame(width: 46, height: 46).background(Color.dvBlue).clipShape(Circle())
-            }.disabled(!active)
+                let active = !draft.trimmingCharacters(in: .whitespaces).isEmpty
+                Button(action: send) {
+                    Image(systemName: active ? "paperplane.fill" : "mic.fill").foregroundColor(.white).font(.system(size: 19))
+                        .frame(width: 46, height: 46).background(Color.dvBlue).clipShape(Circle())
+                }.disabled(!active)
+            }
+            .padding(.horizontal, 10).padding(.vertical, 8)
         }
-        .padding(.horizontal, 10).padding(.vertical, 8)
         .background(Color.white)
     }
 
@@ -1079,8 +1121,11 @@ struct ConversationView: View {
                         messages.append(Msg(text: plain, incoming: true, time: nowTime(), state: .opened))
                     }
                 }
+            } else if let r = (try? JSONSerialization.jsonObject(with: Data(openStr.utf8))) as? [String: Any],
+                      (r["reason"] as? String) == "destroyed" {
+                seen.insert(sealId) // self-destructed before it was opened → stop retrying, never shows
             }
-            // if not opened yet (shares still locked) leave it unseen to retry next poll
+            // timelocked ("locked") or shares still gathering → leave unseen; opens when the window does
         }
     }
 
@@ -1088,17 +1133,18 @@ struct ConversationView: View {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         let fast = fastMode
-        messages.append(Msg(text: text, incoming: false, time: nowTime(), state: .sealing, mode: fast ? "FAST" : "STRICT"))
+        let rv = revealAt, dz = destroyAt // capture the one-shot timelock for THIS message
+        messages.append(Msg(text: text, incoming: false, time: nowTime(), state: .sealing, mode: fast ? "FAST" : "STRICT", revealAt: rv, destroyAt: dz))
         // persist the outgoing message immediately so it survives leaving/reopening the chat.
         if real { Store.addThreadMsg(chat.identityPub, "out-\(UUID().uuidString)", text, false) }
         let idx = messages.count - 1
-        draft = ""
+        draft = ""; revealAt = 0; destroyAt = 0 // reset the timelock after each send
         Task { @MainActor in
             if real {
                 // seal + SHIP over the relay + gateways; the recipient's device polls + opens.
                 // `ok` now means the RELAY actually accepted the ciphertext (real delivery signal).
                 var ok = false
-                let shipStr = SealCore.sealShippable(myIdentitySeed, myCard, chat.devicePub, text, fast)
+                let shipStr = SealCore.sealShippable(myIdentitySeed, myCard, chat.devicePub, text, fast, rv, dz)
                 if let ship = (try? JSONSerialization.jsonObject(with: Data(shipStr.utf8))) as? [String: Any], (ship["ok"] as? Bool) == true {
                     ok = await shipSeal(ship)
                 }
@@ -1115,6 +1161,45 @@ struct ConversationView: View {
                 if messages.indices.contains(idx) { messages[idx].state = opened ? .opened : .sealing }
             }
         }
+    }
+}
+
+// Timed-seal picker: choose timelock (opens later) or self-destruct + a preset duration.
+struct TimedSealSheet: View {
+    let onPick: (Int64, Int64) -> Void   // (revealAt, destroyAt) unix secs
+    let onCancel: () -> Void
+    @State private var mode = 0           // 0 = opens later, 1 = self-destruct
+    private let presets: [(String, Int64)] = [("1 min", 60), ("10 min", 600), ("1 hour", 3600), ("1 day", 86400)]
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text("Timed seal").font(.system(size: 18, weight: .bold)).foregroundColor(.dvInk)
+                Spacer()
+                Button("Cancel", action: onCancel).foregroundColor(.dvSub)
+            }
+            Text("The gateways enforce this — the key can't be assembled outside the window, so it's cryptographic, not just \"please delete\".")
+                .font(.system(size: 12)).foregroundColor(.dvSub)
+            Picker("", selection: $mode) {
+                Text("🔒 Opens later").tag(0)
+                Text("💥 Self-destruct").tag(1)
+            }.pickerStyle(.segmented)
+            Text(mode == 0 ? "Opens after" : "Destroys after").font(.system(size: 13, weight: .semibold)).foregroundColor(.dvInk)
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+                ForEach(presets, id: \.0) { (label, secs) in
+                    Button(action: {
+                        let t = Int64(Date().timeIntervalSince1970) + secs
+                        mode == 0 ? onPick(t, 0) : onPick(0, t)
+                    }) {
+                        Text(label).font(.system(size: 15)).foregroundColor(.dvInk)
+                            .frame(maxWidth: .infinity).padding(.vertical, 14)
+                            .background(Color(hex: 0xF1F4F7)).clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                }
+            }
+            Spacer()
+        }
+        .padding(20)
+        .presentationDetents([.height(340)])
     }
 }
 
@@ -1207,6 +1292,14 @@ private struct Bubble: View {
     private var metaRow: some View {
         HStack(spacing: 4) {
             Spacer()
+            if m.revealAt > 0 {
+                Image(systemName: "clock").font(.system(size: 10)).foregroundColor(.dvBlue)
+                Text("Opens in \(relLabel(m.revealAt))").font(.system(size: 10)).foregroundColor(.dvBlue)
+                Spacer().frame(width: 4)
+            } else if m.destroyAt > 0 {
+                Text("💥 \(relLabel(m.destroyAt))").font(.system(size: 10)).foregroundColor(Color(hex: 0xE0403A))
+                Spacer().frame(width: 4)
+            }
             if let who = m.sealedFor {
                 Image(systemName: "lock.fill").font(.system(size: 10)).foregroundColor(.dvBlue)
                 Text("Sealed for \(who)").font(.system(size: 10)).foregroundColor(.dvBlue)

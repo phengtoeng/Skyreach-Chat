@@ -96,7 +96,15 @@ fn seal_to_json(device_pub_hex: &str, text: &str, fast: bool) -> String {
 ///
 /// `sender_card` is the SENDER's own contact card, embedded in the bundle so the recipient
 /// can identify the sender and REPLY without a prior manual add (self-describing message).
-fn seal_shippable_json(identity_seed_hex: &str, sender_card: &str, device_pub_hex: &str, text: &str, fast: bool) -> String {
+fn seal_shippable_json(
+    identity_seed_hex: &str,
+    sender_card: &str,
+    device_pub_hex: &str,
+    text: &str,
+    fast: bool,
+    reveal_at: i64,
+    destroy_at: i64,
+) -> String {
     let dp: Option<[u8; 32]> = hex::decode(device_pub_hex.trim()).ok().and_then(|v| v.try_into().ok());
     let Some(device_pub) = dp else {
         return json!({ "ok": false, "error": "bad device pubkey" }).to_string();
@@ -117,6 +125,10 @@ fn seal_shippable_json(identity_seed_hex: &str, sender_card: &str, device_pub_he
         "signed_leaf": serde_json::to_value(&item.signed_leaf).unwrap_or(Value::Null),
         "sender_id_pub": hex::encode(sender_id.public()),
         "sender_card": sender_card,
+        // timelock window (unix secs, 0 = none): carried so the recipient can DISPLAY "opens at T"
+        // / "destroyed"; the actual guarantee is the gateways withholding shares outside the window.
+        "reveal_at": reveal_at,
+        "destroy_at": destroy_at,
     });
     let shares: Vec<Value> = item.share_envelopes.iter().filter_map(|s| serde_json::to_value(s).ok()).collect();
     json!({
@@ -125,6 +137,8 @@ fn seal_shippable_json(identity_seed_hex: &str, sender_card: &str, device_pub_he
         "mailbox_tag": hex::encode(tag),
         "bundle": bundle,
         "shares": shares,
+        "reveal_at": reveal_at,
+        "destroy_at": destroy_at,
     })
     .to_string()
 }
@@ -149,6 +163,18 @@ fn open_received_json(device_seed_hex: &str, bundle_str: &str, shares_str: &str)
     let (Some(envelope), Some(signed_leaf), Some(sender_pub)) = (envelope, signed_leaf, sender_pub) else {
         return json!({ "ok": false, "reason": "incomplete bundle" }).to_string();
     };
+
+    // Timelock enforcement (defense-in-depth; the gateways are the primary gate that withholds
+    // the shares outside the window). Refuse to open before reveal_at or after destroy_at.
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let reveal_at = bundle.get("reveal_at").and_then(Value::as_i64).unwrap_or(0);
+    let destroy_at = bundle.get("destroy_at").and_then(Value::as_i64).unwrap_or(0);
+    if destroy_at > 0 && now >= destroy_at {
+        return json!({ "ok": false, "reason": "destroyed" }).to_string();
+    }
+    if reveal_at > 0 && now < reveal_at {
+        return json!({ "ok": false, "reason": "locked", "reveal_at": reveal_at }).to_string();
+    }
 
     // gateways already enforced finality before releasing, so mark the seal finalised.
     let mut chain = MockSealChain::new(1000);
@@ -285,8 +311,16 @@ pub unsafe extern "C" fn ss_seal_to(device_pub: *const c_char, text: *const c_ch
 /// # Safety
 /// `identity_seed`, `device_pub` and `text` must be null or valid NUL-terminated C strings.
 #[no_mangle]
-pub unsafe extern "C" fn ss_seal_shippable(identity_seed: *const c_char, sender_card: *const c_char, device_pub: *const c_char, text: *const c_char, fast: i32) -> *mut c_char {
-    to_c(seal_shippable_json(&cstr(identity_seed), &cstr(sender_card), &cstr(device_pub), &cstr(text), fast != 0))
+pub unsafe extern "C" fn ss_seal_shippable(
+    identity_seed: *const c_char,
+    sender_card: *const c_char,
+    device_pub: *const c_char,
+    text: *const c_char,
+    fast: i32,
+    reveal_at: i64,
+    destroy_at: i64,
+) -> *mut c_char {
+    to_c(seal_shippable_json(&cstr(identity_seed), &cstr(sender_card), &cstr(device_pub), &cstr(text), fast != 0, reveal_at, destroy_at))
 }
 
 /// Open a collected message: `{ ok, plaintext }` or `{ ok:false, reason }`.
@@ -581,12 +615,14 @@ pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeSealShippable<'
     device_pub: JString<'local>,
     text: JString<'local>,
     fast: jni::sys::jboolean,
+    reveal_at: jni::sys::jlong,
+    destroy_at: jni::sys::jlong,
 ) -> jstring {
     let is = jstr(&mut env, &identity_seed);
     let sc = jstr(&mut env, &sender_card);
     let dp = jstr(&mut env, &device_pub);
     let t = jstr(&mut env, &text);
-    ret(env, seal_shippable_json(&is, &sc, &dp, &t, fast != 0))
+    ret(env, seal_shippable_json(&is, &sc, &dp, &t, fast != 0, reveal_at as i64, destroy_at as i64))
 }
 
 #[no_mangle]
@@ -638,7 +674,7 @@ mod tests {
             let _ = mailbox_tag_json(s);
             let _ = phone_commitment_json(s);
             let _ = seal_to_json(s, s, false);
-            let _ = seal_shippable_json(s, s, s, s, true);
+            let _ = seal_shippable_json(s, s, s, s, true, 0, 0);
             let _ = card_for_json(s, s, s);
             let _ = open_received_json(s, s, s);
         }
@@ -658,7 +694,7 @@ mod tests {
         // ...and equal to the tag the SENDER ships to, so polling it receives the seal.
         let seed = bob["identity_seed"].as_str().unwrap();
         let card = bob["card"].as_str().unwrap();
-        let ship: Value = serde_json::from_str(&seal_shippable_json(seed, card, device_pub, "hi", false)).unwrap();
+        let ship: Value = serde_json::from_str(&seal_shippable_json(seed, card, device_pub, "hi", false, 0, 0)).unwrap();
         assert_eq!(ship["ok"], true);
         assert_eq!(ship["mailbox_tag"], t1["mailbox_tag"]);
 
@@ -678,7 +714,7 @@ mod tests {
         let alice_seed = alice["identity_seed"].as_str().unwrap();
         let alice_card = alice["card"].as_str().unwrap();
 
-        let ship: Value = serde_json::from_str(&seal_shippable_json(alice_seed, alice_card, device_pub, "meet at 9", false)).unwrap();
+        let ship: Value = serde_json::from_str(&seal_shippable_json(alice_seed, alice_card, device_pub, "meet at 9", false, 0, 0)).unwrap();
         // attribution: the bundle names ALICE's stable identity as the sender.
         assert_eq!(ship["bundle"]["sender_id_pub"], alice["identity_pub"]);
         // self-describing: the bundle carries Alice's card so Bob can reply without adding her first.
@@ -698,5 +734,32 @@ mod tests {
         let wrong_seed = mallory["device_seed"].as_str().unwrap();
         let denied: Value = serde_json::from_str(&open_received_json(wrong_seed, &bundle, &shares)).unwrap();
         assert_eq!(denied["ok"], false, "wrong device must be denied: {denied}");
+    }
+
+    #[test]
+    fn timelock_reveal_and_destroy_are_enforced_on_open() {
+        let bob: Value = serde_json::from_str(&new_identity_json("Bob")).unwrap();
+        let (dp, ds) = (bob["device_pub"].as_str().unwrap(), bob["device_seed"].as_str().unwrap());
+        let alice: Value = serde_json::from_str(&new_identity_json("Alice")).unwrap();
+        let (aseed, acard) = (alice["identity_seed"].as_str().unwrap(), alice["card"].as_str().unwrap());
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+
+        // reveal_at in the future -> LOCKED even with the shares in hand.
+        let s1: Value = serde_json::from_str(&seal_shippable_json(aseed, acard, dp, "future", false, now + 3600, 0)).unwrap();
+        let o1: Value = serde_json::from_str(&open_received_json(ds, &s1["bundle"].to_string(), &s1["shares"].to_string())).unwrap();
+        assert_eq!(o1["ok"], false);
+        assert_eq!(o1["reason"], "locked");
+
+        // destroy_at in the past -> DESTROYED, unopenable.
+        let s2: Value = serde_json::from_str(&seal_shippable_json(aseed, acard, dp, "gone", false, 0, now - 10)).unwrap();
+        let o2: Value = serde_json::from_str(&open_received_json(ds, &s2["bundle"].to_string(), &s2["shares"].to_string())).unwrap();
+        assert_eq!(o2["ok"], false);
+        assert_eq!(o2["reason"], "destroyed");
+
+        // a window that is open right now -> opens fine.
+        let s3: Value = serde_json::from_str(&seal_shippable_json(aseed, acard, dp, "now", false, now - 10, now + 3600)).unwrap();
+        let o3: Value = serde_json::from_str(&open_received_json(ds, &s3["bundle"].to_string(), &s3["shares"].to_string())).unwrap();
+        assert_eq!(o3["ok"], true, "open window should open: {o3}");
+        assert_eq!(o3["plaintext"], "now");
     }
 }

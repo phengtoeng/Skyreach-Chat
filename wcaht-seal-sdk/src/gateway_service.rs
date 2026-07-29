@@ -9,15 +9,25 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use seal_core::KeyShareEnvelope;
+use serde_json::Value;
 
 #[derive(Default)]
 struct GwStore {
     shares: HashMap<String, Vec<KeyShareEnvelope>>, // seal_id hex -> held shares
     finalised: HashSet<String>,
+    // Optional timelock window per seal (unix secs, 0 = none). The gateway withholds the key
+    // share BEFORE reveal_at and drops it AFTER destroy_at — so the recipient physically cannot
+    // reconstruct the key outside the window. This is what makes timelock/self-destruct
+    // cryptographic (key-level), not a client-side "please delete" policy.
+    windows: HashMap<String, (i64, i64)>,
+}
+
+fn now_unix() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
 /// Run a gateway (blocking) on `addr`, e.g. `"0.0.0.0:9101"`.
@@ -47,17 +57,44 @@ pub fn serve_gateway(addr: &str) -> Result<()> {
             }
             (tiny_http::Method::Post, path) if path.starts_with("/finalize/") => {
                 let sid = path["/finalize/".len()..].to_string();
-                store.lock().unwrap().finalised.insert(sid);
+                // optional JSON body {reveal_at, destroy_at} sets the timelock window for this seal.
+                let mut buf = String::new();
+                let _ = req.as_reader().read_to_string(&mut buf);
+                let (reveal_at, destroy_at) = serde_json::from_str::<Value>(&buf)
+                    .ok()
+                    .map(|v| {
+                        (
+                            v.get("reveal_at").and_then(Value::as_i64).unwrap_or(0),
+                            v.get("destroy_at").and_then(Value::as_i64).unwrap_or(0),
+                        )
+                    })
+                    .unwrap_or((0, 0));
+                let mut s = store.lock().unwrap();
+                s.finalised.insert(sid.clone());
+                if reveal_at > 0 || destroy_at > 0 {
+                    s.windows.insert(sid, (reveal_at, destroy_at));
+                }
                 (200, r#"{"status":"finalised"}"#.to_string())
             }
             (tiny_http::Method::Get, path) if path.starts_with("/release/") => {
                 let sid = &path["/release/".len()..];
-                let s = store.lock().unwrap();
-                if s.finalised.contains(sid) {
+                let mut s = store.lock().unwrap();
+                if !s.finalised.contains(sid) {
+                    (425, err_json("not finalised — no early release")) // 425 Too Early
+                } else if let Some(&(reveal_at, destroy_at)) = s.windows.get(sid) {
+                    let now = now_unix();
+                    if destroy_at > 0 && now >= destroy_at {
+                        s.shares.remove(sid); // self-destruct: the share is gone, key unrecoverable
+                        (410, err_json("destroyed — window closed")) // 410 Gone
+                    } else if reveal_at > 0 && now < reveal_at {
+                        (425, err_json("timelocked — not yet revealable")) // 425 Too Early
+                    } else {
+                        let shares = s.shares.get(sid).cloned().unwrap_or_default();
+                        (200, serde_json::to_string(&shares).unwrap_or_else(|_| "[]".into()))
+                    }
+                } else {
                     let shares = s.shares.get(sid).cloned().unwrap_or_default();
                     (200, serde_json::to_string(&shares).unwrap_or_else(|_| "[]".into()))
-                } else {
-                    (425, err_json("not finalised — no early release")) // 425 Too Early
                 }
             }
             _ => (404, err_json("not found")),

@@ -44,9 +44,10 @@ enum SealCore {
     }
 
     /// Seal (signed by MY identitySeed, with MY card embedded so the peer can reply) + return
-    /// {ok, seal_id, mailbox_tag, bundle, shares}. bundle.sender_card = senderCard.
-    static func sealShippable(_ identitySeed: String, _ senderCard: String, _ devicePub: String, _ text: String, _ fast: Bool) -> String {
-        identitySeed.withCString { i in senderCard.withCString { c in devicePub.withCString { d in text.withCString { t in copy(ss_seal_shippable(i, c, d, t, fast ? 1 : 0)) } } } }
+    /// {ok, seal_id, mailbox_tag, bundle, shares, reveal_at, destroy_at}. revealAt/destroyAt are
+    /// unix secs (0 = none) — a timelock window enforced by the gateways.
+    static func sealShippable(_ identitySeed: String, _ senderCard: String, _ devicePub: String, _ text: String, _ fast: Bool, _ revealAt: Int64 = 0, _ destroyAt: Int64 = 0) -> String {
+        identitySeed.withCString { i in senderCard.withCString { c in devicePub.withCString { d in text.withCString { t in copy(ss_seal_shippable(i, c, d, t, fast ? 1 : 0, revealAt, destroyAt)) } } } }
     }
 
     /// Open a collected message with the recipient's device seed. Returns {ok, plaintext} or {ok:false, reason}.
