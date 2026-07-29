@@ -21,6 +21,7 @@ use seal_core::{SealChain, SealProof, SealStatus};
 use serde_json::{json, Value};
 
 pub mod directory;
+pub mod gateway_service;
 pub mod relay;
 
 // ───────────────────────────── live RPC client ──────────────────────────────

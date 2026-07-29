@@ -52,3 +52,11 @@ path = "src/bin/dir_demo.rs"
 [[bin]]
 name = "wcaht-seal-dir-register"
 path = "src/bin/dir_register.rs"
+
+[[bin]]
+name = "wcaht-seal-gateway"
+path = "src/bin/gateway_server.rs"
+
+[[bin]]
+name = "wcaht-seal-e2e"
+path = "src/bin/e2e.rs"
