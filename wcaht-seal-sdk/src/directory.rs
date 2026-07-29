@@ -9,6 +9,7 @@
 //!   GET  /lookup/<hex commitment>   → { "card": "denvion:…" }  or  404
 
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,11 +20,32 @@ use serde_json::Value;
 type Store = Arc<Mutex<HashMap<String, String>>>; // commitment_hex -> card code
 
 /// Run the directory server (blocking) on `addr`, e.g. `"0.0.0.0:9988"`.
+///
+/// Durability + replication (same model as the relay): each registration is appended to a disk
+/// log and reloaded on startup, and a client register is GOSSIPED to peer directories
+/// (`WCAHT_DIRECTORY_PEERS`, `X-Gossip: 1` to avoid loops) so all nodes converge and a lookup
+/// resolves on any node. Env: `WCAHT_DIRECTORY_PEERS`, `WCAHT_DIRECTORY_DATA` (default `directory-data`).
 pub fn serve_directory(addr: &str) -> Result<()> {
     let server = tiny_http::Server::http(addr).map_err(|e| anyhow!("directory bind {addr}: {e}"))?;
     let store: Store = Arc::new(Mutex::new(HashMap::new()));
 
+    let peers: Vec<String> = std::env::var("WCAHT_DIRECTORY_PEERS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let data_dir = std::env::var("WCAHT_DIRECTORY_DATA").unwrap_or_else(|_| "directory-data".to_string());
+    std::fs::create_dir_all(&data_dir).ok();
+    let log_path = format!("{data_dir}/register.log");
+    load_registrations(&log_path, &store);
+    let gossip_http = reqwest::blocking::Client::builder().timeout(Duration::from_secs(4)).build().ok();
+
     for mut req in server.incoming_requests() {
+        let from_gossip = req
+            .headers()
+            .iter()
+            .any(|h| h.field.as_str().as_str().eq_ignore_ascii_case("X-Gossip"));
         let method = req.method().clone();
         let url = req.url().to_string();
 
@@ -39,7 +61,18 @@ pub fn serve_directory(addr: &str) -> Result<()> {
                             let card = v.get("card").and_then(Value::as_str).unwrap_or_default();
                             // only accept a well-formed card, and only its commitment key
                             if commitment.len() == 64 && ContactCard::decode(card).is_ok() {
-                                store.lock().unwrap().insert(commitment.to_string(), card.to_string());
+                                let changed = {
+                                    let mut s = store.lock().unwrap();
+                                    s.insert(commitment.to_string(), card.to_string()) != Some(card.to_string())
+                                };
+                                if changed {
+                                    persist(&log_path, commitment, card);
+                                    if !from_gossip {
+                                        if let Some(c) = &gossip_http {
+                                            gossip(c.clone(), peers.clone(), commitment.to_string(), card.to_string());
+                                        }
+                                    }
+                                }
                                 (200, r#"{"status":"registered"}"#.to_string())
                             } else {
                                 (400, err_json("bad commitment or card"))
@@ -63,6 +96,48 @@ pub fn serve_directory(addr: &str) -> Result<()> {
         let _ = req.respond(tiny_http::Response::from_string(body).with_status_code(code).with_header(header));
     }
     Ok(())
+}
+
+/// Append a registration to the durable log (one JSON line: `{commitment, card}`).
+fn persist(log_path: &str, commitment: &str, card: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
+        let line = serde_json::json!({ "commitment": commitment, "card": card }).to_string();
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// Reload registrations from the durable log on startup (last write wins).
+fn load_registrations(log_path: &str, store: &Store) {
+    let Ok(content) = std::fs::read_to_string(log_path) else { return };
+    let mut s = store.lock().unwrap();
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(line) {
+            let commitment = v.get("commitment").and_then(Value::as_str).unwrap_or_default();
+            let card = v.get("card").and_then(Value::as_str).unwrap_or_default();
+            if commitment.len() == 64 && !card.is_empty() {
+                s.insert(commitment.to_string(), card.to_string());
+            }
+        }
+    }
+    if !s.is_empty() {
+        println!("directory: reloaded {} registration(s)", s.len());
+    }
+}
+
+/// Fan a client register out to peer directories (X-Gossip so they don't re-forward). Fire-and-forget.
+fn gossip(client: reqwest::blocking::Client, peers: Vec<String>, commitment: String, card: String) {
+    if peers.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let payload = serde_json::json!({ "commitment": commitment, "card": card });
+        for p in &peers {
+            let _ = client.post(format!("{p}/register")).header("X-Gossip", "1").json(&payload).send();
+        }
+    });
 }
 
 fn err_json(msg: &str) -> String {

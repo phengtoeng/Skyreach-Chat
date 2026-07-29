@@ -232,9 +232,8 @@ private fun loadContacts(store: Store): List<Contact> {
 // "10.0.2.2" for services on the emulator's own host machine. Only a hostname/IP: the
 // ports are fixed. Nothing here is secret; the servers only ever see ciphertext + hashes.
 object Server {
-    const val DEFAULT_HOST = "51.79.176.134" // N6 — hosts the directory
+    const val DEFAULT_HOST = "51.79.176.134" // N6
     @Volatile var host: String = DEFAULT_HOST
-    val directory: String get() = "http://$host:9988"
     // The seal backbone runs on all 3 nodes (N5, N6, N7) so no single node is a point of failure.
     val nodeHosts = listOf("139.99.150.23", "51.79.176.134", "51.79.162.80")
     // Replicated relays: ship the ciphertext to ALL, read from ALL (merge) — delivery survives
@@ -243,37 +242,47 @@ object Server {
     // 3 INDEPENDENT gateways, one per node (t=2 of 3): no single machine holds all key shares,
     // and any one gateway can be down and messages still open.
     val gateways: List<String> get() = nodeHosts.map { "http://$it:9201" }
+    // Replicated directories (gossip + persist server-side): register to ALL, look up on ANY.
+    val directories: List<String> get() = nodeHosts.map { "http://$it:9988" }
 }
 
 private fun directoryLookup(phone: String): JSONObject? {
-    return try {
-        val commit = JSONObject(SealCore.phoneCommitment(phone)).optString("phone_commitment")
-        if (commit.isEmpty()) return null
-        val conn = (java.net.URL("${Server.directory}/lookup/$commit").openConnection() as java.net.HttpURLConnection).apply {
-            connectTimeout = 4000; readTimeout = 4000
-        }
-        if (conn.responseCode == 200) {
-            val card = JSONObject(conn.inputStream.bufferedReader().use { it.readText() }).optString("card")
-            val res = JSONObject(SealCore.parseCard(card))
-            if (res.optBoolean("ok")) res else null
-        } else null
-    } catch (e: Exception) {
-        null
+    val commit = runCatching { JSONObject(SealCore.phoneCommitment(phone)).optString("phone_commitment") }.getOrNull()
+    if (commit.isNullOrEmpty()) return null
+    // try each directory node until one answers (any replica resolves — survives a node outage).
+    for (d in Server.directories) {
+        val res = runCatching {
+            val conn = (java.net.URL("$d/lookup/$commit").openConnection() as java.net.HttpURLConnection).apply {
+                connectTimeout = 4000; readTimeout = 4000
+            }
+            if (conn.responseCode == 200) {
+                val card = JSONObject(conn.inputStream.bufferedReader().use { it.readText() }).optString("card")
+                JSONObject(SealCore.parseCard(card)).takeIf { it.optBoolean("ok") }
+            } else null
+        }.getOrNull()
+        if (res != null) return res
     }
+    return null
 }
 
 private fun directoryPublish(phone: String, cardCode: String): Boolean {
-    return try {
-        val commit = JSONObject(SealCore.phoneCommitment(phone)).optString("phone_commitment")
-        val conn = (java.net.URL("${Server.directory}/register").openConnection() as java.net.HttpURLConnection).apply {
-            requestMethod = "POST"; doOutput = true; connectTimeout = 4000; readTimeout = 4000
-            setRequestProperty("Content-Type", "application/json")
-        }
-        conn.outputStream.use { it.write(JSONObject().put("commitment", commit).put("card", cardCode).toString().toByteArray()) }
-        conn.responseCode == 200
-    } catch (e: Exception) {
-        false
+    val commit = runCatching { JSONObject(SealCore.phoneCommitment(phone)).optString("phone_commitment") }.getOrNull()
+    if (commit.isNullOrEmpty()) return false
+    // register to every directory node (they also gossip) — published as long as one accepts.
+    var ok = false
+    val body = JSONObject().put("commitment", commit).put("card", cardCode).toString()
+    for (d in Server.directories) {
+        val code = runCatching {
+            val conn = (java.net.URL("$d/register").openConnection() as java.net.HttpURLConnection).apply {
+                requestMethod = "POST"; doOutput = true; connectTimeout = 4000; readTimeout = 4000
+                setRequestProperty("Content-Type", "application/json")
+            }
+            conn.outputStream.use { it.write(body.toByteArray()) }
+            conn.responseCode
+        }.getOrDefault(-1)
+        if (code == 200) ok = true
     }
+    return ok
 }
 
 private fun qrBitmap(text: String, size: Int = 480): androidx.compose.ui.graphics.ImageBitmap {

@@ -220,37 +220,46 @@ enum Server {
         set { UserDefaults.standard.set(newValue.trimmingCharacters(in: .whitespaces), forKey: "server_host") }
     }
 }
-var directoryURL: String { "http://\(Server.host):9988" }
+// Replicated directories (gossip + persist server-side): register to ALL, look up on ANY.
+var directoryURLs: [String] { nodeHosts.map { "http://\($0):9988" } }
 
 func directoryLookup(_ phone: String) async -> [String: Any]? {
     let commitJson = SealCore.phoneCommitment(phone)
     guard let cd = (try? JSONSerialization.jsonObject(with: Data(commitJson.utf8))) as? [String: Any],
-          let commit = cd["phone_commitment"] as? String,
-          let url = URL(string: "\(directoryURL)/lookup/\(commit)"),
-          let (data, resp) = try? await URLSession.shared.data(from: url),
-          (resp as? HTTPURLResponse)?.statusCode == 200,
-          let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-          let card = body["card"] as? String
-    else { return nil }
-    let res = SealCore.parseCard(card)
-    if let d = (try? JSONSerialization.jsonObject(with: Data(res.utf8))) as? [String: Any], (d["ok"] as? Bool) == true {
-        return d
+          let commit = cd["phone_commitment"] as? String else { return nil }
+    // try each directory node until one answers (any replica resolves — survives a node outage).
+    for base in directoryURLs {
+        guard let url = URL(string: "\(base)/lookup/\(commit)"),
+              let (data, resp) = try? await URLSession.shared.data(from: url),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let card = body["card"] as? String else { continue }
+        let res = SealCore.parseCard(card)
+        if let d = (try? JSONSerialization.jsonObject(with: Data(res.utf8))) as? [String: Any], (d["ok"] as? Bool) == true {
+            return d
+        }
     }
     return nil
 }
 
-/// Publish my phone → my card to the directory (server stores only the hash).
+/// Publish my phone → my card to every directory (server stores only the hash; they also gossip).
 func directoryPublish(_ phone: String, _ card: String) async -> Bool {
     let commitJson = SealCore.phoneCommitment(phone)
     guard let cd = (try? JSONSerialization.jsonObject(with: Data(commitJson.utf8))) as? [String: Any],
           let commit = cd["phone_commitment"] as? String,
-          let url = URL(string: "\(directoryURL)/register") else { return false }
-    var req = URLRequest(url: url)
-    req.httpMethod = "POST"
-    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    req.httpBody = try? JSONSerialization.data(withJSONObject: ["commitment": commit, "card": card])
-    guard let (_, resp) = try? await URLSession.shared.data(for: req) else { return false }
-    return (resp as? HTTPURLResponse)?.statusCode == 200
+          let payload = try? JSONSerialization.data(withJSONObject: ["commitment": commit, "card": card]) else { return false }
+    var ok = false
+    for base in directoryURLs {
+        guard let url = URL(string: "\(base)/register") else { continue }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = payload
+        if let (_, resp) = try? await URLSession.shared.data(for: req), (resp as? HTTPURLResponse)?.statusCode == 200 {
+            ok = true
+        }
+    }
+    return ok
 }
 
 // The seal backbone runs on all 3 nodes (N5, N6, N7) so no single node is a point of failure.

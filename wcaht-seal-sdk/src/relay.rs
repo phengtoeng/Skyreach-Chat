@@ -9,23 +9,56 @@
 //!   POST /mailbox                     body = EncryptedEnvelope JSON  → 200
 //!   GET  /mailbox/<hex mailbox_tag>   → JSON array of EncryptedEnvelope
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use seal_core::EncryptedEnvelope;
+use serde_json::Value;
 
 type Store = Arc<Mutex<HashMap<[u8; 32], Vec<EncryptedEnvelope>>>>;
 
 /// Run the relay server (blocking) on `addr`, e.g. `"127.0.0.1:9977"`.
+///
+/// Durability + replication for the `/inbox` bundle store (the mobile delivery path):
+///   * every accepted item is appended to a disk log and reloaded on startup, so a relay
+///     restart/crash does not lose queued messages;
+///   * a client write is GOSSIPED to peer relays (`WCAHT_RELAY_PEERS`, comma-separated base
+///     URLs) with an `X-Gossip: 1` header, so a message that reached ANY one relay propagates
+///     to the others — it survives even if the relay it first landed on later dies.
+/// Env: `WCAHT_RELAY_PEERS` (peer base URLs), `WCAHT_RELAY_DATA` (data dir, default `relay-data`).
 pub fn serve_relay(addr: &str) -> Result<()> {
     let server = tiny_http::Server::http(addr).map_err(|e| anyhow!("relay bind {addr}: {e}"))?;
     let store: Store = Arc::new(Mutex::new(HashMap::new()));
     // generic bundle inbox: hex mailbox tag -> [bundle JSON string], for full delivery.
     let inbox: Arc<Mutex<HashMap<String, Vec<String>>>> = Arc::new(Mutex::new(HashMap::new()));
+    // per-tag set of seen seal-ids, so replay/gossip/replicated writes never duplicate.
+    let seen: Arc<Mutex<HashMap<String, HashSet<String>>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    let peers: Vec<String> = std::env::var("WCAHT_RELAY_PEERS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let data_dir = std::env::var("WCAHT_RELAY_DATA").unwrap_or_else(|_| "relay-data".to_string());
+    std::fs::create_dir_all(&data_dir).ok();
+    let log_path = format!("{data_dir}/inbox.log");
+    load_inbox(&log_path, &inbox, &seen);
+    if !peers.is_empty() {
+        println!("relay: {} peer(s) for gossip: {}", peers.len(), peers.join(", "));
+    }
+    println!("relay: persisting to {log_path}");
+    let gossip_http = reqwest::blocking::Client::builder().timeout(Duration::from_secs(4)).build().ok();
 
     for mut req in server.incoming_requests() {
+        // an X-Gossip header marks a replicated write from a peer relay → store but do NOT re-gossip.
+        let from_gossip = req
+            .headers()
+            .iter()
+            .any(|h| h.field.as_str().as_str().eq_ignore_ascii_case("X-Gossip"));
         let method = req.method().clone();
         let url = req.url().to_string();
 
@@ -64,7 +97,24 @@ pub fn serve_relay(addr: &str) -> Result<()> {
                 if req.as_reader().read_to_string(&mut buf).is_err() {
                     (400, json_err("unreadable body"))
                 } else {
-                    inbox.lock().unwrap().entry(tag).or_default().push(buf);
+                    let sid = seal_id_of(&buf);
+                    let newly = {
+                        let mut sn = seen.lock().unwrap();
+                        if sn.entry(tag.clone()).or_default().insert(sid) {
+                            inbox.lock().unwrap().entry(tag.clone()).or_default().push(buf.clone());
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if newly {
+                        persist(&log_path, &tag, &buf); // survive a restart
+                        if !from_gossip {
+                            if let Some(c) = &gossip_http {
+                                gossip(c.clone(), peers.clone(), tag.clone(), buf.clone()); // spread to peers
+                            }
+                        }
+                    }
                     (200, r#"{"status":"delivered"}"#.to_string())
                 }
             }
@@ -81,6 +131,70 @@ pub fn serve_relay(addr: &str) -> Result<()> {
         let _ = req.respond(response);
     }
     Ok(())
+}
+
+/// A stable dedup key for an inbox item: its `seal_id` if present, else a hash of the bytes.
+fn seal_id_of(item: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<Value>(item) {
+        if let Some(s) = v.get("seal_id").and_then(Value::as_str) {
+            return s.to_string();
+        }
+    }
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    item.hash(&mut h);
+    format!("h{:x}", h.finish())
+}
+
+/// Append an accepted item to the durable log (one JSON line: `{tag, item}`).
+fn persist(log_path: &str, tag: &str, item: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
+        let line = serde_json::json!({ "tag": tag, "item": item }).to_string();
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// Reload the durable log into memory on startup (deduped by seal-id).
+fn load_inbox(
+    log_path: &str,
+    inbox: &Arc<Mutex<HashMap<String, Vec<String>>>>,
+    seen: &Arc<Mutex<HashMap<String, HashSet<String>>>>,
+) {
+    let Ok(content) = std::fs::read_to_string(log_path) else { return };
+    let mut ib = inbox.lock().unwrap();
+    let mut sn = seen.lock().unwrap();
+    let mut n = 0usize;
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(line) {
+            let tag = v.get("tag").and_then(Value::as_str).unwrap_or_default().to_string();
+            let item = v.get("item").and_then(Value::as_str).unwrap_or_default().to_string();
+            if tag.is_empty() || item.is_empty() {
+                continue;
+            }
+            if sn.entry(tag.clone()).or_default().insert(seal_id_of(&item)) {
+                ib.entry(tag).or_default().push(item);
+                n += 1;
+            }
+        }
+    }
+    if n > 0 {
+        println!("relay: reloaded {n} persisted message(s)");
+    }
+}
+
+/// Fan a client write out to peer relays (marked X-Gossip so they don't re-forward). Fire-and-forget.
+fn gossip(client: reqwest::blocking::Client, peers: Vec<String>, tag: String, body: String) {
+    if peers.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        for p in &peers {
+            let _ = client.post(format!("{p}/inbox/{tag}")).header("X-Gossip", "1").body(body.clone()).send();
+        }
+    });
 }
 
 fn json_err(msg: &str) -> String {
