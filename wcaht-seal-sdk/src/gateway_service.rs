@@ -44,10 +44,13 @@ fn verify_window(body: &str, sid_hex: &str, store: &Arc<Mutex<GwStore>>) -> Resu
     let Ok(v) = serde_json::from_str::<Value>(body) else {
         return Err("unparseable finalize body".into());
     };
-    // A bare {reveal_at, destroy_at} is exactly the forgeable thing we no longer accept.
+    // A bare {reveal_at, destroy_at} is the forgeable shape, so it is IGNORED — but not
+    // rejected. Older clients still send it, and failing the whole finalise would leave their
+    // messages permanently unopenable. Dropping just the window is safe: the timelock lives in
+    // the signed leaf and is enforced by the protocol core regardless of what a gateway thinks.
     if v.get("signed_leaf").is_none() {
         if v.get("reveal_at").is_some() || v.get("destroy_at").is_some() {
-            return Err("a timelock window must arrive inside a signed leaf, not as bare fields".into());
+            eprintln!("gateway: ignoring an unsigned timelock window (client predates signed leaves)");
         }
         return Ok(None);
     }
@@ -144,6 +147,12 @@ pub fn serve_gateway(addr: &str) -> Result<()> {
         .and_then(|b| <[u8; 32]>::try_from(b).ok())
         .map(|seed| crate::AnchorSigner::from_seed(&seed));
     let anchor_api_key = std::env::var("WCAHT_API_KEY").ok();
+    // Strict mode: refuse to release a seal whose signed leaf we never saw. OFF by default so
+    // deploying this binary cannot strand messages from clients that predate signed leaves.
+    let require_signed_leaf = std::env::var("WCAHT_REQUIRE_SIGNED_LEAF").is_ok_and(|v| v == "1");
+    if require_signed_leaf {
+        println!("gateway: STRICT — a seal with no signed leaf will not be released");
+    }
     match (&anchor_signer, &chain_rpc) {
         (Some(sg), Some(_)) => println!("gateway: anchoring ON from {}", sg.address()),
         (Some(_), None) => println!("gateway: WCAHT_ANCHOR_SEED set but WCAHT_RPC is not — anchoring OFF"),
@@ -204,9 +213,13 @@ pub fn serve_gateway(addr: &str) -> Result<()> {
                 // and the gateway would release. With a node configured we check the chain
                 // ourselves — the seal's own slot floor must actually be finalised — and we
                 // require the signed leaf that carries it.
+                // Verify against the chain when we can. When a client sent no signed leaf there
+                // is no floor to check — refusing would break every older client, so by default
+                // we allow it (as before this binary) and only enforce when explicitly asked.
+                // Flip WCAHT_REQUIRE_SIGNED_LEAF=1 once every client is known to send one.
                 let chain_says_final = match (chain_rpc.as_ref(), store.lock().unwrap().floors.get(&sid).copied()) {
                     (None, _) => true, // no node configured: legacy trust, logged at startup
-                    (Some(_), None) => false, // node configured but no signed leaf → not provable
+                    (Some(_), None) => !require_signed_leaf,
                     (Some(rpc), Some(floor)) => rpc.finalized_slot().map(|fin| fin >= floor).unwrap_or(false),
                 };
                 if let Some(e) = rejected {
@@ -371,11 +384,14 @@ mod tests {
     }
 
     #[test]
-    fn bare_numbers_are_refused_now() {
-        // This is the old forgeable shape: anyone could POST it and move a deadline.
+    fn bare_numbers_install_no_window_but_do_not_break_the_finalise() {
+        // The old forgeable shape: anyone could POST it and move a deadline. It must not be
+        // honoured — but it must not fail the finalise either, or every client that predates
+        // signed leaves would have its messages stranded permanently unopenable.
         let store = Arc::new(Mutex::new(GwStore::default()));
-        let e = verify_window(r#"{"reveal_at":1,"destroy_at":2}"#, "aa", &store).unwrap_err();
-        assert!(e.contains("signed leaf"), "{e}");
+        let w = verify_window(r#"{"reveal_at":1,"destroy_at":2}"#, "aa", &store)
+            .expect("must not error — that would strand old clients");
+        assert!(w.is_none(), "an unsigned window must never be installed");
     }
 
     #[test]
