@@ -2070,6 +2070,9 @@ private fun Bubble(m: Msg, now: Long = 0L, onDestroyed: () -> Unit = {}) {
     // Self-destruct: the countdown is the SENDER's to watch, but the burn plays on both sides.
     val destroying = m.destroyAt > 0 && now > 0 && now >= m.destroyAt
     val showDestroyClock = !m.incoming && m.destroyAt > 0 && now > 0 && !destroying
+    // The SENDER's own copy of an "opens later" item: they own the picture, but it must not
+    // look like an ordinary sent photo — it is sealed shut for the recipient until revealAt.
+    val stillSealed = !m.incoming && m.revealAt > 0 && now > 0 && now < m.revealAt
 
     Column(Modifier.fillMaxWidth().padding(vertical = 3.dp), horizontalAlignment = align) {
         val body: @Composable () -> Unit = {
@@ -2077,7 +2080,7 @@ private fun Bubble(m: Msg, now: Long = 0L, onDestroyed: () -> Unit = {}) {
                 when {
                     m.state == State.SEALING -> SealingContent(m)
                     m.state == State.LOCKED -> LockedContent(m, now)
-                    m.kind == Kind.IMAGE -> ImageContent(m)
+                    m.kind == Kind.IMAGE -> ImageContent(m, sealedUntil = stillSealed)
                     m.kind == Kind.VOICE -> VoiceContent(m)
                     else -> TextContent(m)
                 }
@@ -2090,6 +2093,13 @@ private fun Bubble(m: Msg, now: Long = 0L, onDestroyed: () -> Unit = {}) {
                 Icon(Icons.Filled.Autorenew, null, tint = Sub, modifier = Modifier.size(12.dp))
                 Spacer(Modifier.width(4.dp))
                 Text(if (m.mode == "FAST") "Pre-confirming…" else "Sealing…", color = Sub, fontSize = 11.sp)
+            }
+        }
+        if (stillSealed) {
+            Row(Modifier.padding(top = 3.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Filled.Lock, null, tint = Blue, modifier = Modifier.size(12.dp))
+                Spacer(Modifier.width(4.dp))
+                Text("Sealed · opens in ${countdown(m.revealAt - now)}", color = Blue, fontSize = 11.sp)
             }
         }
         if (showDestroyClock) {
@@ -2128,7 +2138,7 @@ private fun SealingContent(m: Msg) {
 }
 
 @Composable
-private fun ImageContent(m: Msg) {
+private fun ImageContent(m: Msg, sealedUntil: Boolean = false) {
     val ctx = LocalContext.current
     val isVideo = m.mediaMime.startsWith("video")
     // Decode the DECRYPTED local file. Nothing here ever touches the network — by this
@@ -2164,9 +2174,16 @@ private fun ImageContent(m: Msg) {
                         .background(Brush.verticalGradient(listOf(Color(0xFFF6B26B), Color(0xFF6FA8DC), Color(0xFF2E5B8A))))
                 )
             }
-            if (isVideo) {
+            if (isVideo && !sealedUntil) {
                 Box(Modifier.size(46.dp).background(Color(0x99000000), CircleShape), contentAlignment = Alignment.Center) {
                     Icon(Icons.Filled.PlayArrow, "Play", tint = Color.White, modifier = Modifier.size(30.dp))
+                }
+            }
+            // A still-sealed item reads as sealed on the sender's side too: the picture is
+            // theirs, but a frosted scrim + lock says plainly that nobody else can open it yet.
+            if (sealedUntil) {
+                Box(Modifier.fillMaxSize().background(Color(0xCCEDF1F5)), contentAlignment = Alignment.Center) {
+                    Icon(Icons.Filled.Lock, null, tint = Blue, modifier = Modifier.size(34.dp))
                 }
             }
             Row(Modifier.align(Alignment.BottomEnd).padding(6.dp), verticalAlignment = Alignment.CenterVertically) {

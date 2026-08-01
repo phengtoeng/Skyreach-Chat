@@ -1824,6 +1824,9 @@ private struct Bubble: View {
         // Self-destruct: the countdown is the SENDER's to watch, but the burn plays on both sides.
         let destroying = m.destroyAt > 0 && now > 0 && now >= m.destroyAt
         let showDestroyClock = !m.incoming && m.destroyAt > 0 && now > 0 && !destroying
+        // The SENDER's own copy of an "opens later" item: they own the picture, but it must not
+        // look like an ordinary sent photo — it is sealed shut for the recipient until revealAt.
+        let stillSealed = !m.incoming && m.revealAt > 0 && now > 0 && now < m.revealAt
         return HStack {
             if !m.incoming { Spacer(minLength: 40) }
             VStack(alignment: m.incoming ? .leading : .trailing, spacing: 3) {
@@ -1839,6 +1842,12 @@ private struct Bubble: View {
                         Image(systemName: "arrow.triangle.2.circlepath").font(.system(size: 11))
                         Text(m.mode == "FAST" ? "Pre-confirming…" : "Sealing…").font(.system(size: 11))
                     }.foregroundColor(.dvSub)
+                }
+                if stillSealed {
+                    HStack(spacing: 4) {
+                        Image(systemName: "lock.fill").font(.system(size: 11))
+                        Text("Sealed · opens in \(countdownLabel(m.revealAt - now))").font(.system(size: 11))
+                    }.foregroundColor(.dvBlue)
                 }
                 if showDestroyClock {
                     HStack(spacing: 4) {
@@ -1914,6 +1923,9 @@ private struct Bubble: View {
         }
     }
 
+    /// True while THIS bubble is the sender's copy of an item still inside its reveal window.
+    private var sealedNow: Bool { !m.incoming && m.revealAt > 0 && now > 0 && now < m.revealAt }
+
     private var imageOnly: some View {
         // Renders the DECRYPTED local file. By this point the bytes exist in readable form
         // only on this device — nothing here touches the network.
@@ -1929,10 +1941,20 @@ private struct Bubble: View {
             }
             .frame(width: 220, height: 160).clipped().clipShape(RoundedRectangle(cornerRadius: 12))
 
-            if isVideo {
+            if isVideo && !sealedNow {
                 Image(systemName: "play.circle.fill")
                     .font(.system(size: 44)).foregroundColor(.white.opacity(0.85))
                     .frame(width: 220, height: 160)
+            }
+            // A still-sealed item reads as sealed on the sender's side too: the picture is
+            // theirs, but a frosted scrim + lock says plainly that nobody else can open it yet.
+            if sealedNow {
+                ZStack {
+                    Color(hex: 0xEDF1F5).opacity(0.8)
+                    Image(systemName: "lock.fill").font(.system(size: 30)).foregroundColor(.dvBlue)
+                }
+                .frame(width: 220, height: 160)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
             }
             HStack(spacing: 3) { Text(m.time).font(.system(size: 11)).foregroundColor(.white); sealBadge }.padding(6)
         }
