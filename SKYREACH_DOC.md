@@ -62,7 +62,9 @@ Two release modes, both bound into the signed seal leaf so they can't be silentl
 | FFI: C ABI (iOS) + JNI (Android) | ✅ done, 2 tests |
 | Native apps (SwiftUI + Kotlin/Compose) with StrictSeal/FastSeal toggle | ✅ done; iOS builds + runs via `xcodegen` (§6b), two-device send/receive verified live |
 | Sealed media (photo/video): chunked + encrypted manifest + `/blob` relay store | ✅ done; verified end-to-end on the live backbone from Android |
-| Total Rust tests | **45 green** |
+| **Batched on-chain commitment (SEAL_ROOT) + sponsored fees** | ✅ done + LIVE on N5/N6/N7; every message is committed under a root anchored in a real tx, the app pays |
+| **Treasury monitoring / alerting** | ✅ done; `:9300/health` → 503 on low treasury, anchor failure, or backlog overflow |
+| Total Rust tests | **63 green** |
 | iOS media UI | ⚠️ written, NOT yet compiled — needs a Mac |
 | Production gateway services, device linking, groups/calls, audit | ❌ Phase 3 |
 
@@ -96,7 +98,7 @@ Both apps drive the **same** Rust core; only the UI layer differs.
 
 ```bash
 cd denvion-splitseal
-cargo test          # 45 tests green (crypto, threat matrix, DSCP-2, registry, relay, media, SDK)
+cargo test          # 63 tests green (crypto, threat matrix, DSCP-2, registry, relay, media, batching, SDK)
 cargo build         # clean, no warnings
 ```
 
@@ -130,6 +132,9 @@ manual Xcode wiring is superseded by `ios-app/project.yml`.
 | `wcaht-seal-relay [addr]` | runs the HTTP payload-prefetch delivery relay | — |
 | `wcaht-seal-fast-e2e` | FastSeal end-to-end via prefetch relay, timed (~37ms, no finality) | — (spins its own relay) |
 | `wcaht-seal-stake <url> [kp]` | on-chain gateway bond → equivocate → slash → slash-claim published → excluded | validator + API key + keypair |
+| `wcaht-seal-batcher [addr]` | the batching service itself (§6c); queue-only without a seed | `WCAHT_RPC` + `WCAHT_BATCHER_SEED` to anchor |
+| `wcaht-seal-batch-demo [url]` | 6 messages → 1 root → 1 tx; verifies each proof as a recipient would, and that an unbatched message can't borrow the root | a running batcher |
+| `wcaht-seal-stats [addr]` | live status dashboard (defaults to :9301, not :9300) | — |
 
 FFI demos (on-device, no chain): `ss_run_demo` (StrictSeal), `ss_run_fast_demo` (FastSeal).
 
@@ -151,12 +156,26 @@ The SplitSeal SDK talks to the real WCAHT chain (`PoASy3`). Facts learned the ha
 - **Funded signer:** `PoASy3/heartbeat_keypair.json` — account `CBXRVVKSALoR5sPjACETuhQZd3xj3M1AWvq5nGH8PwiD`
   (funded ~3yr). The ed25519 **seed is the first 32 bytes** of its 64-byte `keypair` array.
   (In production each gateway funds its own; for tests this one account bonds/anchors.)
-- **Minimum fee = `compute_units × price_per_cu` = 200_000** (NOT the base 5000). Below that you
-  get `fee X below deterministic consensus minimum 200000`. The bins use cu=200_000, fee=200_000.
+- **Fee = `max(5_000, canonical_cu)` where `canonical_cu = declared_cu.max(type_floor)`**, and a
+  Transfer's floor is 5_000 (`PoASy3/src/transaction/validation.rs`,
+  `block_compute_budget.rs`). **A transfer costs 5_000 kak, not 200_000.**
+  ⚠️ This doc previously said the minimum was 200_000. That was wrong, and it was wrong in the
+  SDK too: `transfer_tx` *declared* 200_000 CU on every transfer, and since the declared value
+  is what gets charged, it self-inflicted a **40× overcharge**. Fixed via `transfer_tx_with_cu`;
+  anchors declare `ANCHOR_COMPUTE_UNITS = 5_000`. Don't "fix" a fee rejection by raising the
+  declared CU — you are setting the price, not discovering it.
+- **A transfer's amount has no dust floor** — consensus asks only for `amount > 0`. An anchor
+  therefore sends **1 kak** (`ANCHOR_AMOUNT_KAK`), because the destination is hash-derived and
+  nobody can ever spend from it. Total cost of an anchor: **5_001 kak**.
 - **`recent_blockhash` is a 64-char HEX string** in the tx JSON (`deserialize_recent_blockhash`
   wants exactly 64 hex chars). Fetch it from `GET /blockchain/recent_blockhash`.
-- **Confirm a tx** via `GET /transaction/<base58-signature>` → `{"status":"confirmed","slot":N,…}`
-  (404 until it's included). Poll it.
+- **Confirming a tx: prefer the balance delta.** `GET /transaction/<base58-signature>` is
+  documented to return `{"status":"confirmed","slot":N,…}`, but it has been observed returning
+  `Transaction not found` on **every** node for txs that demonstrably landed (2026-08-01). Do
+  not conclude a tx failed from that endpoint alone — check whether the balances actually moved.
+- **`GET /balance/<addr>` can be stale for ~a minute** after a tx lands, and nodes disagree
+  during that window (one read 0 while the other two read the correct value, then self-healed).
+  Re-read before concluding divergence.
 - **Canonical signing:** `AnchorSigner::canonical_bytes_v2` is a byte-exact replica of the runtime
   `Transaction::canonical_bytes()` (`TX::v2`) — see `PoASy3/src/transaction/transaction.rs:456`.
   If you change the tx shape, re-check it against that function.
@@ -183,7 +202,19 @@ relay and read from all of them, so any one node can be down and delivery still 
 | gateway 1 | 9201 | `skyreach-gw1`       | holds share[0]; releases only after finality (425 until) |
 | gateway 2 | 9202 | `skyreach-gw2`       | holds share[1]                                        |
 | gateway 3 | 9203 | `skyreach-gw3`       | holds share[2]                                        |
+| **batcher** | **9300** | **`skyreach-batcher`** | **commits leaves under a SEAL_ROOT and anchors it on-chain (§6c)** |
+| status    | 9301 | `skyreach-stats`     | live status dashboard (**N5 only**)                   |
 | directory | 9988 | `skyreach-directory` | `hash(phone) → contact card` (privacy-preserving)     |
+
+> **N5/N7 name their single gateway `skyreach-gw` (not `gw1`); N6 runs all three** as
+> `skyreach-gw1/2/3`. A rollout script that only touches `skyreach-gw` silently misses two
+> gateways on N6 — restart all three.
+>
+> **The status dashboard is on 9301, not 9300.** It used to own 9300 and blocked the batcher
+> there; both apps derive their batcher URL as `http://<node>:9300` with no way to configure
+> it, so the dashboard is the service that moved. `ufw` denies new ports by default — a service
+> can look perfectly healthy on `127.0.0.1` while being unreachable from outside
+> (`sudo ufw allow 9300/tcp`).
 
 Each unit is `Restart=always`; logs are in `~/skyreach/logs/`. Manage:
 ```bash
@@ -221,6 +252,78 @@ Restarting the relay is safe: the inbox is an append log reloaded on start, so q
 messages survive (verified — 25 items intact across all three restarts). Only restart the
 units whose binary actually changed. **Rollback** = `install -m 755` the `.bak-*` copy and
 restart.
+
+---
+
+## 6c. Batched on-chain commitment (SEAL_ROOT) + sponsored fees — LIVE
+
+**Every message is committed to the chain, and the app pays for it, not the user.**
+
+Users have no chain account, no balance and no key that could sign a transaction — chat
+identity keys and wallet keys are deliberately separate (spec §5.2), so a user *cannot* be
+charged even in principle. The fee comes from a Skyreach treasury account. This is gas
+sponsorship, the same shape as a Solana fee payer or an ERC-4337 paymaster.
+
+**One transaction per batch, not per message.** Leaves arriving in a window are committed under
+a single merkle root; that root is anchored in one transaction. Each message still gets its own
+signed leaf and its own inclusion proof.
+
+```
+many messages ──▶ batcher :9300 ──▶ seal_batch_root() ──▶ ONE anchor tx (root = destination)
+                                                              │
+recipient ◀── GET /proof/<seal_id> ── {leaf_hash, merkle_path, leaf_index, leaf_count, root}
+                                       verified against the recipient's OWN leaf
+```
+
+- **No consensus change was needed.** The root becomes the transaction's *recipient address*,
+  so a confirmed tx paying that address IS the chain attesting the root existed by that slot.
+  A native `SEAL_ROOT` tx type was considered and **deferred**: it is a consensus change on a
+  live 3-validator chain that has halted on a migration before, and its only real benefit is
+  cost, not security.
+- **The batcher is never trusted.** `verify_seal_inclusion` recomputes the root from the
+  recipient's own leaf plus the path. A message that was never batched cannot borrow a root
+  (there is a test for exactly this).
+- **Odd nodes are promoted, not duplicated** — duplicating would let a forged leaf verify.
+  `leaf_count` is part of the proof so level widths replay identically.
+- **Cost: 5_001 kak per anchor**, flat, regardless of how many messages are in the batch (up to
+  `WCAHT_BATCH_MAX`, default 10_000). Runway at the current treasury is ~200 million anchors.
+- **A failed submit never loses messages** — the whole batch goes back on the queue and retries.
+
+### Operating it
+
+```bash
+# env (in /home/ubuntu/skyreach/batcher.env, chmod 600 — NEVER in the unit file,
+# systemd units are world-readable and this file holds the funded key)
+WCAHT_RPC=http://127.0.0.1:8901
+WCAHT_BATCHER_SEED=<32-byte hex seed of the treasury account>
+WCAHT_BATCH_INTERVAL_MS=1000
+WCAHT_BATCH_MAX=10000
+WCAHT_TREASURY_WARN_KAK=1000000000   # optional; warn below this
+
+curl -s http://<node>:9300/stats    # pending, batches, anchored, last_root, treasury_*
+curl -s http://<node>:9300/health   # 200 healthy / 503 degraded  ← PAGE ON THIS
+```
+
+**Point monitoring at `/health`.** A batcher that cannot anchor fails *silently*: it keeps
+accepting leaves and keeps answering `425 not anchored yet`, so nothing looks broken from the
+outside. `/health` returns **503** with a readable problem list when the treasury is low, when
+anchors are failing consecutively, or when the backlog overflowed.
+
+Without a seed the batcher runs **queue-only** — it accepts leaves and submits nothing, and
+says so on startup. That is the deliberate safe default: it will never pretend a message was
+anchored.
+
+`pending` is capped at 200k leaves. Before that cap existed, a dry treasury grew the queue
+without bound until the OOM killer took the process — and every anchored proof held in memory
+with it. On overflow the batcher returns 503 and the message is still **delivered**, just not
+batched; both apps treat batching as best-effort (`submitLeafForBatching` is fire-and-forget,
+and `fetchVerifiedProof` skips any batcher that doesn't answer).
+
+**Verified on the live chain** from all three nodes: 6 sealed messages → one root → one
+transaction → every message verified against that same root; the root address holds exactly
+1 kak on all three validators and the treasury moved by exactly 5,001.
+
+---
 
 ### Sealed media (photo / video)
 
@@ -394,7 +497,14 @@ Prioritized, with entry points. Media (item 5) is **done**; the rest is not star
    (`GET /inbox/<tag>` still returns the whole mailbox on every 3s poll).
    ▸ Then: **MLS groups**, `CALL_SESSION` live calls (`ContentType::CallSession` exists as a stub).
 6. **Real gateway staking economics** — min-bond calibration, partial slashing, unbonding periods.
-7. **24h soak + external crypto/protocol audit** before any real use.
+7. **Batched on-chain commitment + sponsored fees** — ✅ **DONE and LIVE** (§6c). Every message is
+   committed under a `SEAL_ROOT` anchored in one real transaction, paid by the treasury.
+   ▸ Remaining here: a **treasury top-up runbook** (what to do when `/health` goes 503 — which
+   account funds it, how much, who approves); **per-node treasury accounts** so one leaked key
+   does not expose the whole budget (safe to split: the tx preimage has no nonce, so separate
+   accounts cannot race); and deciding whether the ~200M-anchor runway needs an automatic
+   refill at all.
+8. **24h soak + external crypto/protocol audit** before any real use.
 
 Design intent to preserve: FastSeal was slotted in behind the same `SealChain`/`try_open` seam
 without a client rewrite. Keep new release gates composable the same way.
@@ -422,6 +532,24 @@ without a client rewrite. Keep new release gates composable the same way.
 - **The relay + gateways are in-memory only** (`relay.rs`, `gateway_service.rs` both use a plain
   `HashMap`). Restarting a `skyreach-*` unit on N6 drops every queued ciphertext and every
   finalized share, so undelivered messages are gone for good. Fix before any real use.
+  ▸ The **batcher is in-memory too**: its `proofs` map does not survive a restart, so a proof
+  fetched before the restart is unavailable after it. The anchor itself is on-chain and
+  permanent — only the convenience lookup is lost.
+- **`/transaction/<sig>` cannot be used to confirm a tx** — it returned "Transaction not found"
+  on every node for anchors that had demonstrably landed (2026-08-01). **Confirm by balance
+  delta.** Related: `/balance` can be stale for ~a minute after a tx and nodes will disagree
+  during that window; re-read before calling it divergence.
+- **Don't raise declared compute units to clear a fee rejection.** The declared CU *is* the
+  price (`fee = max(5_000, declared.max(floor))`). Declaring 200_000 on a transfer is a 40×
+  self-inflicted overcharge, and this doc taught that mistake for months.
+- **A service bound on `0.0.0.0` can still be unreachable** — `ufw` denies new ports by default,
+  so it looks perfectly healthy over `127.0.0.1` and times out from anywhere else.
+- **Check what already owns a port before deploying to it.** The batcher's first N5 rollout
+  crash-looped on `Address already in use` because the status dashboard had held :9300 for two
+  days. `sudo ss -lntp | grep <port>`.
+- **A sponsored service fails silently when its funding runs out.** The batcher kept accepting
+  messages and answering `425 not anchored yet` — nothing looked broken. Any component that
+  spends from a balance needs an endpoint that goes *unhealthy*, not just a log line.
 
 ---
 

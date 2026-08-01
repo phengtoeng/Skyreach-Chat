@@ -37,7 +37,7 @@ Both apps share the exact same Rust core; only the UI layer differs per platform
 
 ```bash
 cd denvion-splitseal
-cargo test          # 45 tests green: locked-until-finality + full threat matrix + media
+cargo test          # 63 tests green: locked-until-finality + full threat matrix + media + batching
 ```
 
 The tests prove the core promise: nothing opens before a **finalised** seal **and**
@@ -46,6 +46,25 @@ ciphertext, replay, wrong chain id, expiry, revocation, and insufficient shares.
 single gateway can be offline and a `t=2` item still opens. For media they also prove
 that a recipient holding **every** chunk still cannot open one before the gate, and that
 an altered or reordered chunk is refused.
+
+## Every message touches the chain — and the app pays for it
+
+A message is not just encrypted locally; it is **committed on-chain**. Its signed leaf is
+folded into a merkle root and that root is anchored in a real WCAHT transaction, so there is
+public, timestamped evidence that this exact message existed by that slot.
+
+The user never pays and never signs. Chat identity keys and wallet keys are deliberately
+separate, so a user has no chain account that *could* be charged — the fee comes from a
+Skyreach treasury account (gas sponsorship, like a Solana fee payer or an ERC-4337 paymaster).
+
+It stays affordable because commitment is **batched**: every message in a window shares one
+root and therefore **one transaction**, at a flat 5,001 kak no matter how many messages are in
+it (up to 10,000). Each message still gets its own inclusion proof, and the recipient verifies
+that proof against its **own** leaf — the batching service is never trusted. A message that was
+never batched cannot borrow someone else's root.
+
+This needed no consensus change: the root *is* the transaction's recipient address, so a
+confirmed transaction paying it is itself the proof. See `SKYREACH_DOC.md` §6c.
 
 ## Two release modes (DSCP-2)
 
@@ -274,6 +293,7 @@ Both flows execute in the shared Rust core, on-device, identically on iOS and An
 | 2 ▸ *started* | ✅ `wcaht-seal-sdk`: live finality read + `WcahtSealChain` (real `SealChain`, verified end-to-end); ✅ byte-exact `TX::v2` anchor signer. ▸ remaining: submit the anchor tx from a funded gateway account (API key), 3 independent seal-gateway services, delivery-relay service, device linking + proof screen |
 | 2+ ▸ **done** | ✅ **DSCP-2** protocol: `SealMode` on the leaf, slashable `PreConfirmation`s, mode-aware `try_open_dscp2`, equivocation → `SlashingEvidence`. ✅ **payload-prefetch delivery relay** (ciphertext-only HTTP; FastSeal e2e ~37ms, no finality). ✅ **gateway staking/slashing** (`GatewayRegistry` + on-chain stake/slash anchors — full loop verified live). ✅ **StrictSeal/FastSeal UI toggle** in both native apps |
 | 3 ▸ *started* | ✅ **sealed media** — chunked + encrypted manifest, `manifest_root` on-chain, `/blob` store on the live relays (N5/N6/N7), photo+video send/receive in the Android app. ▸ remaining: production multi-gateway services, device linking + proof screen, voice notes/documents, blob GC after `destroy_at`, MLS groups, `CALL_SESSION` live calls, 24h soak + external audit |
+| 3 ▸ **done** | ✅ **batched on-chain commitment + sponsored fees** — `SEAL_ROOT` merkle batching, one transaction per batch, treasury-paid so users never sign or pay; per-message inclusion proofs verified against the recipient's own leaf. Live on N5/N6/N7 with `/health` alerting. ▸ remaining: a treasury top-up runbook, and per-node treasury accounts to shrink the blast radius of one shared key |
 
 The core here is written so FastSeal slots in as an alternative release gate without
 rewriting the client protocol.
