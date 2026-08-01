@@ -1194,6 +1194,54 @@ mod tests {
     }
 
     #[test]
+    fn timed_media_is_gated_the_same_way_text_is() {
+        let tmp = Tmp::new("timed");
+        let alice: Value = serde_json::from_str(&new_identity_json("Alice")).unwrap();
+        let bob: Value = serde_json::from_str(&new_identity_json("Bob")).unwrap();
+        let src = tmp.join("in.jpg");
+        std::fs::write(&src, vec![3u8; 4096]).unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+
+        let seal = |reveal: i64, destroy: i64, dir: &str| -> Value {
+            serde_json::from_str(&seal_media_file_json(
+                alice["identity_seed"].as_str().unwrap(),
+                alice["card"].as_str().unwrap(),
+                bob["device_pub"].as_str().unwrap(),
+                &src, "image/jpeg", "image", "", &tmp.join(dir), false, reveal, destroy,
+            ))
+            .unwrap()
+        };
+        let info = |m: &Value| -> Value {
+            serde_json::from_str(&open_media_info_json(
+                bob["device_seed"].as_str().unwrap(),
+                &m["bundle"].to_string(),
+                &m["shares"].to_string(),
+                "",
+            ))
+            .unwrap()
+        };
+
+        // reveal_at in the future → LOCKED, and the caller is told when it opens
+        let later = seal(now + 3600, 0, "c1");
+        let r = info(&later);
+        assert_eq!(r["ok"], false, "timelocked media must not open: {r}");
+        assert_eq!(r["reason"], "locked");
+        assert_eq!(r["reveal_at"], now + 3600, "app needs the deadline to run a countdown");
+
+        // destroy_at in the past → DESTROYED, never openable again
+        let gone = seal(0, now - 1, "c2");
+        let r = info(&gone);
+        assert_eq!(r["ok"], false, "self-destructed media must not open: {r}");
+        assert_eq!(r["reason"], "destroyed");
+
+        // inside the window → opens normally
+        let live = seal(now - 10, now + 3600, "c3");
+        let r = info(&live);
+        assert_eq!(r["ok"], true, "media inside its window must open: {r}");
+        assert_eq!(r["mime_type"], "image/jpeg");
+    }
+
+    #[test]
     fn a_media_seal_never_opens_through_the_text_path() {
         // Regression: a media envelope carries a bincode manifest. Opening it as text handed
         // the app binary, which rendered as a bubble of U+FFFD replacement characters.

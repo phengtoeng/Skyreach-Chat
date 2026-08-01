@@ -12,6 +12,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -47,6 +48,7 @@ import dev.chrisbanes.haze.haze
 import dev.chrisbanes.haze.hazeChild
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
@@ -120,7 +122,12 @@ private fun initials(name: String) =
 private data class Chat(val name: String, val last: String, val time: String, val unread: Int = 0, val devicePub: String = "", val identityPub: String = "", val isContact: Boolean = false)
 
 private enum class Kind { TEXT, IMAGE, VOICE }
-private enum class State { PLAIN, SEALING, OPENED }
+private enum class State {
+    PLAIN, SEALING, OPENED,
+    /** Received but time-locked: the gateways withhold the shares until `revealAt`, so there is
+     *  nothing to render yet. The bubble shows a lock + countdown, never a hint of the content. */
+    LOCKED,
+}
 
 private data class Msg(
     val id: Long,
@@ -136,6 +143,8 @@ private data class Msg(
     val destroyAt: Long = 0, // unix secs: self-destructs after this time (0 = none)
     val mediaPath: String = "", // decrypted file on THIS device only; never uploaded
     val mediaMime: String = "",
+    /** Set on a LOCKED placeholder so the real item can replace it when the window opens. */
+    val lockedSealId: String = "",
 )
 
 private val CHATS = listOf(
@@ -237,6 +246,7 @@ private class Store(ctx: Context) {
         incoming: Boolean,
         media: String = "", // local path to the DECRYPTED file (this device only)
         mime: String = "",
+        destroyAt: Long = 0, // persisted so a self-destruct still fires after an app restart
     ): Boolean {
         if (peer.isBlank()) return false
         val a = thread(peer)
@@ -244,11 +254,24 @@ private class Store(ctx: Context) {
         a.put(
             JSONObject().put("id", id).put("text", text).put("incoming", incoming)
                 .put("ts", System.currentTimeMillis()).put("media", media).put("mime", mime)
+                .put("destroy_at", destroyAt)
         )
         p.edit().putString("thread_$peer", a.toString()).apply()
         return true
     }
     fun clearThread(peer: String) { if (peer.isNotBlank()) p.edit().remove("thread_$peer").apply() }
+
+    /** Drop a self-destructed item from the durable transcript so it never comes back on reopen. */
+    fun removeThreadMedia(peer: String, mediaPath: String) {
+        if (peer.isBlank() || mediaPath.isBlank()) return
+        val a = thread(peer)
+        val keep = JSONArray()
+        for (i in 0 until a.length()) {
+            val o = a.getJSONObject(i)
+            if (o.optString("media") != mediaPath) keep.put(o)
+        }
+        p.edit().putString("thread_$peer", keep.toString()).apply()
+    }
 }
 
 private fun loadOrCreateIdentity(store: Store): JSONObject {
@@ -1480,6 +1503,7 @@ private fun ConversationScreen(
                             kind = if (media.isNotBlank()) Kind.IMAGE else Kind.TEXT,
                             state = State.OPENED,
                             mediaPath = media, mediaMime = o.optString("mime"),
+                            destroyAt = o.optLong("destroy_at"),
                         )
                     )
                 }
@@ -1497,6 +1521,7 @@ private fun ConversationScreen(
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val polling = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
+    val nowSecs = rememberNowSeconds() // drives reveal countdowns and destroy deadlines
 
     LaunchedEffect(Unit) { if (messages.isNotEmpty()) listState.scrollToItem(messages.lastIndex) }
 
@@ -1515,20 +1540,52 @@ private fun ConversationScreen(
                 // Media arrives as a manifest, not as bytes: open the manifest, pull the
                 // chunks the relay is holding, then decrypt and reassemble locally.
                 if (bundle.optJSONObject("signed_leaf")?.optJSONObject("leaf")?.optString("content_type") == "Media") {
+                    // Time-locked? Show a locked placeholder with a countdown rather than
+                    // nothing at all, and keep polling — it opens by itself at revealAt.
+                    val gate = withContext(Dispatchers.IO) {
+                        runCatching { JSONObject(SealCore.openMediaInfo(myDeviceSeed, bundle.toString(), shares, "")) }.getOrNull()
+                    }
+                    if (gate != null && !gate.optBoolean("ok")) {
+                        when (gate.optString("reason")) {
+                            "destroyed" -> { seen.add(sealId); continue } // gone before it was ever opened
+                            "locked" -> {
+                                val revealAt = gate.optLong("reveal_at")
+                                val sender = bundle.optString("sender_id_pub")
+                                if (sender == chat.identityPub && messages.none { it.lockedSealId == sealId }) {
+                                    messages.add(
+                                        Msg(
+                                            System.nanoTime(), "Photo", true, now(), kind = Kind.IMAGE,
+                                            state = State.LOCKED, revealAt = revealAt, lockedSealId = sealId,
+                                        )
+                                    )
+                                    listState.animateScrollToItem(messages.lastIndex)
+                                }
+                                continue // NOT marked seen: the next poll opens it once the window does
+                            }
+                        }
+                    }
                     val got = withContext(Dispatchers.IO) {
                         receiveMedia(ctx, myDeviceSeed, sealId, bundle.toString(), shares)
+                    }
+                    if (got != null) {
+                        // replace the locked placeholder, if one is on screen
+                        messages.indexOfFirst { it.lockedSealId == sealId }.takeIf { it >= 0 }?.let { messages.removeAt(it) }
                     }
                     if (got != null) {
                         seen.add(sealId)
                         val sender = bundle.optString("sender_id_pub")
                         val label = if (got.second.startsWith("video")) "Video" else "Photo"
+                        // carry the destroy deadline across: the recipient's copy must burn too,
+                        // otherwise a "self-destruct" only ever removed the sender's side.
+                        val dz = bundle.optLong("destroy_at")
                         if (store.addInbox(myTag, sealId, label, sender)) {
-                            store.addThreadMsg(sender, sealId, label, true, media = got.first, mime = got.second)
+                            store.addThreadMsg(sender, sealId, label, true, media = got.first, mime = got.second, destroyAt = dz)
                             if (sender == chat.identityPub) {
                                 messages.add(
                                     Msg(
                                         System.nanoTime(), label, true, now(), kind = Kind.IMAGE,
                                         state = State.OPENED, mediaPath = got.first, mediaMime = got.second,
+                                        destroyAt = dz,
                                     )
                                 )
                                 listState.animateScrollToItem(messages.lastIndex)
@@ -1581,10 +1638,15 @@ private fun ConversationScreen(
         val mime = ctx.contentResolver.getType(uri) ?: "image/jpeg"
         val isVideo = mime.startsWith("video")
         val label = if (isVideo) "Video" else "Photo"
-        messages.add(Msg(System.nanoTime(), label, false, now(), kind = Kind.IMAGE, state = State.SEALING, mode = if (fastMode) "FAST" else "STRICT"))
-        val idx = messages.lastIndex
         val fast = fastMode
         val rv = revealAt; val dz = destroyAt
+        messages.add(
+            Msg(
+                System.nanoTime(), label, false, now(), kind = Kind.IMAGE, state = State.SEALING,
+                mode = if (fast) "FAST" else "STRICT", revealAt = rv, destroyAt = dz,
+            )
+        )
+        val idx = messages.lastIndex
         revealAt = 0L; destroyAt = 0L
         scope.launch {
             listState.animateScrollToItem(messages.lastIndex)
@@ -1619,7 +1681,7 @@ private fun ConversationScreen(
             }
             if (result != null) {
                 messages[idx] = messages[idx].copy(state = State.OPENED, sealedFor = chat.name, mediaPath = result, mediaMime = mime)
-                store.addThreadMsg(chat.identityPub, "out-" + System.nanoTime(), label, false, media = result, mime = mime)
+                store.addThreadMsg(chat.identityPub, "out-" + System.nanoTime(), label, false, media = result, mime = mime, destroyAt = dz)
             } else {
                 messages.removeAt(idx)
                 android.widget.Toast.makeText(ctx, "Couldn't send $label — check the server", android.widget.Toast.LENGTH_SHORT).show()
@@ -1698,7 +1760,14 @@ private fun ConversationScreen(
             contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
         ) {
             item { DateChip("Today") }
-            items(messages) { m -> Bubble(m) }
+            items(messages, key = { it.id }) { m ->
+                Bubble(m, nowSecs) {
+                    // burn finished — drop it from the transcript for good
+                    messages.remove(m)
+                    if (real) store.removeThreadMedia(chat.identityPub, m.mediaPath)
+                    if (m.mediaPath.isNotBlank()) runCatching { java.io.File(m.mediaPath).delete() }
+                }
+            }
         }
 
         val timerLabel = when {
@@ -1785,8 +1854,92 @@ private fun DateChip(text: String) {
     }
 }
 
+/** Wall-clock seconds, ticking once a second, for countdowns and destroy deadlines. */
 @Composable
-private fun Bubble(m: Msg) {
+private fun rememberNowSeconds(): Long {
+    var now by remember { mutableStateOf(System.currentTimeMillis() / 1000) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(1000)
+            now = System.currentTimeMillis() / 1000
+        }
+    }
+    return now
+}
+
+/** mm:ss for a countdown; falls back to h/d for long windows. */
+private fun countdown(secondsLeft: Long): String {
+    val s = secondsLeft.coerceAtLeast(0)
+    return when {
+        s >= 86400 -> "${s / 86400}d ${(s % 86400) / 3600}h"
+        s >= 3600 -> "${s / 3600}h ${(s % 3600) / 60}m"
+        else -> "%d:%02d".format(s / 60, s % 60)
+    }
+}
+
+/**
+ * Burns the content away: it shrinks and fades while puffs of smoke rise off it, then
+ * `onFinished` fires so the caller can drop the message for good.
+ */
+@Composable
+private fun SmokeDestroy(onFinished: () -> Unit, content: @Composable () -> Unit) {
+    val p = remember { androidx.compose.animation.core.Animatable(0f) }
+    LaunchedEffect(Unit) {
+        p.animateTo(1f, androidx.compose.animation.core.tween(1500, easing = androidx.compose.animation.core.LinearEasing))
+        onFinished()
+    }
+    Box {
+        Box(
+            Modifier.graphicsLayer {
+                alpha = (1f - p.value * 1.35f).coerceIn(0f, 1f)
+                val shrink = 1f - 0.14f * p.value
+                scaleX = shrink; scaleY = shrink
+            }
+        ) { content() }
+
+        // puffs: deterministic per-index so they don't jitter between recompositions
+        Canvas(Modifier.matchParentSize()) {
+            val t = p.value
+            for (i in 0 until 14) {
+                val seed = i * 7919
+                val fx = ((seed % 100) / 100f)                 // horizontal position 0..1
+                val drift = (((seed / 100) % 100) / 100f - 0.5f) // sideways drift
+                val delay = (i % 5) * 0.08f
+                val local = ((t - delay) / (1f - delay)).coerceIn(0f, 1f)
+                if (local <= 0f) continue
+                val r = size.minDimension * (0.06f + 0.16f * local)
+                val cx = size.width * fx + drift * size.width * 0.35f * local
+                val cy = size.height * (0.85f - 1.05f * local)
+                drawCircle(
+                    color = Color(0xFF9AA5B1).copy(alpha = (0.42f * (1f - local)).coerceAtLeast(0f)),
+                    radius = r,
+                    center = androidx.compose.ui.geometry.Offset(cx, cy),
+                )
+            }
+        }
+    }
+}
+
+/** The locked card: a lock and a live countdown, and deliberately NO hint of the content —
+ *  the preview is sealed inside the manifest, which cannot be opened before the window. */
+@Composable
+private fun LockedContent(m: Msg, now: Long) {
+    Column(
+        Modifier.size(width = 220.dp, height = 160.dp).clip(RoundedCornerShape(12.dp))
+            .background(Color(0xFFE3E9EF)),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Icon(Icons.Filled.Lock, null, tint = Sub, modifier = Modifier.size(30.dp))
+        Spacer(Modifier.height(8.dp))
+        Text(countdown(m.revealAt - now), color = Ink, fontSize = 26.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(4.dp))
+        Text("Photo · opens in", color = Sub, fontSize = 12.sp)
+    }
+}
+
+@Composable
+private fun Bubble(m: Msg, now: Long = 0L, onDestroyed: () -> Unit = {}) {
     val align = if (m.incoming) Alignment.Start else Alignment.End
     val bg = if (m.incoming) Incoming else Outgoing
     val shape = RoundedCornerShape(
@@ -1794,20 +1947,36 @@ private fun Bubble(m: Msg) {
         bottomStart = if (m.incoming) 4.dp else 18.dp,
         bottomEnd = if (m.incoming) 18.dp else 4.dp,
     )
+    // Self-destruct: the countdown is the SENDER's to watch, but the burn plays on both sides.
+    val destroying = m.destroyAt > 0 && now > 0 && now >= m.destroyAt
+    val showDestroyClock = !m.incoming && m.destroyAt > 0 && now > 0 && !destroying
+
     Column(Modifier.fillMaxWidth().padding(vertical = 3.dp), horizontalAlignment = align) {
-        Box(Modifier.widthIn(max = 300.dp).clip(shape).background(bg).padding(10.dp)) {
-            when {
-                m.state == State.SEALING -> SealingContent(m)
-                m.kind == Kind.IMAGE -> ImageContent(m)
-                m.kind == Kind.VOICE -> VoiceContent(m)
-                else -> TextContent(m)
+        val body: @Composable () -> Unit = {
+            Box(Modifier.widthIn(max = 300.dp).clip(shape).background(bg).padding(10.dp)) {
+                when {
+                    m.state == State.SEALING -> SealingContent(m)
+                    m.state == State.LOCKED -> LockedContent(m, now)
+                    m.kind == Kind.IMAGE -> ImageContent(m)
+                    m.kind == Kind.VOICE -> VoiceContent(m)
+                    else -> TextContent(m)
+                }
             }
         }
+        if (destroying) SmokeDestroy(onFinished = onDestroyed, content = body) else body()
+
         if (m.state == State.SEALING) {
             Row(Modifier.padding(top = 3.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Filled.Autorenew, null, tint = Sub, modifier = Modifier.size(12.dp))
                 Spacer(Modifier.width(4.dp))
                 Text(if (m.mode == "FAST") "Pre-confirming…" else "Sealing…", color = Sub, fontSize = 11.sp)
+            }
+        }
+        if (showDestroyClock) {
+            Row(Modifier.padding(top = 3.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Filled.Whatshot, null, tint = Color(0xFFE0703A), modifier = Modifier.size(12.dp))
+                Spacer(Modifier.width(4.dp))
+                Text("Destroys in ${countdown(m.destroyAt - now)}", color = Color(0xFFE0703A), fontSize = 11.sp)
             }
         }
     }

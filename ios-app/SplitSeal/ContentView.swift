@@ -52,7 +52,12 @@ private func nowTime() -> String {
 // ─────────────────────────────── models ─────────────────────────────────────
 struct Chat: Identifiable { let id = UUID(); let name: String; let last: String; let time: String; var unread: Int = 0; var devicePub: String = ""; var identityPub: String = ""; var isContact: Bool = false }
 enum Kind { case text, image, voice }
-enum MsgState { case plain, sealing, opened }
+enum MsgState {
+    case plain, sealing, opened
+    /// Received but time-locked: the gateways withhold the shares until `revealAt`, so there is
+    /// nothing to render yet. The bubble shows a lock + countdown, never a hint of the content.
+    case locked
+}
 struct Msg: Identifiable {
     let id = UUID(); var text: String; let incoming: Bool; let time: String
     var kind: Kind = .text; var state: MsgState = .plain; var read: Bool = true; var mode: String = "STRICT"
@@ -61,6 +66,8 @@ struct Msg: Identifiable {
     var destroyAt: Int64 = 0 // unix secs: self-destructs after this time (0 = none)
     var mediaPath: String = "" // decrypted file on THIS device only; never uploaded
     var mediaMime: String = ""
+    /// Set on a LOCKED placeholder so the real item can replace it when the window opens.
+    var lockedSealId: String = ""
 }
 
 /// Short "time from now" label for a unix-seconds target, e.g. "10m", "1h", "1d".
@@ -186,19 +193,29 @@ enum Store {
     static func addThreadMsg(
         _ peer: String, _ id: String, _ text: String, _ incoming: Bool,
         media: String = "", // local path to the DECRYPTED file (this device only)
-        mime: String = ""
+        mime: String = "",
+        destroyAt: Int64 = 0 // persisted so a self-destruct still fires after an app restart
     ) -> Bool {
         guard !peer.isEmpty else { return false }
         var a = thread(peer)
         if a.contains(where: { ($0["id"] as? String) == id }) { return false }
         a.append(["id": id, "text": text, "incoming": incoming, "ts": Date().timeIntervalSince1970,
-                  "media": media, "mime": mime])
+                  "media": media, "mime": mime, "destroy_at": destroyAt])
         if let out = try? JSONSerialization.data(withJSONObject: a), let s = String(data: out, encoding: .utf8) {
             d.set(s, forKey: "thread_\(peer)")
         }
         return true
     }
     static func clearThread(_ peer: String) { if !peer.isEmpty { d.removeObject(forKey: "thread_\(peer)") } }
+
+    /// Drop a self-destructed item from the durable transcript so it never comes back on reopen.
+    static func removeThreadMedia(_ peer: String, _ mediaPath: String) {
+        guard !peer.isEmpty, !mediaPath.isEmpty else { return }
+        let keep = thread(peer).filter { ($0["media"] as? String) != mediaPath }
+        if let out = try? JSONSerialization.data(withJSONObject: keep), let s = String(data: out, encoding: .utf8) {
+            d.set(s, forKey: "thread_\(peer)")
+        }
+    }
 }
 
 func loadOrCreateIdentity() -> [String: Any] {
@@ -1259,6 +1276,9 @@ struct ConversationView: View {
     @State private var pickedItem: PhotosPickerItem?
     @State private var mediaError: String?
     @State private var playing: URL?
+    /// Wall-clock seconds, ticking once a second: drives reveal countdowns and destroy deadlines.
+    @State private var nowSecs: Int64 = Int64(Date().timeIntervalSince1970)
+    private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     // A "real" conversation is linked to a contact's device key (vs. the demo threads).
     private var real: Bool { !chat.devicePub.isEmpty }
@@ -1288,7 +1308,17 @@ struct ConversationView: View {
                 ScrollView {
                     LazyVStack(spacing: 0) {
                         DateChip("Today")
-                        ForEach(messages) { m in Bubble(m).id(m.id) }
+                        ForEach(messages) { m in
+                            Bubble(m, now: nowSecs) {
+                                // burn finished — drop it from the transcript for good
+                                messages.removeAll { $0.id == m.id }
+                                if real { Store.removeThreadMedia(chat.identityPub, m.mediaPath) }
+                                if !m.mediaPath.isEmpty {
+                                    try? FileManager.default.removeItem(atPath: m.mediaPath)
+                                }
+                            }
+                            .id(m.id)
+                        }
                     }
                     .padding(.horizontal, 12).padding(.vertical, 8)
                 }
@@ -1304,6 +1334,7 @@ struct ConversationView: View {
         .navigationBarHidden(true)
         // Load the picked item's raw bytes and seal them. Videos come back as a movie
         // transferable; images as Data.
+        .onReceive(tick) { _ in nowSecs = Int64(Date().timeIntervalSince1970) }
         .onChange(of: pickedItem) { _, item in
             guard let item else { return }
             Task {
@@ -1357,6 +1388,7 @@ struct ConversationView: View {
                             text: o["text"] as? String ?? "",
                             incoming: (o["incoming"] as? Bool) ?? false, time: "",
                             kind: media.isEmpty ? .text : .image, state: .opened,
+                            destroyAt: (o["destroy_at"] as? NSNumber)?.int64Value ?? 0,
                             mediaPath: media, mediaMime: o["mime"] as? String ?? ""
                         ))
                     }
@@ -1434,14 +1466,35 @@ struct ConversationView: View {
             // the relay is holding, then decrypt and reassemble locally.
             let leaf = ((item["bundle"] as? [String: Any])?["signed_leaf"] as? [String: Any])?["leaf"] as? [String: Any]
             if (leaf?["content_type"] as? String) == "Media" {
+                // Time-locked? Show a locked placeholder with a countdown rather than nothing at
+                // all, and keep polling — it opens by itself at revealAt.
+                let gateStr = SealCore.openMediaInfo(myDeviceSeed, bundleStr, shares, "")
+                if let gate = (try? JSONSerialization.jsonObject(with: Data(gateStr.utf8))) as? [String: Any],
+                   (gate["ok"] as? Bool) != true {
+                    let reason = gate["reason"] as? String ?? ""
+                    if reason == "destroyed" { seen.insert(sealId); continue } // gone before ever opened
+                    if reason == "locked" {
+                        let revealAt = (gate["reveal_at"] as? NSNumber)?.int64Value ?? 0
+                        if sender == chat.identityPub, !messages.contains(where: { $0.lockedSealId == sealId }) {
+                            messages.append(Msg(text: "Photo", incoming: true, time: nowTime(), kind: .image,
+                                                state: .locked, revealAt: revealAt, lockedSealId: sealId))
+                        }
+                        continue // NOT marked seen: the next poll opens it once the window does
+                    }
+                }
                 if let got = await receiveMedia(myDeviceSeed, sealId, bundleStr, shares) {
                     seen.insert(sealId)
                     let label = got.1.hasPrefix("video") ? "Video" : "Photo"
+                    // carry the destroy deadline across: the recipient's copy must burn too,
+                    // otherwise "self-destruct" only ever removed the sender's side.
+                    let dz = ((item["bundle"] as? [String: Any])?["destroy_at"] as? NSNumber)?.int64Value ?? 0
+                    messages.removeAll { $0.lockedSealId == sealId } // replace the locked placeholder
                     if Store.addInbox(myTag, sealId, label, sender) {
-                        Store.addThreadMsg(sender, sealId, label, true, media: got.0, mime: got.1)
+                        Store.addThreadMsg(sender, sealId, label, true, media: got.0, mime: got.1, destroyAt: dz)
                         if sender == chat.identityPub {
                             messages.append(Msg(text: label, incoming: true, time: nowTime(),
-                                                kind: .image, state: .opened, mediaPath: got.0, mediaMime: got.1))
+                                                kind: .image, state: .opened, destroyAt: dz,
+                                                mediaPath: got.0, mediaMime: got.1))
                         }
                     }
                 }
@@ -1474,11 +1527,12 @@ struct ConversationView: View {
         guard real else { return }
         let isVideo = mime.hasPrefix("video")
         let label = isVideo ? "Video" : "Photo"
-        messages.append(Msg(text: label, incoming: false, time: nowTime(), kind: .image,
-                            state: .sealing, mode: fastMode ? "FAST" : "STRICT"))
-        let idx = messages.count - 1
         let fast = fastMode
         let rv = revealAt, dz = destroyAt
+        messages.append(Msg(text: label, incoming: false, time: nowTime(), kind: .image,
+                            state: .sealing, mode: fast ? "FAST" : "STRICT",
+                            revealAt: rv, destroyAt: dz))
+        let idx = messages.count - 1
         revealAt = 0; destroyAt = 0
         Task {
             let preview = buildPreview(src, isVideo: isVideo)
@@ -1515,7 +1569,7 @@ struct ConversationView: View {
                 messages[idx].sealedFor = chat.name
                 messages[idx].mediaPath = mine.path
                 messages[idx].mediaMime = mime
-                Store.addThreadMsg(chat.identityPub, "out-\(UUID().uuidString)", label, false, media: mine.path, mime: mime)
+                Store.addThreadMsg(chat.identityPub, "out-\(UUID().uuidString)", label, false, media: mine.path, mime: mime, destroyAt: dz)
             }
         }
     }
@@ -1627,33 +1681,116 @@ extension EnvironmentValues {
     }
 }
 
+/// mm:ss for a countdown; falls back to h/d for long windows.
+func countdownLabel(_ secondsLeft: Int64) -> String {
+    let s = max(0, secondsLeft)
+    if s >= 86400 { return "\(s / 86400)d \((s % 86400) / 3600)h" }
+    if s >= 3600 { return "\(s / 3600)h \((s % 3600) / 60)m" }
+    return String(format: "%d:%02d", s / 60, s % 60)
+}
+
+/// Burns the content away: it shrinks and fades while puffs of smoke rise off it, then
+/// `onFinished` fires so the caller can drop the message for good.
+private struct SmokeDestroy<Content: View>: View {
+    let onFinished: () -> Void
+    @ViewBuilder var content: Content
+    @State private var p: Double = 0
+
+    var body: some View {
+        ZStack {
+            content
+                .opacity(max(0, 1 - p * 1.35))
+                .scaleEffect(1 - 0.14 * p)
+            Canvas { ctx, size in
+                for i in 0..<14 {
+                    let seed = i * 7919
+                    let fx = Double(seed % 100) / 100.0
+                    let drift = Double((seed / 100) % 100) / 100.0 - 0.5
+                    let delay = Double(i % 5) * 0.08
+                    let local = max(0, min(1, (p - delay) / (1 - delay)))
+                    if local <= 0 { continue }
+                    let r = min(size.width, size.height) * (0.06 + 0.16 * local)
+                    let cx = size.width * fx + drift * size.width * 0.35 * local
+                    let cy = size.height * (0.85 - 1.05 * local)
+                    let rect = CGRect(x: cx - r, y: cy - r, width: r * 2, height: r * 2)
+                    ctx.fill(Path(ellipseIn: rect),
+                             with: .color(Color(hex: 0x9AA5B1).opacity(max(0, 0.42 * (1 - local)))))
+                }
+            }
+            .allowsHitTesting(false)
+        }
+        .onAppear {
+            withAnimation(.linear(duration: 1.5)) { p = 1 }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.55) { onFinished() }
+        }
+    }
+}
+
 private struct Bubble: View {
     let m: Msg
+    var now: Int64 = 0
+    var onDestroyed: () -> Void = {}
     @Environment(\.playVideo) private var playVideo
-    init(_ m: Msg) { self.m = m }
+    init(_ m: Msg, now: Int64 = 0, onDestroyed: @escaping () -> Void = {}) {
+        self.m = m; self.now = now; self.onDestroyed = onDestroyed
+    }
     var body: some View {
-        HStack {
+        // Self-destruct: the countdown is the SENDER's to watch, but the burn plays on both sides.
+        let destroying = m.destroyAt > 0 && now > 0 && now >= m.destroyAt
+        let showDestroyClock = !m.incoming && m.destroyAt > 0 && now > 0 && !destroying
+        return HStack {
             if !m.incoming { Spacer(minLength: 40) }
             VStack(alignment: m.incoming ? .leading : .trailing, spacing: 3) {
-                content
-                    .padding(10)
-                    .background(m.incoming ? Color.white : Color.dvOut)
-                    .clipShape(RoundedRectangle(cornerRadius: 18))
-                    .frame(maxWidth: 300, alignment: m.incoming ? .leading : .trailing)
+                Group {
+                    if destroying {
+                        SmokeDestroy(onFinished: onDestroyed) { bubbleBody }
+                    } else {
+                        bubbleBody
+                    }
+                }
                 if m.state == .sealing {
                     HStack(spacing: 4) {
                         Image(systemName: "arrow.triangle.2.circlepath").font(.system(size: 11))
                         Text(m.mode == "FAST" ? "Pre-confirming…" : "Sealing…").font(.system(size: 11))
                     }.foregroundColor(.dvSub)
                 }
+                if showDestroyClock {
+                    HStack(spacing: 4) {
+                        Image(systemName: "flame.fill").font(.system(size: 11))
+                        Text("Destroys in \(countdownLabel(m.destroyAt - now))").font(.system(size: 11))
+                    }.foregroundColor(Color(hex: 0xE0703A))
+                }
             }
             if m.incoming { Spacer(minLength: 40) }
         }.padding(.vertical, 3)
     }
 
+    private var bubbleBody: some View {
+        content
+            .padding(10)
+            .background(m.incoming ? Color.white : Color.dvOut)
+            .clipShape(RoundedRectangle(cornerRadius: 18))
+            .frame(maxWidth: 300, alignment: m.incoming ? .leading : .trailing)
+    }
+
+    /// The locked card: a lock and a live countdown, and deliberately NO hint of the content —
+    /// the preview is sealed inside the manifest, which cannot be opened before the window.
+    private var lockedContent: some View {
+        VStack(spacing: 6) {
+            Image(systemName: "lock.fill").font(.system(size: 26)).foregroundColor(.dvSub)
+            Text(countdownLabel(m.revealAt - now))
+                .font(.system(size: 26, weight: .bold)).foregroundColor(.dvInk)
+            Text("Photo · opens in").font(.system(size: 12)).foregroundColor(.dvSub)
+        }
+        .frame(width: 220, height: 160)
+        .background(Color(hex: 0xE3E9EF))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
     @ViewBuilder private var content: some View {
         switch m.state {
         case .sealing: sealing
+        case .locked: lockedContent
         default:
             switch m.kind {
             case .image: imageContent
