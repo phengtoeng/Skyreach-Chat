@@ -45,6 +45,10 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    // Backdrop blur for the floating bottom bar — the iOS `.ultraThinMaterial` equivalent.
+    // 0.7.x is the last line built against Compose 1.6 / Kotlin 1.9; newer needs Compose 1.7+.
+    // Real blur needs API 31+, below that it degrades to a translucent scrim.
+    implementation("dev.chrisbanes.haze:haze:0.7.3")
     implementation("com.google.zxing:core:3.5.3") // QR code for the profile card
     implementation("com.journeyapps:zxing-android-embedded:4.3.0") // camera QR scanner
 }

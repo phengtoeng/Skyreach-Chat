@@ -22,7 +22,8 @@ extension Color {
     static let dvSub = Color(hex: 0x8C99A6)
     static let dvHair = Color(hex: 0xECEFF2)
     static let dvGreen = Color(hex: 0x33C15A)
-    static let dvBarActive = Color(hex: 0xE9ECEF)  // pill behind the selected tab
+    static let dvBarActive = Color(hex: 0x101720).opacity(0.10)  // pill behind the selected tab
+    static let dvBarEdge = Color.white.opacity(0.60)             // hairline highlight on the glass
     static let dvBadge = Color(hex: 0xF03D3D)
 }
 
@@ -672,9 +673,12 @@ private struct ChatRow: View {
     }
 }
 
-/// Floating bottom bar: a white capsule holding the four tabs, plus a detached round
-/// search button. It overlays the content (the lists pad their bottom for it) instead
-/// of docking to the window edge.
+/// Floating bottom bar: a frosted-glass capsule holding the four tabs, plus a detached
+/// round search button. `.ultraThinMaterial` blurs whatever scrolls underneath. It overlays
+/// the content (the lists pad their bottom for it) instead of docking to the window edge.
+///
+/// Shadows stay faint here on purpose: the surface is translucent, so a normal-strength
+/// shadow shows through the glass and greys the whole bar out.
 private struct BottomBar: View {
     let tab: Int
     let onTab: (Int) -> Void
@@ -690,17 +694,17 @@ private struct BottomBar: View {
                 NavItem(icon: "gearshape.fill", label: "Settings", active: tab == TAB_SETTINGS, dot: settingsAlert) { onTab(TAB_SETTINGS) }
             }
             .padding(6)
-            .background(Color.white)
-            .clipShape(Capsule())
-            .shadow(color: .black.opacity(0.16), radius: 12, y: 4)
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay(Capsule().strokeBorder(Color.dvBarEdge, lineWidth: 1))
+            .shadow(color: .black.opacity(0.10), radius: 10, y: 4)
 
             Image(systemName: "magnifyingglass")
                 .font(.system(size: 22, weight: .medium))
                 .foregroundColor(.dvInk)
                 .frame(width: 58, height: 58)
-                .background(Color.white)
-                .clipShape(Circle())
-                .shadow(color: .black.opacity(0.16), radius: 12, y: 4)
+                .background(.ultraThinMaterial, in: Circle())
+                .overlay(Circle().strokeBorder(Color.dvBarEdge, lineWidth: 1))
+                .shadow(color: .black.opacity(0.10), radius: 10, y: 4)
                 .contentShape(Circle())
                 .onTapGesture(perform: onSearch)
         }

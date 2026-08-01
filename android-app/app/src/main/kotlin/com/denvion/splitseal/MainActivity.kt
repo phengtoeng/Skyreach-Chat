@@ -39,6 +39,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.HazeStyle
+import dev.chrisbanes.haze.haze
+import dev.chrisbanes.haze.hazeChild
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
@@ -69,9 +73,21 @@ private val Ink = Color(0xFF101720)
 private val Sub = Color(0xFF8C99A6)
 private val Hair = Color(0xFFECEFF2)
 private val Green = Color(0xFF33C15A)
-private val BarBg = Color(0xFFFFFFFF)      // floating nav capsule / search button
-private val BarActive = Color(0xFFE9ECEF)  // pill behind the selected tab
+private val BarActive = Color(0x1A101720)  // pill behind the selected tab (soft grey on glass)
+private val BarEdge = Color(0x99FFFFFF)    // hairline highlight around the glass
+private val BarShadow = Color(0x26000000)  // soft drop shadow (API 28+ honours the colour)
 private val BadgeRed = Color(0xFFF03D3D)
+
+/**
+ * Frosted-glass for the floating bar, matching iOS `.ultraThinMaterial`: whatever scrolls
+ * underneath is blurred and tinted white. Real backdrop blur needs API 31+; below that haze
+ * falls back to a plain translucent scrim, which still reads as glass.
+ */
+private val Glass = HazeStyle(
+    tint = Color.White.copy(alpha = 0.72f),
+    blurRadius = 20.dp,
+    noiseFactor = 0.03f,
+)
 
 // Bottom-bar tabs, left to right.
 private const val TAB_CONTACTS = 0
@@ -675,7 +691,13 @@ private fun ChatListScreen(
         TAB_CALLS -> "Calls"
         else -> "Denvion"
     }
-    Column(Modifier.fillMaxSize().background(ScreenBg)) {
+    val hazeState = remember { HazeState() }
+    // The bar is a sibling of the hazed content, never a child of it — haze blurs a node's own
+    // subtree, so nesting the bar inside would feed the bar back into its own backdrop.
+    Box(Modifier.fillMaxSize()) {
+    // The background belongs INSIDE the hazed node — haze blurs that node's own drawing, so a
+    // backdrop painted by the parent would leave the glass sampling transparent pixels.
+    Column(Modifier.fillMaxSize().background(ScreenBg).haze(state = hazeState, style = Glass)) {
         Row(
             Modifier.fillMaxWidth().background(Blue).padding(horizontal = 16.dp, vertical = 14.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -716,30 +738,29 @@ private fun ChatListScreen(
                 )
             }
         }
-        Box(Modifier.weight(1f)) {
-            LazyColumn(
-                Modifier.fillMaxSize(),
-                // clear the floating bar + its shadow so the last row stays tappable
-                contentPadding = PaddingValues(bottom = 96.dp),
-            ) {
-                items(rows) { c ->
-                    ChatRow(c, onClick = { onOpen(c) }, onLongClick = { pendingDelete = c })
-                    Box(Modifier.padding(start = 84.dp).fillMaxWidth().height(1.dp).background(Hair))
-                }
+        LazyColumn(
+            Modifier.weight(1f),
+            // clear the floating bar + its shadow so the last row stays tappable
+            contentPadding = PaddingValues(bottom = 96.dp),
+        ) {
+            items(rows) { c ->
+                ChatRow(c, onClick = { onOpen(c) }, onLongClick = { pendingDelete = c })
+                Box(Modifier.padding(start = 84.dp).fillMaxWidth().height(1.dp).background(Hair))
             }
-            FloatingActionButton(
-                onClick = onAdd,
-                containerColor = Blue,
-                contentColor = Color.White,
-                modifier = Modifier.align(Alignment.BottomEnd).padding(end = 20.dp, bottom = 104.dp),
-            ) { Icon(Icons.Filled.PersonAdd, "Add contact") }
-            Box(Modifier.align(Alignment.BottomCenter)) {
-                BottomBar(
-                    tab, onTab,
-                    chatBadge = all.sumOf { it.unread },
-                    onSearch = { searching = !searching; if (!searching) query = "" },
-                )
-            }
+        }
+    }
+        FloatingActionButton(
+            onClick = onAdd,
+            containerColor = Blue,
+            contentColor = Color.White,
+            modifier = Modifier.align(Alignment.BottomEnd).padding(end = 20.dp, bottom = 104.dp),
+        ) { Icon(Icons.Filled.PersonAdd, "Add contact") }
+        Box(Modifier.align(Alignment.BottomCenter)) {
+            BottomBar(
+                hazeState, tab, onTab,
+                chatBadge = all.sumOf { it.unread },
+                onSearch = { searching = !searching; if (!searching) query = "" },
+            )
         }
     }
 
@@ -797,6 +818,7 @@ private fun ChatRow(c: Chat, onClick: () -> Unit, onLongClick: () -> Unit) {
  */
 @Composable
 private fun BottomBar(
+    hazeState: HazeState,
     tab: Int,
     onTab: (Int) -> Unit,
     chatBadge: Int = 0,
@@ -810,9 +832,11 @@ private fun BottomBar(
     ) {
         Row(
             Modifier.weight(1f)
-                .shadow(14.dp, CircleShape, clip = false)
-                .clip(CircleShape)
-                .background(BarBg)
+                // Keep this faint: the surface is translucent, so the shadow shows THROUGH the
+                // glass and a normal-strength one greys the whole bar out.
+                .shadow(6.dp, CircleShape, clip = false, ambientColor = BarShadow, spotColor = BarShadow)
+                .hazeChild(state = hazeState, shape = CircleShape, style = Glass)
+                .border(1.dp, BarEdge, CircleShape)
                 .padding(horizontal = 6.dp, vertical = 6.dp),
             horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically,
@@ -824,9 +848,12 @@ private fun BottomBar(
         }
         Box(
             Modifier.size(58.dp)
-                .shadow(14.dp, CircleShape, clip = false)
+                // Keep this faint: the surface is translucent, so the shadow shows THROUGH the
+                // glass and a normal-strength one greys the whole bar out.
+                .shadow(6.dp, CircleShape, clip = false, ambientColor = BarShadow, spotColor = BarShadow)
+                .hazeChild(state = hazeState, shape = CircleShape, style = Glass)
+                .border(1.dp, BarEdge, CircleShape)
                 .clip(CircleShape)
-                .background(BarBg)
                 .clickable(onClick = onSearch),
             contentAlignment = Alignment.Center,
         ) { Icon(Icons.Filled.Search, "Search", tint = Ink, modifier = Modifier.size(26.dp)) }
@@ -892,7 +919,9 @@ private fun ProfileScreen(
     var myName by remember(name) { mutableStateOf(name) }
     var myPhone by remember { mutableStateOf(identity.optString("phone")) }
     var host by remember { mutableStateOf(currentHost) }
-    Column(Modifier.fillMaxSize().background(ScreenBg)) {
+    val hazeState = remember { HazeState() }
+    Box(Modifier.fillMaxSize()) {
+        Column(Modifier.fillMaxSize().background(ScreenBg).haze(state = hazeState, style = Glass)) {
         Row(
             Modifier.fillMaxWidth().background(Blue).padding(horizontal = 16.dp, vertical = 14.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -1049,8 +1078,9 @@ private fun ProfileScreen(
                 ) { Text("Save server", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold) }
                 Spacer(Modifier.height(96.dp)) // clear the floating bar
             }
-            Box(Modifier.align(Alignment.BottomCenter)) { BottomBar(tab, onTab) }
         }
+        }
+        Box(Modifier.align(Alignment.BottomCenter)) { BottomBar(hazeState, tab, onTab) }
     }
 }
 
