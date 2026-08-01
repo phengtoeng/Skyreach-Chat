@@ -30,6 +30,10 @@ name = "wcaht-seal-anchor"
 path = "src/bin/anchor.rs"
 
 [[bin]]
+name = "wcaht-seal-media-e2e"
+path = "src/bin/media_e2e.rs"
+
+[[bin]]
 name = "wcaht-seal-relay"
 path = "src/bin/relay_server.rs"
 

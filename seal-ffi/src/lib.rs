@@ -188,6 +188,284 @@ fn open_received_json(device_seed_hex: &str, bundle_str: &str, shares_str: &str)
     }
 }
 
+// ─────────────────────────────── media ──────────────────────────────────────
+//
+// Media crosses this boundary as FILE PATHS, never as bytes: a 40 MB video base64'd
+// through JNI would cost several copies of itself in RAM. Rust reads the source file,
+// writes each encrypted chunk out as its own file, and returns only JSON metadata.
+
+/// Refuse to seal anything larger than this in one item (this cut holds the plaintext in
+/// memory while chunking; true streaming is a follow-up).
+const MAX_MEDIA_BYTES: u64 = 64 * 1024 * 1024;
+
+fn kind_from_str(s: &str) -> ContentKind {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "video" => ContentKind::Video,
+        "audio" => ContentKind::Audio,
+        "file" => ContentKind::File,
+        _ => ContentKind::Image,
+    }
+}
+
+fn kind_str(k: ContentKind) -> &'static str {
+    match k {
+        ContentKind::Image => "image",
+        ContentKind::Audio => "audio",
+        ContentKind::File => "file",
+        ContentKind::Video => "video",
+    }
+}
+
+/// Seal a media file. Writes one file per encrypted chunk into `out_dir`, named by its
+/// ciphertext hash, and returns the same `{bundle, shares}` shape a text seal produces —
+/// so the existing ship/collect plumbing is unchanged — plus the chunk list to upload.
+///
+/// `preview_path` must point at an ALREADY blurred/downscaled image; it is sealed inside
+/// the manifest and is never uploaded as its own object.
+#[allow(clippy::too_many_arguments)]
+fn seal_media_file_json(
+    identity_seed_hex: &str,
+    sender_card: &str,
+    device_pub_hex: &str,
+    in_path: &str,
+    mime: &str,
+    kind: &str,
+    preview_path: &str,
+    out_dir: &str,
+    fast: bool,
+    reveal_at: i64,
+    destroy_at: i64,
+) -> String {
+    let dp: Option<[u8; 32]> = hex::decode(device_pub_hex.trim()).ok().and_then(|v| v.try_into().ok());
+    let Some(device_pub) = dp else {
+        return json!({ "ok": false, "error": "bad device pubkey" }).to_string();
+    };
+    let meta = match std::fs::metadata(in_path) {
+        Ok(m) => m,
+        Err(e) => return json!({ "ok": false, "error": format!("cannot read media: {e}") }).to_string(),
+    };
+    if meta.len() == 0 {
+        return json!({ "ok": false, "error": "media file is empty" }).to_string();
+    }
+    if meta.len() > MAX_MEDIA_BYTES {
+        return json!({ "ok": false, "error": format!("media too large ({} bytes, cap {MAX_MEDIA_BYTES})", meta.len()) })
+            .to_string();
+    }
+    let bytes = match std::fs::read(in_path) {
+        Ok(b) => b,
+        Err(e) => return json!({ "ok": false, "error": format!("cannot read media: {e}") }).to_string(),
+    };
+    // an empty/unreadable preview simply means "no locked preview"
+    let preview = if preview_path.trim().is_empty() {
+        Vec::new()
+    } else {
+        std::fs::read(preview_path).unwrap_or_default()
+    };
+    let policy = if preview.is_empty() { PreviewPolicy::None } else { PreviewPolicy::LockedBlur };
+
+    if let Err(e) = std::fs::create_dir_all(out_dir) {
+        return json!({ "ok": false, "error": format!("cannot create out_dir: {e}") }).to_string();
+    }
+
+    let sender_id = sc::SignId::from_seed(&seed_from_hex(identity_seed_hex));
+    let sender_dev = sc::SignId::generate();
+    let gw_ids: Vec<[u8; 32]> = (0..3).map(|_| sc::random_32()).collect();
+    let tag = mailbox_tag(&device_pub);
+    let mode = if fast { SealMode::FastSeal } else { SealMode::StrictSeal };
+
+    let sealed = match seal_media_with_mode(
+        &bytes,
+        kind_from_str(kind),
+        mime,
+        &preview,
+        policy,
+        (0, 0),
+        0,
+        DEFAULT_CHUNK_SIZE,
+        &sender_id,
+        &sender_dev,
+        &device_pub,
+        tag,
+        &gw_ids,
+        2,
+        100,
+        100_000,
+        mode,
+    ) {
+        Ok(s) => s,
+        Err(e) => return json!({ "ok": false, "error": e.to_string() }).to_string(),
+    };
+
+    // spill the encrypted chunks to disk for the uploader
+    let mut chunk_meta = Vec::with_capacity(sealed.chunks.len());
+    for c in &sealed.chunks {
+        let hex_hash = hex::encode(c.ciphertext_hash);
+        let path = format!("{out_dir}/{hex_hash}");
+        if let Err(e) = std::fs::write(&path, &c.bytes) {
+            return json!({ "ok": false, "error": format!("cannot write chunk: {e}") }).to_string();
+        }
+        chunk_meta.push(json!({ "index": c.index, "hash": hex_hash, "path": path, "size": c.bytes.len() }));
+    }
+
+    let item = &sealed.item;
+    let bundle = json!({
+        "envelope": serde_json::to_value(&item.envelope).unwrap_or(Value::Null),
+        "signed_leaf": serde_json::to_value(&item.signed_leaf).unwrap_or(Value::Null),
+        "sender_id_pub": hex::encode(sender_id.public()),
+        "sender_card": sender_card,
+        "reveal_at": reveal_at,
+        "destroy_at": destroy_at,
+    });
+    let shares: Vec<Value> = item.share_envelopes.iter().filter_map(|s| serde_json::to_value(s).ok()).collect();
+    json!({
+        "ok": true,
+        "seal_id": hex::encode(item.signed_leaf.leaf.seal_id),
+        "mailbox_tag": hex::encode(tag),
+        "bundle": bundle,
+        "shares": shares,
+        "chunk_count": sealed.chunks.len(),
+        "chunks": chunk_meta,
+        "reveal_at": reveal_at,
+        "destroy_at": destroy_at,
+    })
+    .to_string()
+}
+
+/// Everything needed to run the recipient gate, parsed out of a relay bundle.
+struct OpenCtx {
+    envelope: EncryptedEnvelope,
+    signed_leaf: SignedLeaf,
+    sender_pub: [u8; 32],
+    shares: Vec<KeyShareEnvelope>,
+    chain: MockSealChain,
+}
+
+/// Parse a bundle + shares and apply the timelock window. `Err` is a ready-to-return JSON
+/// string. The gateways are the primary gate — they withhold shares outside the window —
+/// so the checks here are defence in depth.
+fn open_ctx(bundle_str: &str, shares_str: &str) -> std::result::Result<OpenCtx, String> {
+    let Ok(bundle): Result<Value, _> = serde_json::from_str(bundle_str) else {
+        return Err(json!({ "ok": false, "reason": "bad bundle" }).to_string());
+    };
+    let envelope: Option<EncryptedEnvelope> =
+        serde_json::from_value(bundle.get("envelope").cloned().unwrap_or(Value::Null)).ok();
+    let signed_leaf: Option<SignedLeaf> =
+        serde_json::from_value(bundle.get("signed_leaf").cloned().unwrap_or(Value::Null)).ok();
+    let sender_pub: Option<[u8; 32]> = bundle
+        .get("sender_id_pub")
+        .and_then(Value::as_str)
+        .and_then(|s| hex::decode(s).ok())
+        .and_then(|v| v.try_into().ok());
+    let shares: Vec<KeyShareEnvelope> = serde_json::from_str(shares_str).unwrap_or_default();
+    let (Some(envelope), Some(signed_leaf), Some(sender_pub)) = (envelope, signed_leaf, sender_pub) else {
+        return Err(json!({ "ok": false, "reason": "incomplete bundle" }).to_string());
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let reveal_at = bundle.get("reveal_at").and_then(Value::as_i64).unwrap_or(0);
+    let destroy_at = bundle.get("destroy_at").and_then(Value::as_i64).unwrap_or(0);
+    if destroy_at > 0 && now >= destroy_at {
+        return Err(json!({ "ok": false, "reason": "destroyed" }).to_string());
+    }
+    if reveal_at > 0 && now < reveal_at {
+        return Err(json!({ "ok": false, "reason": "locked", "reveal_at": reveal_at }).to_string());
+    }
+
+    // gateways already enforced finality before releasing, so mark the seal finalised.
+    let mut chain = MockSealChain::new(1000);
+    let _ = chain.submit_leaf(&signed_leaf, &sender_pub);
+    let _ = chain.finalize(&signed_leaf.leaf.seal_id);
+    Ok(OpenCtx { envelope, signed_leaf, sender_pub, shares, chain })
+}
+
+/// Step 1 of receiving media: open the MANIFEST only. Tells the app what the item is and
+/// which chunks to fetch. Writes the locked preview (if any) to `preview_out` so the app
+/// can show something while the chunks download.
+fn open_media_info_json(device_seed_hex: &str, bundle_str: &str, shares_str: &str, preview_out: &str) -> String {
+    let recipient = sc::DeviceKey::from_seed(seed_from_hex(device_seed_hex));
+    let ctx = match open_ctx(bundle_str, shares_str) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    match try_open_media(&ctx.envelope, &ctx.signed_leaf, &ctx.sender_pub, &recipient, &ctx.shares, &ctx.chain) {
+        MediaOutcome::Opened { manifest, .. } => {
+            if !preview_out.trim().is_empty() && !manifest.preview.is_empty() {
+                let _ = std::fs::write(preview_out, &manifest.preview);
+            }
+            let hashes: Vec<String> = manifest.ciphertext_chunk_hashes.iter().map(hex::encode).collect();
+            json!({
+                "ok": true,
+                "mime_type": manifest.mime_type,
+                "kind": kind_str(manifest.content_kind),
+                "plaintext_size": manifest.plaintext_size,
+                "chunk_count": manifest.chunk_count,
+                "chunks": hashes,
+                "width": manifest.width,
+                "height": manifest.height,
+                "duration_ms": manifest.duration_ms,
+                "has_preview": !manifest.preview.is_empty(),
+            })
+            .to_string()
+        }
+        MediaOutcome::Locked { reason, .. } => json!({ "ok": false, "reason": reason }).to_string(),
+        MediaOutcome::Rejected { reason } => json!({ "ok": false, "reason": reason }).to_string(),
+    }
+}
+
+/// Step 2: with every chunk downloaded into `chunk_dir` (each file named by its hex hash,
+/// exactly as `open_media_info` listed them), decrypt and reassemble into `out_path`.
+///
+/// A missing or altered chunk fails here rather than producing a corrupt file.
+fn open_media_file_json(
+    device_seed_hex: &str,
+    bundle_str: &str,
+    shares_str: &str,
+    chunk_dir: &str,
+    out_path: &str,
+) -> String {
+    let recipient = sc::DeviceKey::from_seed(seed_from_hex(device_seed_hex));
+    let ctx = match open_ctx(bundle_str, shares_str) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let (manifest, opener) =
+        match try_open_media(&ctx.envelope, &ctx.signed_leaf, &ctx.sender_pub, &recipient, &ctx.shares, &ctx.chain) {
+            MediaOutcome::Opened { manifest, opener } => (manifest, opener),
+            MediaOutcome::Locked { reason, .. } => return json!({ "ok": false, "reason": reason }).to_string(),
+            MediaOutcome::Rejected { reason } => return json!({ "ok": false, "reason": reason }).to_string(),
+        };
+
+    let mut out = Vec::with_capacity(manifest.plaintext_size as usize);
+    for (i, h) in manifest.ciphertext_chunk_hashes.iter().enumerate() {
+        let path = format!("{chunk_dir}/{}", hex::encode(h));
+        let blob = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => return json!({ "ok": false, "reason": format!("chunk {i} missing: {e}") }).to_string(),
+        };
+        match opener.decrypt_chunk(i as u32, &blob) {
+            Ok(plain) => out.extend_from_slice(&plain),
+            Err(e) => return json!({ "ok": false, "reason": format!("chunk {i}: {e}") }).to_string(),
+        }
+    }
+    if out.len() as u64 != manifest.plaintext_size {
+        return json!({ "ok": false, "reason": "reassembled size does not match the manifest" }).to_string();
+    }
+    if let Err(e) = std::fs::write(out_path, &out) {
+        return json!({ "ok": false, "reason": format!("cannot write output: {e}") }).to_string();
+    }
+    json!({
+        "ok": true,
+        "out_path": out_path,
+        "mime_type": manifest.mime_type,
+        "kind": kind_str(manifest.content_kind),
+        "bytes": out.len(),
+    })
+    .to_string()
+}
+
 /// Privacy-preserving directory key for a phone number (never the raw number, never
 /// on-chain). `hash(normalized phone)` — what resolves to a WCAHT address in the directory.
 fn phone_commitment_json(phone: &str) -> String {
@@ -330,6 +608,69 @@ pub unsafe extern "C" fn ss_seal_shippable(
 #[no_mangle]
 pub unsafe extern "C" fn ss_open_received(device_seed: *const c_char, bundle: *const c_char, shares: *const c_char) -> *mut c_char {
     to_c(open_received_json(&cstr(device_seed), &cstr(bundle), &cstr(shares)))
+}
+
+/// Seal a media FILE. Chunks land in `out_dir` named by hash; returns `{bundle, shares, chunks}`.
+///
+/// # Safety
+/// All arguments must be null or valid NUL-terminated C strings.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn ss_seal_media_file(
+    identity_seed: *const c_char,
+    sender_card: *const c_char,
+    device_pub: *const c_char,
+    in_path: *const c_char,
+    mime: *const c_char,
+    kind: *const c_char,
+    preview_path: *const c_char,
+    out_dir: *const c_char,
+    fast: i32,
+    reveal_at: i64,
+    destroy_at: i64,
+) -> *mut c_char {
+    to_c(seal_media_file_json(
+        &cstr(identity_seed),
+        &cstr(sender_card),
+        &cstr(device_pub),
+        &cstr(in_path),
+        &cstr(mime),
+        &cstr(kind),
+        &cstr(preview_path),
+        &cstr(out_dir),
+        fast != 0,
+        reveal_at,
+        destroy_at,
+    ))
+}
+
+/// Media step 1: open the manifest → `{ ok, mime_type, kind, chunks:[hash] }`.
+///
+/// # Safety
+/// All arguments must be null or valid NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn ss_open_media_info(
+    device_seed: *const c_char,
+    bundle: *const c_char,
+    shares: *const c_char,
+    preview_out: *const c_char,
+) -> *mut c_char {
+    to_c(open_media_info_json(&cstr(device_seed), &cstr(bundle), &cstr(shares), &cstr(preview_out)))
+}
+
+/// Media step 2: reassemble the downloaded chunks into `out_path`.
+///
+/// # Safety
+/// All arguments must be null or valid NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn ss_open_media_file(
+    device_seed: *const c_char,
+    bundle: *const c_char,
+    shares: *const c_char,
+    chunk_dir: *const c_char,
+    out_path: *const c_char,
+) -> *mut c_char {
+    to_c(open_media_file_json(&cstr(device_seed), &cstr(bundle), &cstr(shares), &cstr(chunk_dir), &cstr(out_path)))
 }
 
 /// Free a string returned by any `ss_*` function. Safe on null.
@@ -639,6 +980,71 @@ pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeOpenReceived<'l
     ret(env, open_received_json(&ds, &b, &s))
 }
 
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeSealMediaFile<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    identity_seed: JString<'local>,
+    sender_card: JString<'local>,
+    device_pub: JString<'local>,
+    in_path: JString<'local>,
+    mime: JString<'local>,
+    kind: JString<'local>,
+    preview_path: JString<'local>,
+    out_dir: JString<'local>,
+    fast: jni::sys::jboolean,
+    reveal_at: jni::sys::jlong,
+    destroy_at: jni::sys::jlong,
+) -> jstring {
+    let is = jstr(&mut env, &identity_seed);
+    let card = jstr(&mut env, &sender_card);
+    let dp = jstr(&mut env, &device_pub);
+    let ip = jstr(&mut env, &in_path);
+    let mt = jstr(&mut env, &mime);
+    let kd = jstr(&mut env, &kind);
+    let pv = jstr(&mut env, &preview_path);
+    let od = jstr(&mut env, &out_dir);
+    ret(
+        env,
+        seal_media_file_json(&is, &card, &dp, &ip, &mt, &kd, &pv, &od, fast != 0, reveal_at as i64, destroy_at as i64),
+    )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeOpenMediaInfo<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    device_seed: JString<'local>,
+    bundle: JString<'local>,
+    shares: JString<'local>,
+    preview_out: JString<'local>,
+) -> jstring {
+    let ds = jstr(&mut env, &device_seed);
+    let b = jstr(&mut env, &bundle);
+    let s = jstr(&mut env, &shares);
+    let p = jstr(&mut env, &preview_out);
+    ret(env, open_media_info_json(&ds, &b, &s, &p))
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeOpenMediaFile<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    device_seed: JString<'local>,
+    bundle: JString<'local>,
+    shares: JString<'local>,
+    chunk_dir: JString<'local>,
+    out_path: JString<'local>,
+) -> jstring {
+    let ds = jstr(&mut env, &device_seed);
+    let b = jstr(&mut env, &bundle);
+    let s = jstr(&mut env, &shares);
+    let cd = jstr(&mut env, &chunk_dir);
+    let op = jstr(&mut env, &out_path);
+    ret(env, open_media_file_json(&ds, &b, &s, &cd, &op))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -677,7 +1083,135 @@ mod tests {
             let _ = seal_shippable_json(s, s, s, s, true, 0, 0);
             let _ = card_for_json(s, s, s);
             let _ = open_received_json(s, s, s);
+            // the media entry points take PATHS from the platform — equally untrusted
+            let _ = seal_media_file_json(s, s, s, s, s, s, s, s, false, 0, 0);
+            let _ = open_media_info_json(s, s, s, s);
+            let _ = open_media_file_json(s, s, s, s, s);
         }
+    }
+
+    /// A scratch dir under the OS temp dir, removed on drop.
+    struct Tmp(std::path::PathBuf);
+    impl Tmp {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("ss-media-{tag}-{}", hex::encode(sc::random_32())));
+            std::fs::create_dir_all(&p).unwrap();
+            Tmp(p)
+        }
+        fn join(&self, n: &str) -> String {
+            self.0.join(n).to_string_lossy().into_owned()
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn media_file_round_trips_through_the_ffi() {
+        let tmp = Tmp::new("rt");
+        let alice: Value = serde_json::from_str(&new_identity_json("Alice")).unwrap();
+        let bob: Value = serde_json::from_str(&new_identity_json("Bob")).unwrap();
+
+        // a payload big enough to span several 1 MiB chunks, with a partial last one
+        let picture: Vec<u8> = (0..(2 * 1024 * 1024 + 12_345u32)).map(|i| (i % 251) as u8).collect();
+        let src = tmp.join("in.jpg");
+        std::fs::write(&src, &picture).unwrap();
+        std::fs::write(tmp.join("preview.jpg"), b"blurred").unwrap();
+
+        let chunks_dir = tmp.join("chunks");
+        let sealed: Value = serde_json::from_str(&seal_media_file_json(
+            alice["identity_seed"].as_str().unwrap(),
+            alice["card"].as_str().unwrap(),
+            bob["device_pub"].as_str().unwrap(),
+            &src,
+            "image/jpeg",
+            "image",
+            &tmp.join("preview.jpg"),
+            &chunks_dir,
+            false,
+            0,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(sealed["ok"], true, "{sealed}");
+        assert_eq!(sealed["chunk_count"], 3);
+
+        let bundle = sealed["bundle"].to_string();
+        let shares = sealed["shares"].to_string();
+
+        // step 1: the manifest tells the recipient what to fetch
+        let info: Value =
+            serde_json::from_str(&open_media_info_json(bob["device_seed"].as_str().unwrap(), &bundle, &shares, &tmp.join("pv.out")))
+                .unwrap();
+        assert_eq!(info["ok"], true, "{info}");
+        assert_eq!(info["mime_type"], "image/jpeg");
+        assert_eq!(info["kind"], "image");
+        assert_eq!(info["chunk_count"], 3);
+        assert_eq!(info["plaintext_size"], picture.len() as u64);
+        assert_eq!(std::fs::read(tmp.join("pv.out")).unwrap(), b"blurred");
+
+        // step 2: the app "downloads" the chunks — here, straight from where they were written
+        let out = tmp.join("out.jpg");
+        let done: Value = serde_json::from_str(&open_media_file_json(
+            bob["device_seed"].as_str().unwrap(),
+            &bundle,
+            &shares,
+            &chunks_dir,
+            &out,
+        ))
+        .unwrap();
+        assert_eq!(done["ok"], true, "{done}");
+        assert_eq!(std::fs::read(&out).unwrap(), picture, "reassembled bytes must be identical");
+    }
+
+    #[test]
+    fn wrong_device_cannot_open_media_and_a_missing_chunk_fails_loudly() {
+        let tmp = Tmp::new("neg");
+        let alice: Value = serde_json::from_str(&new_identity_json("Alice")).unwrap();
+        let bob: Value = serde_json::from_str(&new_identity_json("Bob")).unwrap();
+        let mallory: Value = serde_json::from_str(&new_identity_json("Mallory")).unwrap();
+
+        let src = tmp.join("in.bin");
+        std::fs::write(&src, vec![7u8; 4096]).unwrap();
+        let chunks_dir = tmp.join("chunks");
+        let sealed: Value = serde_json::from_str(&seal_media_file_json(
+            alice["identity_seed"].as_str().unwrap(),
+            alice["card"].as_str().unwrap(),
+            bob["device_pub"].as_str().unwrap(),
+            &src,
+            "video/mp4",
+            "video",
+            "",
+            &chunks_dir,
+            false,
+            0,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(sealed["ok"], true, "{sealed}");
+        let bundle = sealed["bundle"].to_string();
+        let shares = sealed["shares"].to_string();
+
+        // an item addressed to Bob must not open for Mallory, even holding every chunk
+        let bad: Value =
+            serde_json::from_str(&open_media_info_json(mallory["device_seed"].as_str().unwrap(), &bundle, &shares, "")).unwrap();
+        assert_eq!(bad["ok"], false, "media opened for the wrong device: {bad}");
+
+        // and a chunk the relay never served fails rather than yielding a truncated file
+        std::fs::remove_dir_all(&chunks_dir).unwrap();
+        std::fs::create_dir_all(&chunks_dir).unwrap();
+        let missing: Value = serde_json::from_str(&open_media_file_json(
+            bob["device_seed"].as_str().unwrap(),
+            &bundle,
+            &shares,
+            &chunks_dir,
+            &tmp.join("out.bin"),
+        ))
+        .unwrap();
+        assert_eq!(missing["ok"], false);
+        assert!(missing["reason"].as_str().unwrap().contains("missing"), "{missing}");
     }
 
     #[test]

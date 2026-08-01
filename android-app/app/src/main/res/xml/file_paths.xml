@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Only the decrypted-media directory is shareable, so an ACTION_VIEW intent can play a
+     video. Nothing else in app storage (seeds, transcripts, chunks) is exposed. -->
+<paths>
+    <files-path name="media" path="media/" />
+</paths>

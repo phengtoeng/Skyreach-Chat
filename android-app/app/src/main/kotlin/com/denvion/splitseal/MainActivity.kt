@@ -7,6 +7,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -132,6 +134,8 @@ private data class Msg(
     val sealedFor: String? = null, // set when sealed to a real contact's device key
     val revealAt: Long = 0, // unix secs: timelocked to open at/after this time (0 = none)
     val destroyAt: Long = 0, // unix secs: self-destructs after this time (0 = none)
+    val mediaPath: String = "", // decrypted file on THIS device only; never uploaded
+    val mediaMime: String = "",
 )
 
 private val CHATS = listOf(
@@ -226,11 +230,21 @@ private class Store(ctx: Context) {
     fun thread(peer: String): JSONArray =
         if (peer.isBlank()) JSONArray() else p.getString("thread_$peer", null)?.let { JSONArray(it) } ?: JSONArray()
     /** Append a message to a conversation (dedup by id); false if already stored. */
-    fun addThreadMsg(peer: String, id: String, text: String, incoming: Boolean): Boolean {
+    fun addThreadMsg(
+        peer: String,
+        id: String,
+        text: String,
+        incoming: Boolean,
+        media: String = "", // local path to the DECRYPTED file (this device only)
+        mime: String = "",
+    ): Boolean {
         if (peer.isBlank()) return false
         val a = thread(peer)
         for (i in 0 until a.length()) if (a.getJSONObject(i).optString("id") == id) return false
-        a.put(JSONObject().put("id", id).put("text", text).put("incoming", incoming).put("ts", System.currentTimeMillis()))
+        a.put(
+            JSONObject().put("id", id).put("text", text).put("incoming", incoming)
+                .put("ts", System.currentTimeMillis()).put("media", media).put("mime", mime)
+        )
         p.edit().putString("thread_$peer", a.toString()).apply()
         return true
     }
@@ -274,12 +288,21 @@ object Server {
     @Volatile var host: String = DEFAULT_HOST
     // The seal backbone runs on all 3 nodes (N5, N6, N7) so no single node is a point of failure.
     val nodeHosts = listOf("139.99.150.23", "51.79.176.134", "51.79.162.80")
+
+    /** True when Settings points us at one specific machine instead of the live backbone. */
+    private val pinned: Boolean get() = host.isNotBlank() && host != DEFAULT_HOST
+
     // Replicated relays: ship the ciphertext to ALL, read from ALL (merge) — delivery survives
     // any node outage as long as one relay that got the message is up.
-    val relays: List<String> get() = nodeHosts.map { "http://$it:9200" }
+    // Pinned to one host (dev/self-host), everything runs on that machine instead.
+    val relays: List<String> get() = if (pinned) listOf("http://$host:9200") else nodeHosts.map { "http://$it:9200" }
+
     // 3 INDEPENDENT gateways, one per node (t=2 of 3): no single machine holds all key shares,
-    // and any one gateway can be down and messages still open.
-    val gateways: List<String> get() = nodeHosts.map { "http://$it:9201" }
+    // and any one gateway can be down and messages still open. Pinned to one host they sit on
+    // consecutive ports — convenient for a local stack, but NOT independent, so dev only.
+    val gateways: List<String> get() =
+        if (pinned) listOf("http://$host:9201", "http://$host:9202", "http://$host:9203")
+        else nodeHosts.map { "http://$it:9201" }
     // Replicated directories (gossip + persist server-side): register to ALL, look up on ANY.
     val directories: List<String> get() = nodeHosts.map { "http://$it:9988" }
 }
@@ -384,6 +407,120 @@ private fun fetchInboxAll(tag: String): List<JSONObject> {
         }
     }
     return byId.values.toList()
+}
+
+/** Upload one encrypted media chunk to EVERY relay, addressed by its ciphertext hash.
+ *  The relay verifies the hash matches the bytes, so it cannot substitute a chunk — and it
+ *  holds no key, so it can never open one. True if at least one relay stored it. */
+private fun uploadBlob(hashHex: String, bytes: ByteArray): Boolean {
+    var ok = false
+    for (r in Server.relays) {
+        try {
+            val conn = (java.net.URL("$r/blob/$hashHex").openConnection() as java.net.HttpURLConnection).apply {
+                requestMethod = "PUT"; doOutput = true
+                connectTimeout = 8000; readTimeout = 60000 // uploads are not 4-second work
+                setRequestProperty("Content-Type", "application/octet-stream")
+                setFixedLengthStreamingMode(bytes.size) // stream it; don't buffer a second copy
+            }
+            conn.outputStream.use { it.write(bytes) }
+            if (conn.responseCode in 200..299) ok = true
+        } catch (_: Exception) { /* try the next relay */ }
+    }
+    return ok
+}
+
+/** Fetch one encrypted chunk from whichever relay still has it. */
+private fun downloadBlob(hashHex: String): ByteArray? {
+    for (r in Server.relays) {
+        try {
+            val conn = (java.net.URL("$r/blob/$hashHex").openConnection() as java.net.HttpURLConnection).apply {
+                connectTimeout = 8000; readTimeout = 60000
+            }
+            if (conn.responseCode == 200) return conn.inputStream.use { it.readBytes() }
+        } catch (_: Exception) { /* try the next relay */ }
+    }
+    return null
+}
+
+// ───────────────────────────── media send / receive ─────────────────────────
+//
+// The picked file is copied into the app cache, sealed by Rust into encrypted chunks on
+// disk, and only those chunks are uploaded. The readable original never leaves the device.
+
+/** Copy a picked content:// item into our cache so Rust can read it by path. */
+private fun cacheFromUri(ctx: Context, uri: android.net.Uri, name: String): java.io.File? = try {
+    val f = java.io.File(ctx.cacheDir, name)
+    ctx.contentResolver.openInputStream(uri)?.use { input -> f.outputStream().use { input.copyTo(it) } }
+    if (f.length() > 0) f else null
+} catch (_: Exception) { null }
+
+/**
+ * A deliberately TINY thumbnail: it is sealed inside the manifest, so it is only ever seen
+ * by the recipient — but keeping it small is what makes it a blur rather than a preview
+ * (spec §10.3: never a readable thumbnail for a locked item).
+ */
+private fun buildPreview(ctx: Context, src: java.io.File, isVideo: Boolean): java.io.File? = try {
+    val bmp = if (isVideo) {
+        android.media.MediaMetadataRetriever().use { it.setDataSource(src.path); it.getFrameAtTime(0) }
+    } else {
+        val opts = android.graphics.BitmapFactory.Options().apply { inSampleSize = 16 }
+        android.graphics.BitmapFactory.decodeFile(src.path, opts)
+    }
+    if (bmp == null) null else {
+        val small = android.graphics.Bitmap.createScaledBitmap(bmp, 32, 32, true)
+        val out = java.io.File(ctx.cacheDir, "preview-${System.nanoTime()}.jpg")
+        out.outputStream().use { small.compress(android.graphics.Bitmap.CompressFormat.JPEG, 60, it) }
+        out
+    }
+} catch (_: Exception) { null }
+
+/** Upload every encrypted chunk listed by `sealMediaFile`, then delete the local copies. */
+private fun uploadChunks(sealed: JSONObject): Boolean {
+    val chunks = sealed.optJSONArray("chunks") ?: return false
+    for (i in 0 until chunks.length()) {
+        val c = chunks.getJSONObject(i)
+        val f = java.io.File(c.optString("path"))
+        val bytes = runCatching { f.readBytes() }.getOrNull() ?: return false
+        if (!uploadBlob(c.optString("hash"), bytes)) return false
+        f.delete() // the relay has it now; no need to keep ciphertext on the sender
+    }
+    return true
+}
+
+/**
+ * Receive one media seal: open the manifest, fetch every chunk the relay is holding, then
+ * decrypt and reassemble. Returns (localPath, mime), or null while it is still locked or
+ * the chunks have not all arrived — the caller simply retries on the next poll.
+ */
+private fun receiveMedia(ctx: Context, deviceSeed: String, sealId: String, bundle: String, shares: String): Pair<String, String>? {
+    val previewPath = java.io.File(ctx.cacheDir, "pv-$sealId.jpg").path
+    val info = runCatching { JSONObject(SealCore.openMediaInfo(deviceSeed, bundle, shares, previewPath)) }.getOrNull() ?: return null
+    if (!info.optBoolean("ok")) return null // locked, or not enough shares released yet
+
+    val chunkDir = java.io.File(ctx.cacheDir, "chunks/$sealId").apply { mkdirs() }
+    val hashes = info.optJSONArray("chunks") ?: return null
+    for (i in 0 until hashes.length()) {
+        val h = hashes.getString(i)
+        val f = java.io.File(chunkDir, h)
+        if (f.exists()) continue // resume: never re-download a chunk we already hold
+        val bytes = downloadBlob(h) ?: return null
+        f.writeBytes(bytes)
+    }
+
+    val mime = info.optString("mime_type", "application/octet-stream")
+    val ext = when {
+        mime.startsWith("video") -> "mp4"
+        mime.contains("png") -> "png"
+        else -> "jpg"
+    }
+    val mediaDir = java.io.File(ctx.filesDir, "media").apply { mkdirs() }
+    val out = java.io.File(mediaDir, "$sealId.$ext")
+    val done = runCatching {
+        JSONObject(SealCore.openMediaFile(deviceSeed, bundle, shares, chunkDir.path, out.path))
+    }.getOrNull() ?: return null
+    if (!done.optBoolean("ok")) return null
+    chunkDir.deleteRecursively() // plaintext is assembled; the ciphertext copies are dead weight
+    return out.path to mime
 }
 
 /** Collect released shares for a seal from all gateways. */
@@ -1310,7 +1447,15 @@ private fun ConversationScreen(
                 val t = store.thread(chat.identityPub)
                 for (i in 0 until t.length()) {
                     val o = t.getJSONObject(i)
-                    add(Msg(System.nanoTime() + i, o.optString("text"), o.optBoolean("incoming"), "", state = State.OPENED))
+                    val media = o.optString("media")
+                    add(
+                        Msg(
+                            System.nanoTime() + i, o.optString("text"), o.optBoolean("incoming"), "",
+                            kind = if (media.isNotBlank()) Kind.IMAGE else Kind.TEXT,
+                            state = State.OPENED,
+                            mediaPath = media, mediaMime = o.optString("mime"),
+                        )
+                    )
                 }
             } else {
                 addAll(seedThread())
@@ -1340,6 +1485,33 @@ private fun ConversationScreen(
                 val bundle = item.optJSONObject("bundle") ?: continue
                 if (sealId.isBlank() || sealId in seen) continue
                 val shares = withContext(Dispatchers.IO) { collectShares(sealId) }
+
+                // Media arrives as a manifest, not as bytes: open the manifest, pull the
+                // chunks the relay is holding, then decrypt and reassemble locally.
+                if (bundle.optJSONObject("signed_leaf")?.optJSONObject("leaf")?.optString("content_type") == "Media") {
+                    val got = withContext(Dispatchers.IO) {
+                        receiveMedia(ctx, myDeviceSeed, sealId, bundle.toString(), shares)
+                    }
+                    if (got != null) {
+                        seen.add(sealId)
+                        val sender = bundle.optString("sender_id_pub")
+                        val label = if (got.second.startsWith("video")) "Video" else "Photo"
+                        if (store.addInbox(myTag, sealId, label, sender)) {
+                            store.addThreadMsg(sender, sealId, label, true, media = got.first, mime = got.second)
+                            if (sender == chat.identityPub) {
+                                messages.add(
+                                    Msg(
+                                        System.nanoTime(), label, true, now(), kind = Kind.IMAGE,
+                                        state = State.OPENED, mediaPath = got.first, mediaMime = got.second,
+                                    )
+                                )
+                                listState.animateScrollToItem(messages.lastIndex)
+                            }
+                        }
+                    }
+                    continue // still locked / chunks not all there yet → retry on the next poll
+                }
+
                 val opened = runCatching {
                     withContext(Dispatchers.IO) { JSONObject(SealCore.openReceived(myDeviceSeed, bundle.toString(), shares)) }
                 }.getOrNull()
@@ -1369,6 +1541,67 @@ private fun ConversationScreen(
     LaunchedEffect(myTag, real) {
         if (real && myTag.isNotBlank()) while (true) { poll(); delay(3000) }
     }
+
+    /**
+     * Seal and ship a picked photo/video. The readable file is copied into our cache only so
+     * Rust can chunk-encrypt it; ONLY the encrypted chunks are uploaded, and they go to the
+     * relay addressed by ciphertext hash. The sender's own copy stays local for the bubble.
+     */
+    fun sendMedia(uri: android.net.Uri) {
+        if (!real) {
+            android.widget.Toast.makeText(ctx, "Add this person as a contact first", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        val mime = ctx.contentResolver.getType(uri) ?: "image/jpeg"
+        val isVideo = mime.startsWith("video")
+        val label = if (isVideo) "Video" else "Photo"
+        messages.add(Msg(System.nanoTime(), label, false, now(), kind = Kind.IMAGE, state = State.SEALING, mode = if (fastMode) "FAST" else "STRICT"))
+        val idx = messages.lastIndex
+        val fast = fastMode
+        val rv = revealAt; val dz = destroyAt
+        revealAt = 0L; destroyAt = 0L
+        scope.launch {
+            listState.animateScrollToItem(messages.lastIndex)
+            val result = withContext(Dispatchers.IO) {
+                val src = cacheFromUri(ctx, uri, "pick-${System.nanoTime()}") ?: return@withContext null
+                val preview = buildPreview(ctx, src, isVideo)
+                val chunkDir = java.io.File(ctx.cacheDir, "out-${System.nanoTime()}")
+                val sealed = runCatching {
+                    JSONObject(
+                        SealCore.sealMediaFile(
+                            myIdentitySeed, myCard, chat.devicePub, src.path, mime,
+                            if (isVideo) "video" else "image",
+                            preview?.path ?: "", chunkDir.path, fast, rv, dz,
+                        )
+                    )
+                }.getOrNull()
+                preview?.delete()
+                if (sealed == null || !sealed.optBoolean("ok")) {
+                    chunkDir.deleteRecursively(); src.delete()
+                    return@withContext null
+                }
+                // upload the opaque chunks, then the manifest bundle + key shares
+                val up = uploadChunks(sealed)
+                chunkDir.deleteRecursively()
+                if (!up) { src.delete(); return@withContext null }
+                if (!shipSeal(sealed)) { src.delete(); return@withContext null }
+                // keep OUR readable copy locally so the sent bubble can render it
+                val mediaDir = java.io.File(ctx.filesDir, "media").apply { mkdirs() }
+                val mine = java.io.File(mediaDir, "sent-${sealed.optString("seal_id")}.${if (isVideo) "mp4" else "jpg"}")
+                src.copyTo(mine, overwrite = true); src.delete()
+                mine.path
+            }
+            if (result != null) {
+                messages[idx] = messages[idx].copy(state = State.OPENED, sealedFor = chat.name, mediaPath = result, mediaMime = mime)
+                store.addThreadMsg(chat.identityPub, "out-" + System.nanoTime(), label, false, media = result, mime = mime)
+            } else {
+                messages.removeAt(idx)
+                android.widget.Toast.makeText(ctx, "Couldn't send $label — check the server", android.widget.Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    val pickMedia = rememberMediaPicker { uri -> sendMedia(uri) }
 
     fun send() {
         val text = draft.trim()
@@ -1447,7 +1680,11 @@ private fun ConversationScreen(
             destroyAt > 0 -> "💥 Destroys in ${relLabel(destroyAt)}"
             else -> null
         }
-        Composer(draft, { draft = it }, timerLabel, { showTimer = true }, { revealAt = 0L; destroyAt = 0L }, ::send)
+        Composer(
+            draft, { draft = it }, timerLabel, { showTimer = true }, { revealAt = 0L; destroyAt = 0L },
+            onAttach = { pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)) },
+            onSend = ::send,
+        )
     }
 
     if (showTimer) TimedSealDialog(
@@ -1455,6 +1692,11 @@ private fun ConversationScreen(
         onPick = { r, d -> revealAt = r; destroyAt = d; showTimer = false },
     )
 }
+
+/** Photo/video picker. `PickVisualMedia` needs no storage permission. */
+@Composable
+private fun rememberMediaPicker(onPicked: (android.net.Uri) -> Unit) =
+    rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri -> uri?.let(onPicked) }
 
 @Composable
 private fun TimedSealDialog(onDismiss: () -> Unit, onPick: (Long, Long) -> Unit) {
@@ -1572,18 +1814,66 @@ private fun SealingContent(m: Msg) {
 
 @Composable
 private fun ImageContent(m: Msg) {
+    val ctx = LocalContext.current
+    val isVideo = m.mediaMime.startsWith("video")
+    // Decode the DECRYPTED local file. Nothing here ever touches the network — by this
+    // point the bytes exist in readable form only on this device.
+    val bmp = remember(m.mediaPath) {
+        if (m.mediaPath.isBlank()) null
+        else runCatching {
+            if (isVideo) {
+                android.media.MediaMetadataRetriever().use { it.setDataSource(m.mediaPath); it.getFrameAtTime(0) }
+            } else {
+                android.graphics.BitmapFactory.decodeFile(m.mediaPath, android.graphics.BitmapFactory.Options().apply { inSampleSize = 2 })
+            }
+        }.getOrNull()
+    }
     Column {
         Box(
-            Modifier.size(width = 220.dp, height = 130.dp).clip(RoundedCornerShape(12.dp))
-                .background(Brush.verticalGradient(listOf(Color(0xFFF6B26B), Color(0xFF6FA8DC), Color(0xFF2E5B8A)))),
-            contentAlignment = Alignment.BottomEnd,
+            Modifier.size(width = 220.dp, height = 160.dp).clip(RoundedCornerShape(12.dp))
+                .background(Color(0xFFDDE4EA))
+                .then(if (isVideo && m.mediaPath.isNotBlank()) Modifier.clickable { openExternally(ctx, m.mediaPath, m.mediaMime) } else Modifier),
+            contentAlignment = Alignment.Center,
         ) {
-            Row(Modifier.padding(6.dp), verticalAlignment = Alignment.CenterVertically) {
+            if (bmp != null) {
+                Image(
+                    bitmap = bmp.asImageBitmap(),
+                    contentDescription = if (isVideo) "Video" else "Photo",
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                )
+            } else {
+                // no decrypted file yet (placeholder / demo threads)
+                Box(
+                    Modifier.fillMaxSize()
+                        .background(Brush.verticalGradient(listOf(Color(0xFFF6B26B), Color(0xFF6FA8DC), Color(0xFF2E5B8A))))
+                )
+            }
+            if (isVideo) {
+                Box(Modifier.size(46.dp).background(Color(0x99000000), CircleShape), contentAlignment = Alignment.Center) {
+                    Icon(Icons.Filled.PlayArrow, "Play", tint = Color.White, modifier = Modifier.size(30.dp))
+                }
+            }
+            Row(Modifier.align(Alignment.BottomEnd).padding(6.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(m.time, color = Color.White, fontSize = 11.sp)
                 Spacer(Modifier.width(3.dp))
                 SealBadge()
             }
         }
+    }
+}
+
+/** Hand a decrypted file to a player/viewer via a FileProvider-free content-less intent. */
+private fun openExternally(ctx: Context, path: String, mime: String) {
+    runCatching {
+        val f = java.io.File(path)
+        val uri = androidx.core.content.FileProvider.getUriForFile(ctx, "${ctx.packageName}.files", f)
+        ctx.startActivity(
+            android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, mime)
+                addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+        )
     }
 }
 
@@ -1650,6 +1940,7 @@ private fun Composer(
     timerLabel: String?,
     onClock: () -> Unit,
     onClearTimer: () -> Unit,
+    onAttach: () -> Unit,
     onSend: () -> Unit,
 ) {
   Column(Modifier.fillMaxWidth().background(Color.White)) {
@@ -1671,6 +1962,9 @@ private fun Composer(
     ) {
         IconButton(onClick = onClock) {
             Icon(Icons.Filled.Schedule, "Timed seal", tint = if (timerLabel != null) Blue else Sub, modifier = Modifier.size(23.dp))
+        }
+        IconButton(onClick = onAttach) {
+            Icon(Icons.Filled.PhotoCamera, "Send photo or video", tint = Sub, modifier = Modifier.size(23.dp))
         }
         OutlinedTextField(
             value = value,

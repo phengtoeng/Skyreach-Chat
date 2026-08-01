@@ -10,7 +10,7 @@
 //!   GET  /mailbox/<hex mailbox_tag>   → JSON array of EncryptedEnvelope
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Write as _;
+use std::io::{Read, Write as _};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -54,6 +54,12 @@ pub fn serve_relay(addr: &str) -> Result<()> {
         println!("relay: {} peer(s) for gossip: {}", peers.len(), peers.join(", "));
     }
     println!("relay: persisting to {log_path}");
+    // Encrypted media chunks, content-addressed by ciphertext hash. Not gossiped: the
+    // client uploads to every relay itself, so replication costs one upload either way
+    // and peers never carry blobs nobody asked them for.
+    let blob_dir = format!("{data_dir}/blobs");
+    std::fs::create_dir_all(&blob_dir).ok();
+    println!("relay: media blobs in {blob_dir}");
     let gossip_http = reqwest::blocking::Client::builder().timeout(Duration::from_secs(4)).build().ok();
 
     for mut req in server.incoming_requests() {
@@ -64,6 +70,79 @@ pub fn serve_relay(addr: &str) -> Result<()> {
             .any(|h| h.field.as_str().as_str().eq_ignore_ascii_case("X-Gossip"));
         let method = req.method().clone();
         let url = req.url().to_string();
+
+        // ── media blob store ──────────────────────────────────────────────────
+        // Handled before the JSON routes because chunks are raw binary in and out.
+        // The relay stores opaque ciphertext: it holds no key and cannot open any of it.
+        // It CAN verify the content address, which is what stops it substituting a blob.
+        if let Some(rest) = url.strip_prefix("/blob/") {
+            let name = rest.trim_end_matches('/').to_string();
+            // The name becomes a filename, so it must be exactly a 64-char lowercase hex
+            // hash and nothing else. This is the path-traversal gate.
+            if name.len() != 64 || !name.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+                respond_json(req, 400, &json_err("blob name must be a 64-char lowercase hex hash"));
+                continue;
+            }
+            let path = format!("{blob_dir}/{name}");
+            match method {
+                tiny_http::Method::Put | tiny_http::Method::Post => {
+                    let mut bytes = Vec::new();
+                    // cap the read itself — never trust a Content-Length we were handed
+                    let mut limited = Read::take(req.as_reader(), MAX_BLOB_BYTES + 1);
+                    if limited.read_to_end(&mut bytes).is_err() {
+                        respond_json(req, 400, &json_err("unreadable body"));
+                        continue;
+                    }
+                    if bytes.len() as u64 > MAX_BLOB_BYTES {
+                        respond_json(req, 413, &json_err("blob too large"));
+                        continue;
+                    }
+                    // content-addressing check: the bytes must hash to the name they claim.
+                    if hex::encode(seal_crypto::hash("DSCP-1/media-chunk", &bytes)) != name {
+                        respond_json(req, 400, &json_err("blob does not match its content hash"));
+                        continue;
+                    }
+                    // already stored → idempotent, so a retried upload costs nothing.
+                    if std::path::Path::new(&path).exists() {
+                        respond_json(req, 200, r#"{"status":"exists"}"#);
+                        continue;
+                    }
+                    match std::fs::write(&path, &bytes) {
+                        Ok(()) => respond_json(req, 200, r#"{"status":"stored"}"#),
+                        Err(e) => respond_json(req, 500, &json_err(&format!("store: {e}"))),
+                    }
+                    continue;
+                }
+                tiny_http::Method::Get => {
+                    match std::fs::File::open(&path) {
+                        Ok(f) => {
+                            let hdr =
+                                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/octet-stream"[..])
+                                    .expect("static header");
+                            let len = f.metadata().ok().map(|m| m.len() as usize);
+                            let _ = req.respond(tiny_http::Response::new(
+                                tiny_http::StatusCode(200),
+                                vec![hdr],
+                                f,
+                                len,
+                                None,
+                            ));
+                        }
+                        Err(_) => respond_json(req, 404, &json_err("no such blob")),
+                    }
+                    continue;
+                }
+                tiny_http::Method::Head => {
+                    let code = if std::path::Path::new(&path).exists() { 200 } else { 404 };
+                    respond_json(req, code, "{}");
+                    continue;
+                }
+                _ => {
+                    respond_json(req, 405, &json_err("method not allowed"));
+                    continue;
+                }
+            }
+        }
 
         let (code, body): (u16, String) = match (method, url.as_str()) {
             (tiny_http::Method::Post, "/mailbox") => {
@@ -162,6 +241,20 @@ pub fn serve_relay(addr: &str) -> Result<()> {
         let _ = req.respond(response);
     }
     Ok(())
+}
+
+/// One encrypted media chunk, plus AEAD tag and nonce overhead. Chunks are 1 MiB
+/// (`seal_core::DEFAULT_CHUNK_SIZE`); the headroom absorbs framing without letting a
+/// caller stream something unbounded at us.
+const MAX_BLOB_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Reply with a JSON body and close. Used by the blob routes, which return early.
+fn respond_json(req: tiny_http::Request, code: u16, body: &str) {
+    let hdr = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).expect("static header");
+    let resp = tiny_http::Response::from_string(body.to_string())
+        .with_status_code(code)
+        .with_header(hdr);
+    let _ = req.respond(resp);
 }
 
 /// A stable dedup key for an inbox item: its `seal_id` if present, else a hash of the bytes.

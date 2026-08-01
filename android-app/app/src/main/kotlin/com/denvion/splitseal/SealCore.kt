@@ -20,6 +20,13 @@ object SealCore {
     private external fun nativeSealTo(devicePub: String, text: String, fast: Boolean): String
     private external fun nativeSealShippable(identitySeed: String, senderCard: String, devicePub: String, text: String, fast: Boolean, revealAt: Long, destroyAt: Long): String
     private external fun nativeOpenReceived(deviceSeed: String, bundle: String, shares: String): String
+    private external fun nativeSealMediaFile(
+        identitySeed: String, senderCard: String, devicePub: String, inPath: String,
+        mime: String, kind: String, previewPath: String, outDir: String,
+        fast: Boolean, revealAt: Long, destroyAt: Long,
+    ): String
+    private external fun nativeOpenMediaInfo(deviceSeed: String, bundle: String, shares: String, previewOut: String): String
+    private external fun nativeOpenMediaFile(deviceSeed: String, bundle: String, shares: String, chunkDir: String, outPath: String): String
 
     /** `{ "protocol":"DSCP-2", "version":2, "chain_id":7789 }` */
     fun version(): String = nativeVersion()
@@ -56,4 +63,42 @@ object SealCore {
 
     /** Open a collected message with the recipient's device seed. Returns {ok, plaintext} or {ok:false, reason}. */
     fun openReceived(deviceSeed: String, bundle: String, shares: String): String = nativeOpenReceived(deviceSeed, bundle, shares)
+
+    // ── media ──
+    // Media crosses this boundary as FILE PATHS, never as bytes: pushing a 40 MB video
+    // through JNI would cost several copies of it in RAM. Rust reads the source file and
+    // writes each encrypted chunk out as its own file; only JSON metadata crosses.
+
+    /**
+     * Seal a media file to a contact's device. Writes one encrypted chunk per file into
+     * `outDir`, named by its ciphertext hash. `previewPath` must ALREADY be a blurred /
+     * downscaled image — it is sealed inside the manifest and never uploaded on its own;
+     * pass "" for none.
+     *
+     * Returns `{ok, seal_id, mailbox_tag, bundle, shares, chunk_count, chunks:[{index,hash,path,size}]}`
+     * — the same bundle/shares shape a text seal produces, so `shipSeal` works unchanged.
+     */
+    fun sealMediaFile(
+        identitySeed: String, senderCard: String, devicePub: String, inPath: String,
+        mime: String, kind: String, previewPath: String, outDir: String,
+        fast: Boolean = false, revealAt: Long = 0, destroyAt: Long = 0,
+    ): String = nativeSealMediaFile(
+        identitySeed, senderCard, devicePub, inPath, mime, kind, previewPath, outDir, fast, revealAt, destroyAt,
+    )
+
+    /**
+     * Media step 1 — open the MANIFEST only, to learn what the item is and which chunks to
+     * fetch: `{ok, mime_type, kind, chunk_count, chunks:[hash], plaintext_size}`.
+     * Writes the locked preview to `previewOut` when the item carries one.
+     */
+    fun openMediaInfo(deviceSeed: String, bundle: String, shares: String, previewOut: String): String =
+        nativeOpenMediaInfo(deviceSeed, bundle, shares, previewOut)
+
+    /**
+     * Media step 2 — every chunk having been downloaded into `chunkDir` (each file named by
+     * its hex hash, exactly as `openMediaInfo` listed), decrypt and reassemble into `outPath`.
+     * A missing or altered chunk fails here rather than producing a corrupt file.
+     */
+    fun openMediaFile(deviceSeed: String, bundle: String, shares: String, chunkDir: String, outPath: String): String =
+        nativeOpenMediaFile(deviceSeed, bundle, shares, chunkDir, outPath)
 }
