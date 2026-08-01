@@ -1619,13 +1619,27 @@ struct TimedSealSheet: View {
     let onPick: (Int64, Int64) -> Void   // (revealAt, destroyAt) unix secs
     let onCancel: () -> Void
     @State private var mode = 0           // 0 = opens later, 1 = self-destruct
-    private let presets: [(String, Int64)] = [("1 min", 60), ("10 min", 600), ("1 hour", 3600), ("1 day", 86400)]
+    @State private var exact = false      // false = quick presets, true = calendar + clock
+    @State private var when = Date().addingTimeInterval(3600)
+    private let presets: [(String, Int64)] = [
+        ("1 min", 60), ("10 min", 600), ("1 hour", 3600),
+        ("1 day", 86400), ("3 days", 259200), ("1 week", 604800),
+    ]
+
+    private func commit(_ epoch: Int64) {
+        guard epoch > Int64(Date().timeIntervalSince1970) else { return } // never a past instant
+        mode == 0 ? onPick(epoch, 0) : onPick(0, epoch)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
-                Text("Timed seal").font(.system(size: 18, weight: .bold)).foregroundColor(.dvInk)
+                Text(exact ? "Pick date & time" : "Timed seal")
+                    .font(.system(size: 18, weight: .bold)).foregroundColor(.dvInk)
                 Spacer()
-                Button("Cancel", action: onCancel).foregroundColor(.dvSub)
+                Button(exact ? "Back" : "Cancel") {
+                    if exact { withAnimation(.easeInOut(duration: 0.22)) { exact = false } } else { onCancel() }
+                }.foregroundColor(.dvSub)
             }
             Text("The gateways enforce this — the key can't be assembled outside the window, so it's cryptographic, not just \"please delete\".")
                 .font(.system(size: 12)).foregroundColor(.dvSub)
@@ -1633,23 +1647,52 @@ struct TimedSealSheet: View {
                 Text("🔒 Opens later").tag(0)
                 Text("💥 Self-destruct").tag(1)
             }.pickerStyle(.segmented)
-            Text(mode == 0 ? "Opens after" : "Destroys after").font(.system(size: 13, weight: .semibold)).foregroundColor(.dvInk)
-            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-                ForEach(presets, id: \.0) { (label, secs) in
-                    Button(action: {
-                        let t = Int64(Date().timeIntervalSince1970) + secs
-                        mode == 0 ? onPick(t, 0) : onPick(0, t)
-                    }) {
-                        Text(label).font(.system(size: 15)).foregroundColor(.dvInk)
-                            .frame(maxWidth: .infinity).padding(.vertical, 14)
-                            .background(Color(hex: 0xF1F4F7)).clipShape(RoundedRectangle(cornerRadius: 10))
+
+            if exact {
+                // graphical style gives a real calendar + clock in one control
+                DatePicker(
+                    "",
+                    selection: $when,
+                    in: Date().addingTimeInterval(60)...,   // future only
+                    displayedComponents: [.date, .hourAndMinute]
+                )
+                .datePickerStyle(.graphical)
+                .labelsHidden()
+                .tint(.dvBlue)
+
+                Button(action: { commit(Int64(when.timeIntervalSince1970)) }) {
+                    Text((mode == 0 ? "Opens " : "Destroys ") + when.formatted(date: .abbreviated, time: .shortened))
+                        .font(.system(size: 15, weight: .semibold)).foregroundColor(.white)
+                        .frame(maxWidth: .infinity).padding(.vertical, 14)
+                        .background(Color.dvBlue).clipShape(RoundedRectangle(cornerRadius: 10))
+                }
+            } else {
+                Text(mode == 0 ? "Opens after" : "Destroys after")
+                    .font(.system(size: 13, weight: .semibold)).foregroundColor(.dvInk)
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+                    ForEach(presets, id: \.0) { (label, secs) in
+                        Button(action: { commit(Int64(Date().timeIntervalSince1970) + secs) }) {
+                            Text(label).font(.system(size: 15)).foregroundColor(.dvInk)
+                                .frame(maxWidth: .infinity).padding(.vertical, 14)
+                                .background(Color(hex: 0xF1F4F7)).clipShape(RoundedRectangle(cornerRadius: 10))
+                        }
                     }
                 }
+                Button(action: { withAnimation(.easeInOut(duration: 0.22)) { exact = true } }) {
+                    HStack {
+                        Image(systemName: "calendar")
+                        Text("Pick exact date & time").font(.system(size: 15, weight: .semibold))
+                    }
+                    .foregroundColor(.dvBlue)
+                    .frame(maxWidth: .infinity).padding(.vertical, 13)
+                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.dvBlue, lineWidth: 1))
+                }
             }
-            Spacer()
+            Spacer(minLength: 0)
         }
         .padding(20)
-        .presentationDetents([.height(340)])
+        .animation(.easeInOut(duration: 0.22), value: exact)
+        .presentationDetents([.height(exact ? 620 : 420)])
     }
 }
 

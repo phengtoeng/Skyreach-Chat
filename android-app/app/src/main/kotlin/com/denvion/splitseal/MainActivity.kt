@@ -12,6 +12,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -1794,46 +1795,144 @@ private fun rememberMediaPicker(onPicked: (android.net.Uri) -> Unit) =
     rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri -> uri?.let(onPicked) }
 
 @Composable
+@OptIn(ExperimentalMaterial3Api::class)
 private fun TimedSealDialog(onDismiss: () -> Unit, onPick: (Long, Long) -> Unit) {
     var mode by remember { mutableStateOf(0) } // 0 = timelock (opens later), 1 = self-destruct
-    val presets = listOf("1 min" to 60L, "10 min" to 600L, "1 hour" to 3600L, "1 day" to 86400L)
+    var page by remember { mutableStateOf(0) }  // 0 = quick presets, 1 = calendar, 2 = clock
+    val presets = listOf(
+        "1 min" to 60L, "10 min" to 600L, "1 hour" to 3600L,
+        "1 day" to 86400L, "3 days" to 259200L, "1 week" to 604800L,
+    )
+    val zone = remember { java.util.TimeZone.getDefault() }
+    val datePickerState = rememberDatePickerState(
+        initialSelectedDateMillis = System.currentTimeMillis(),
+        // A seal can only be set in the FUTURE, so past days are not selectable at all.
+        selectableDates = object : SelectableDates {
+            override fun isSelectableDate(utcTimeMillis: Long): Boolean {
+                val todayUtc = System.currentTimeMillis() - zone.getOffset(System.currentTimeMillis())
+                return utcTimeMillis >= todayUtc - 86_400_000L
+            }
+        },
+    )
+    val timePickerState = rememberTimePickerState(is24Hour = false)
+
+    /** Combine the picked day + time into a local unix timestamp. */
+    fun chosenEpoch(): Long {
+        val dayUtc = datePickerState.selectedDateMillis ?: return 0L
+        // DatePicker hands back UTC midnight; rebuild the day in the LOCAL calendar so
+        // "3pm" means 3pm where the user is, not 3pm UTC.
+        val cal = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"))
+        cal.timeInMillis = dayUtc
+        val local = java.util.Calendar.getInstance()
+        local.set(
+            cal.get(java.util.Calendar.YEAR), cal.get(java.util.Calendar.MONTH), cal.get(java.util.Calendar.DAY_OF_MONTH),
+            timePickerState.hour, timePickerState.minute, 0,
+        )
+        local.set(java.util.Calendar.MILLISECOND, 0)
+        return local.timeInMillis / 1000
+    }
+
+    fun commit(epoch: Long) {
+        if (epoch <= System.currentTimeMillis() / 1000) return // never accept a past instant
+        if (mode == 0) onPick(epoch, 0L) else onPick(0L, epoch)
+    }
+
+    // The calendar gets Material3's own DatePickerDialog: a DatePicker embedded in a plain
+    // AlertDialog is squeezed to the alert's width and clips the last weekday column.
+    if (page == 1) {
+        DatePickerDialog(
+            onDismissRequest = onDismiss,
+            confirmButton = {
+                TextButton(onClick = { page = 2 }) { Text("Next", color = Blue, fontWeight = FontWeight.SemiBold) }
+            },
+            dismissButton = { TextButton(onClick = { page = 0 }) { Text("Back", color = Sub) } },
+        ) {
+            DatePicker(state = datePickerState, showModeToggle = true)
+        }
+        return
+    }
+
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Timed seal") },
+        title = { Text(if (page == 0) "Timed seal" else "Pick a time") },
         text = {
-            Column {
-                Text(
-                    "The gateways enforce this — the key can't be assembled outside the window, so it's cryptographic, not just \"please delete\".",
-                    color = Sub, fontSize = 12.sp,
-                )
-                Spacer(Modifier.height(14.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    ModeChip("🔒 Opens later", mode == 0) { mode = 0 }
-                    ModeChip("💥 Self-destruct", mode == 1) { mode = 1 }
-                }
-                Spacer(Modifier.height(16.dp))
-                Text(if (mode == 0) "Opens after" else "Destroys after", color = Ink, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(8.dp))
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    presets.chunked(2).forEach { row ->
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            row.forEach { (label, secs) ->
-                                Box(
-                                    Modifier.weight(1f).clip(RoundedCornerShape(10.dp)).background(Color(0xFFF1F4F7))
-                                        .clickable {
-                                            val t = System.currentTimeMillis() / 1000 + secs
-                                            if (mode == 0) onPick(t, 0L) else onPick(0L, t)
-                                        }.padding(vertical = 12.dp),
-                                    contentAlignment = Alignment.Center,
-                                ) { Text(label, color = Ink, fontSize = 14.sp) }
+            // animateContentSize keeps the dialog from snapping between pages
+            Column(Modifier.animateContentSize()) {
+                if (page == 0) {
+                    Text(
+                        "The gateways enforce this — the key can't be assembled outside the window, so it's cryptographic, not just \"please delete\".",
+                        color = Sub, fontSize = 12.sp,
+                    )
+                    Spacer(Modifier.height(14.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        ModeChip("🔒 Opens later", mode == 0) { mode = 0 }
+                        ModeChip("💥 Self-destruct", mode == 1) { mode = 1 }
+                    }
+                    Spacer(Modifier.height(16.dp))
+                    Text(
+                        if (mode == 0) "Opens after" else "Destroys after",
+                        color = Ink, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        presets.chunked(2).forEach { row ->
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                row.forEach { (label, secs) ->
+                                    Box(
+                                        Modifier.weight(1f).clip(RoundedCornerShape(10.dp)).background(Color(0xFFF1F4F7))
+                                            .clickable { commit(System.currentTimeMillis() / 1000 + secs) }
+                                            .padding(vertical = 12.dp),
+                                        contentAlignment = Alignment.Center,
+                                    ) { Text(label, color = Ink, fontSize = 14.sp) }
+                                }
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    Row(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+                            .border(1.dp, Blue, RoundedCornerShape(10.dp))
+                            .clickable { page = 1 }.padding(vertical = 12.dp),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(Icons.Filled.CalendarMonth, null, tint = Blue, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Pick exact date & time", color = Blue, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                } else {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+                        TimePicker(state = timePickerState)
+                        Spacer(Modifier.height(6.dp))
+                        val e = chosenEpoch()
+                        if (e > 0) {
+                            val fmt = SimpleDateFormat("EEE d MMM yyyy · h:mm a", Locale.getDefault())
+                            Text(
+                                (if (mode == 0) "Opens " else "Destroys ") + fmt.format(Date(e * 1000)),
+                                color = if (e > System.currentTimeMillis() / 1000) Ink else Color(0xFFE0403A),
+                                fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+                            )
+                            if (e <= System.currentTimeMillis() / 1000) {
+                                Text("Pick a time in the future", color = Color(0xFFE0403A), fontSize = 11.sp)
                             }
                         }
                     }
                 }
             }
         },
-        confirmButton = {},
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel", color = Sub) } },
+        confirmButton = {
+            if (page == 2) {
+                TextButton(
+                    onClick = { commit(chosenEpoch()) },
+                    enabled = chosenEpoch() > System.currentTimeMillis() / 1000,
+                ) { Text("Set", color = Blue, fontWeight = FontWeight.SemiBold) }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = { if (page == 0) onDismiss() else page = 1 }) {
+                Text(if (page == 0) "Cancel" else "Back", color = Sub)
+            }
+        },
     )
 }
 
