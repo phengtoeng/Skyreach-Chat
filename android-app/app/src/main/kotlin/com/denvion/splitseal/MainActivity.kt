@@ -153,6 +153,12 @@ private data class Msg(
     val mediaMime: String = "",
     /** Set on a LOCKED placeholder so the real item can replace it when the window opens. */
     val lockedSealId: String = "",
+    /** The seal this bubble came from, so the live poll can tell "already on screen" apart from
+     *  "already in the store". Those are NOT the same thing: two poll loops run concurrently (the
+     *  chat list and the open conversation), and whichever gets there first consumes the store's
+     *  one-shot dedup — which used to mean the message never appeared until you left the chat and
+     *  came back. Dedup the UI on this, not on the store's return value. */
+    val sealId: String = "",
 )
 
 private val CHATS = listOf(
@@ -1676,18 +1682,21 @@ private fun ConversationScreen(
                         // carry the destroy deadline across: the recipient's copy must burn too,
                         // otherwise a "self-destruct" only ever removed the sender's side.
                         val dz = bundle.optLong("destroy_at")
+                        // persist once …
                         if (store.addInbox(myTag, sealId, label, sender)) {
                             store.addThreadMsg(sender, sealId, label, true, media = got.first, mime = got.second, destroyAt = dz)
-                            if (sender == chat.identityPub) {
-                                messages.add(
-                                    Msg(
-                                        System.nanoTime(), label, true, now(), kind = Kind.IMAGE,
-                                        state = State.OPENED, mediaPath = got.first, mediaMime = got.second,
-                                        destroyAt = dz,
-                                    )
+                        }
+                        // … and append to the open conversation independently of that dedup, or a
+                        // photo that the chat-list poll persisted first never shows up live.
+                        if (sender == chat.identityPub && messages.none { it.sealId == sealId }) {
+                            messages.add(
+                                Msg(
+                                    System.nanoTime(), label, true, now(), kind = Kind.IMAGE,
+                                    state = State.OPENED, mediaPath = got.first, mediaMime = got.second,
+                                    destroyAt = dz, sealId = sealId,
                                 )
-                                listState.animateScrollToItem(messages.lastIndex)
-                            }
+                            )
+                            listState.animateScrollToItem(messages.lastIndex)
                         }
                     }
                     continue // still locked / chunks not all there yet → retry on the next poll
@@ -1701,12 +1710,17 @@ private fun ConversationScreen(
                     val text = opened.optString("plaintext")
                     val sender = bundle.optString("sender_id_pub") // sender's stable identity_pub
                     // dedup on the opened seal, persist to the sender's transcript, show if it's THIS chat.
+                    // Persist once (addInbox is a one-shot dedup) …
                     if (store.addInbox(myTag, sealId, text, sender)) {
                         store.addThreadMsg(sender, sealId, text, true)
-                        if (sender == chat.identityPub) {
-                            messages.add(Msg(System.nanoTime(), text, true, now(), state = State.OPENED))
-                            listState.animateScrollToItem(messages.lastIndex)
-                        }
+                    }
+                    // … but decide the on-screen append SEPARATELY. The chat-list poll and this
+                    // conversation poll both run, and if the list one persists the message first
+                    // it eats the dedup — so gating the UI on addInbox() meant the bubble never
+                    // appeared until the user left the chat and came back.
+                    if (sender == chat.identityPub && messages.none { it.sealId == sealId }) {
+                        messages.add(Msg(System.nanoTime(), text, true, now(), state = State.OPENED, sealId = sealId))
+                        listState.animateScrollToItem(messages.lastIndex)
                     }
                 } else if (opened?.optString("reason") == "destroyed") {
                     seen.add(sealId) // self-destructed before it was opened → stop retrying, never shows
