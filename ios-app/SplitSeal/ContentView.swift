@@ -1031,6 +1031,9 @@ struct NewContactView: View {
     @State private var sync = true
     @State private var country = iosCountries[0]
     @State private var showSync = false
+    @State private var codeInput = ""
+
+    private var codeReady: Bool { !codeInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
     private func doSave() {
         onSave(first.trimmingCharacters(in: .whitespaces), last.trimmingCharacters(in: .whitespaces), phone.trimmingCharacters(in: .whitespaces))
@@ -1105,17 +1108,43 @@ struct NewContactView: View {
                     }
                     .background(Color.white).clipShape(RoundedRectangle(cornerRadius: 14))
 
-                    // Paste the denvion: contact code directly — one button, no editable field
-                    // (an editable field pops the text-selection Magnifier, which crashes on the emulator).
+                    // Add by the denvion: contact code. The field is EDITABLE so a code can be
+                    // typed, or pasted with the keyboard's own long-press ▸ Paste.
+                    //
+                    // The clipboard button is SwiftUI's `PasteButton`, not a plain button reading
+                    // UIPasteboard: since iOS 16 a programmatic `UIPasteboard.general.string` read
+                    // pops an "Allow Paste?" prompt and returns nil unless the user confirms it,
+                    // which surfaced here as "Not a contact code" for a perfectly good code.
+                    // PasteButton is granted access without any prompt.
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Or add by contact code").font(.system(size: 13)).foregroundColor(.dvSub)
-                        Text("On the other phone: Settings ▸ Copy my code, then tap Paste here.")
+                        Text("On the other phone: Settings ▸ Copy my code. Paste or type it here.")
                             .font(.system(size: 11)).foregroundColor(.dvSub)
-                        Button(action: { onPasteCode(UIPasteboard.general.string ?? "") }) {
-                            Label("Paste contact code", systemImage: "doc.on.clipboard")
-                                .font(.system(size: 15, weight: .semibold)).foregroundColor(.white)
-                                .frame(maxWidth: .infinity).padding(.vertical, 14)
-                                .background(Color.dvBlue).clipShape(RoundedRectangle(cornerRadius: 10))
+
+                        TextField("denvion:…", text: $codeInput, axis: .vertical)
+                            .lineLimit(1...3)
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundColor(.dvInk)
+                            .autocorrectionDisabled()
+                            .textInputAutocapitalization(.never)
+                            .padding(12)
+                            .background(Color(hex: 0xF1F4F7))
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+
+                        HStack(spacing: 10) {
+                            PasteButton(payloadType: String.self) { items in
+                                if let s = items.first { codeInput = s }
+                            }
+                            .labelStyle(.titleAndIcon)
+                            .tint(.dvBlue)
+
+                            Button(action: { onPasteCode(codeInput) }) {
+                                Text("Use this code")
+                                    .font(.system(size: 15, weight: .semibold)).foregroundColor(.white)
+                                    .frame(maxWidth: .infinity).padding(.vertical, 12)
+                                    .background(codeReady ? Color.dvBlue : Color(hex: 0xCBD3DA))
+                                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                            }.disabled(!codeReady)
                         }
                     }
                     .padding(16).background(Color.white).clipShape(RoundedRectangle(cornerRadius: 14))

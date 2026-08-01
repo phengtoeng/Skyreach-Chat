@@ -147,6 +147,10 @@ fn seal_shippable_json(
 /// device from `device_seed`, then open the `bundle` (from the relay) with the `shares`
 /// (from the gateways). By the time shares are in hand the gateways have already gated
 /// on finality, so this treats the seal as finalised.
+///
+/// Refuses MEDIA leaves outright: a media envelope carries a bincode `MediaManifest`, and
+/// running it through here would hand the app binary that `from_utf8_lossy` turns into a
+/// bubble full of replacement characters. Callers must route media to `ss_open_media_info`.
 fn open_received_json(device_seed_hex: &str, bundle_str: &str, shares_str: &str) -> String {
     let recipient = sc::DeviceKey::from_seed(seed_from_hex(device_seed_hex));
     let Ok(bundle): Result<Value, _> = serde_json::from_str(bundle_str) else {
@@ -163,6 +167,19 @@ fn open_received_json(device_seed_hex: &str, bundle_str: &str, shares_str: &str)
     let (Some(envelope), Some(signed_leaf), Some(sender_pub)) = (envelope, signed_leaf, sender_pub) else {
         return json!({ "ok": false, "reason": "incomplete bundle" }).to_string();
     };
+
+    // A media envelope holds a bincode MediaManifest, not text. Opening it here would hand the
+    // caller binary that renders as a bubble full of replacement characters, so refuse it and
+    // say where to go instead — an app that predates media support then shows nothing rather
+    // than garbage.
+    if signed_leaf.leaf.content_type != ContentType::Text {
+        return json!({
+            "ok": false,
+            "reason": "not a text item — open media with ss_open_media_info / ss_open_media_file",
+            "content_type": kind_of(signed_leaf.leaf.content_type),
+        })
+        .to_string();
+    }
 
     // Timelock enforcement (defense-in-depth; the gateways are the primary gate that withholds
     // the shares outside the window). Refuse to open before reveal_at or after destroy_at.
@@ -204,6 +221,16 @@ fn kind_from_str(s: &str) -> ContentKind {
         "audio" => ContentKind::Audio,
         "file" => ContentKind::File,
         _ => ContentKind::Image,
+    }
+}
+
+/// Label for a leaf's content type, for error reporting.
+fn kind_of(c: ContentType) -> &'static str {
+    match c {
+        ContentType::Text => "text",
+        ContentType::Media => "media",
+        ContentType::Document => "document",
+        ContentType::CallSession => "call_session",
     }
 }
 
@@ -1164,6 +1191,42 @@ mod tests {
         .unwrap();
         assert_eq!(done["ok"], true, "{done}");
         assert_eq!(std::fs::read(&out).unwrap(), picture, "reassembled bytes must be identical");
+    }
+
+    #[test]
+    fn a_media_seal_never_opens_through_the_text_path() {
+        // Regression: a media envelope carries a bincode manifest. Opening it as text handed
+        // the app binary, which rendered as a bubble of U+FFFD replacement characters.
+        let tmp = Tmp::new("mixed");
+        let alice: Value = serde_json::from_str(&new_identity_json("Alice")).unwrap();
+        let bob: Value = serde_json::from_str(&new_identity_json("Bob")).unwrap();
+        let src = tmp.join("in.jpg");
+        std::fs::write(&src, vec![9u8; 2048]).unwrap();
+        let sealed: Value = serde_json::from_str(&seal_media_file_json(
+            alice["identity_seed"].as_str().unwrap(),
+            alice["card"].as_str().unwrap(),
+            bob["device_pub"].as_str().unwrap(),
+            &src,
+            "image/jpeg",
+            "image",
+            "",
+            &tmp.join("chunks"),
+            false,
+            0,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(sealed["ok"], true, "{sealed}");
+
+        let opened: Value = serde_json::from_str(&open_received_json(
+            bob["device_seed"].as_str().unwrap(),
+            &sealed["bundle"].to_string(),
+            &sealed["shares"].to_string(),
+        ))
+        .unwrap();
+        assert_eq!(opened["ok"], false, "text path must refuse a media seal: {opened}");
+        assert_eq!(opened["content_type"], "media");
+        assert!(opened.get("plaintext").is_none(), "must never hand back manifest bytes");
     }
 
     #[test]
