@@ -551,6 +551,33 @@ func finalizedSlot() async -> Int64 {
     return 0
 }
 
+/// The chain slot at which THIS seal was anchored, verified by us.
+///
+/// Asks the gateways for the anchor tx signature, fetches that transaction from a WCAHT node,
+/// and hands both to Rust — which recomputes the leaf hash from the bundle we already hold and
+/// requires the anchor to have paid exactly that address. So the answer rests on a transaction
+/// the chain confirmed, not on any gateway's claim. 0 = no verifiable anchor (yet).
+func verifiedAnchorSlot(_ sealId: String, _ bundle: String) async -> Int64 {
+    for gw in gatewayURLs {
+        guard let meta = await httpGet("\(gw)/anchor/\(sealId)"),
+              let d = (try? JSONSerialization.jsonObject(with: Data(meta.utf8))) as? [String: Any],
+              let sig = d["signature"] as? String, !sig.isEmpty else { continue }
+        for h in nodeHosts {
+            guard let txJson = await httpGet("http://\(h):8901/transaction/\(sig)") else { continue }
+            let r = SealCore.verifyAnchor(bundle, txJson)
+            if let v = (try? JSONSerialization.jsonObject(with: Data(r.utf8))) as? [String: Any] {
+                if (v["ok"] as? Bool) == true {
+                    return (v["anchor_slot"] as? NSNumber)?.int64Value ?? 0
+                }
+                // An anchor that commits a DIFFERENT leaf is not a missing anchor — it means the
+                // bundle we hold is not the one that was committed. Refuse it outright.
+                if (v["reason"] as? String) == "anchor commits a different leaf" { return -1 }
+            }
+        }
+    }
+    return 0
+}
+
 func collectShares(_ sealId: String) async -> String {
     var all: [Any] = []
     for gw in gatewayURLs {
@@ -1516,6 +1543,9 @@ struct ConversationView: View {
                   let bundleStr = String(data: bd, encoding: .utf8) else { continue }
             let sender = (item["bundle"] as? [String: Any])?["sender_id_pub"] as? String ?? ""
             let shares = await collectShares(sealId)
+            // If an anchor exists and contradicts this bundle, the bundle is not what was
+            // committed on-chain — drop it rather than opening it.
+            if await verifiedAnchorSlot(sealId, bundleStr) < 0 { seen.insert(sealId); continue }
 
             // Media arrives as a manifest, not as bytes: open the manifest, pull the chunks
             // the relay is holding, then decrypt and reassemble locally.

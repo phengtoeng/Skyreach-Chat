@@ -573,6 +573,31 @@ private fun receiveMedia(ctx: Context, deviceSeed: String, sealId: String, bundl
     return Triple(out.path, mime, info.optString("caption"))
 }
 
+/**
+ * The chain slot at which THIS seal was anchored, verified by us.
+ *
+ * Asks the gateways for the anchor tx signature, fetches that transaction from a WCAHT node,
+ * and hands both to Rust — which recomputes the leaf hash from the bundle we already hold and
+ * requires the anchor to have paid exactly that address. So the answer rests on a transaction
+ * the chain confirmed, not on any gateway's claim. 0 = no verifiable anchor (yet).
+ */
+private fun verifiedAnchorSlot(sealId: String, bundle: String): Long {
+    for (gw in Server.gateways) {
+        val meta = httpGet("$gw/anchor/$sealId") ?: continue
+        val sig = runCatching { JSONObject(meta).optString("signature") }.getOrNull().orEmpty()
+        if (sig.isBlank()) continue
+        for (h in Server.nodeHosts) {
+            val txJson = httpGet("http://$h:8901/transaction/$sig") ?: continue
+            val v = runCatching { JSONObject(SealCore.verifyAnchor(bundle, txJson)) }.getOrNull() ?: continue
+            if (v.optBoolean("ok")) return v.optLong("anchor_slot")
+            // An anchor that commits a DIFFERENT leaf is not a missing anchor — it means the
+            // bundle we hold is not the one that was committed. Refuse it outright.
+            if (v.optString("reason") == "anchor commits a different leaf") return -1L
+        }
+    }
+    return 0
+}
+
 /** Collect released shares for a seal from all gateways. */
 private fun collectShares(sealId: String): String {
     val all = JSONArray()
@@ -1570,6 +1595,12 @@ private fun ConversationScreen(
                 val bundle = item.optJSONObject("bundle") ?: continue
                 if (sealId.isBlank() || sealId in seen) continue
                 val shares = withContext(Dispatchers.IO) { collectShares(sealId) }
+                // If an anchor exists and contradicts this bundle, the bundle is not what was
+                // committed on-chain — drop it rather than opening it.
+                if (withContext(Dispatchers.IO) { verifiedAnchorSlot(sealId, bundle.toString()) } < 0) {
+                    seen.add(sealId)
+                    continue
+                }
 
                 // Media arrives as a manifest, not as bytes: open the manifest, pull the
                 // chunks the relay is holding, then decrypt and reassemble locally.

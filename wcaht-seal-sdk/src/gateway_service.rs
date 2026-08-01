@@ -30,6 +30,9 @@ struct GwStore {
     /// before this seal's share may be released. Wall-clock windows depend on somebody's
     /// system clock; this one depends on the chain having actually advanced.
     floors: HashMap<String, u64>,
+    /// seal_id hex -> (anchor tx signature, slot). Served so a recipient can fetch the anchor
+    /// and verify it against its OWN leaf, rather than taking this gateway's word for anything.
+    anchors: HashMap<String, (String, u64)>,
 }
 
 /// Extract a timelock window from a `{signed_leaf, sender_id_pub}` body, but only if the leaf
@@ -92,6 +95,35 @@ fn verify_window(body: &str, sid_hex: &str, store: &Arc<Mutex<GwStore>>) -> Resu
     Ok(Some((leaf.leaf.reveal_at_unix as i64, leaf.leaf.destroy_at_unix as i64)))
 }
 
+/// The leaf hash of an already-verified `{signed_leaf, ...}` body. Only call after
+/// `verify_window` returned Ok — this does no checking of its own.
+fn verified_leaf_hash(body: &str) -> Option<[u8; 32]> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    let leaf: SignedLeaf = serde_json::from_value(v.get("signed_leaf")?.clone()).ok()?;
+    Some(leaf.leaf.leaf_hash())
+}
+
+/// Submit an anchor transfer committing `leaf_hash` as its recipient address, and return
+/// `(signature, slot)` once the chain confirms it.
+fn anchor_leaf(
+    signer: &crate::AnchorSigner,
+    rpc: &crate::WcahtRpc,
+    leaf_hash: &[u8; 32],
+    api_key: Option<&str>,
+) -> Result<(String, u64)> {
+    let (blockhash, slot) = rpc.recent_blockhash()?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let fee: u64 = std::env::var("WCAHT_ANCHOR_FEE").ok().and_then(|v| v.parse().ok()).unwrap_or(25_000);
+    let tx = signer.anchor_tx(leaf_hash, &blockhash, slot + 150, now, fee)?;
+    let resp = rpc.submit_tx(&tx, api_key)?;
+    let sig = tx.get("signature").and_then(Value::as_str).unwrap_or_default().to_string();
+    if sig.is_empty() {
+        return Err(anyhow!("anchor tx has no signature: {resp}"));
+    }
+    // The recipient re-verifies against the chain anyway; the slot here is a hint.
+    Ok((sig, rpc.finalized_slot().unwrap_or(slot)))
+}
+
 fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
@@ -102,6 +134,18 @@ pub fn serve_gateway(addr: &str) -> Result<()> {
     let store = Arc::new(Mutex::new(GwStore::default()));
     // WCAHT_RPC=http://host:8901 lets this gateway verify chain time itself.
     let chain_rpc = std::env::var("WCAHT_RPC").ok().map(|u| crate::WcahtRpc::new(&u));
+    // Anchoring is opt-in: it costs a real fee, so it needs an explicitly funded account.
+    let anchor_signer = std::env::var("WCAHT_ANCHOR_SEED")
+        .ok()
+        .and_then(|h| hex::decode(h.trim()).ok())
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .map(|seed| crate::AnchorSigner::from_seed(&seed));
+    let anchor_api_key = std::env::var("WCAHT_API_KEY").ok();
+    match (&anchor_signer, &chain_rpc) {
+        (Some(sg), Some(_)) => println!("gateway: anchoring ON from {}", sg.address()),
+        (Some(_), None) => println!("gateway: WCAHT_ANCHOR_SEED set but WCAHT_RPC is not — anchoring OFF"),
+        (None, _) => println!("gateway: WCAHT_ANCHOR_SEED unset — seals will not be anchored on-chain"),
+    }
     match &chain_rpc {
         Some(_) => println!("gateway: chain gate ON (WCAHT_RPC set) — finality and timelock both verified against the chain"),
         None => println!(
@@ -142,9 +186,13 @@ pub fn serve_gateway(addr: &str) -> Result<()> {
                 let _ = req.as_reader().read_to_string(&mut buf);
                 let mut window: Option<(i64, i64)> = None;
                 let mut rejected: Option<String> = None;
+                let mut leaf_hash_seen: Option<[u8; 32]> = None;
                 if !buf.trim().is_empty() {
                     match verify_window(&buf, &sid, &store) {
-                        Ok(Some(w)) => window = Some(w),
+                        Ok(Some(w)) => {
+                            window = Some(w);
+                            leaf_hash_seen = verified_leaf_hash(&buf);
+                        }
                         Ok(None) => {}                      // no leaf supplied → no window
                         Err(e) => rejected = Some(e),
                     }
@@ -163,11 +211,30 @@ pub fn serve_gateway(addr: &str) -> Result<()> {
                 } else if !chain_says_final {
                     (425, err_json("chain has not finalised this seal — send the signed leaf and wait"))
                 } else {
-                    let mut s = store.lock().unwrap();
-                    s.finalised.insert(sid.clone());
-                    if let Some((r, d)) = window {
-                        if r > 0 || d > 0 {
-                            s.windows.insert(sid, (r, d));
+                    {
+                        let mut s = store.lock().unwrap();
+                        s.finalised.insert(sid.clone());
+                        if let Some((r, d)) = window {
+                            if r > 0 || d > 0 {
+                                s.windows.insert(sid.clone(), (r, d));
+                            }
+                        }
+                    }
+                    // Anchor the verified leaf on-chain, once per seal. The leaf hash becomes
+                    // the transfer's recipient address, so the resulting transaction IS the
+                    // chain's attestation that this leaf existed — which the recipient can
+                    // verify itself with ss_verify_anchor.
+                    if let (Some(signer), Some(rpc), Some(lh)) =
+                        (anchor_signer.as_ref(), chain_rpc.as_ref(), leaf_hash_seen)
+                    {
+                        let already = store.lock().unwrap().anchors.contains_key(&sid);
+                        if !already {
+                            match anchor_leaf(signer, rpc, &lh, anchor_api_key.as_deref()) {
+                                Ok((sig, slot)) => {
+                                    store.lock().unwrap().anchors.insert(sid.clone(), (sig, slot));
+                                }
+                                Err(e) => eprintln!("gateway: anchoring {sid} failed: {e}"),
+                            }
                         }
                     }
                     (200, r#"{"status":"finalised"}"#.to_string())
@@ -205,6 +272,13 @@ pub fn serve_gateway(addr: &str) -> Result<()> {
                 } else {
                     let shares = s.shares.get(sid).cloned().unwrap_or_default();
                     (200, serde_json::to_string(&shares).unwrap_or_else(|_| "[]".into()))
+                }
+            }
+            (tiny_http::Method::Get, path) if path.starts_with("/anchor/") => {
+                let sid = &path["/anchor/".len()..];
+                match store.lock().unwrap().anchors.get(sid) {
+                    Some((sig, slot)) => (200, serde_json::json!({ "signature": sig, "slot": slot }).to_string()),
+                    None => (404, err_json("no anchor for this seal")),
                 }
             }
             _ => (404, err_json("not found")),
