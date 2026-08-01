@@ -83,6 +83,8 @@ fn main() -> Result<()> {
         chain.slot(),
         100_000,
         SealMode::StrictSeal,
+        0,
+        0,
     )?;
     let item = &sealed.item;
     let seal_id = item.signed_leaf.leaf.seal_id;

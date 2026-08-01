@@ -62,6 +62,11 @@ pub struct SealLeaf {
     pub threshold_n: u8,
     pub not_before_finalized_slot: u64,
     pub expires_at_slot: u64,
+    /// Timelock window, unix seconds, 0 = none. These live IN the leaf so they are covered by
+    /// the sender signature and by the leaf hash that is anchored on-chain — a relay cannot
+    /// move a deadline, and a patched client cannot ignore one (see `try_open_inner`).
+    pub reveal_at_unix: u64,
+    pub destroy_at_unix: u64,
     pub flags: u32,
     /// DSCP-2 release discipline (StrictSeal vault vs FastSeal fast-path).
     pub mode: SealMode,
@@ -126,6 +131,15 @@ pub struct KeyShareEnvelope {
 }
 
 // ───────────────────────────── commitments / AAD ────────────────────────────
+
+/// Wall-clock seconds. Used only for the leaf's timelock window; every other gate is
+/// slot-based and read from the chain.
+pub fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 pub fn device_commitment(device_pub: &[u8; 32]) -> [u8; 32] {
     sc::hash("DSCP-1/device", device_pub)
@@ -959,6 +973,8 @@ pub fn seal_media_with_mode(
     current_slot: u64,
     ttl_slots: u64,
     mode: SealMode,
+    reveal_at_unix: u64,
+    destroy_at_unix: u64,
 ) -> Result<SealedMedia> {
     let seal_id = sc::random_32();
     let k_content = sc::random_32();
@@ -1000,6 +1016,8 @@ pub fn seal_media_with_mode(
         current_slot,
         ttl_slots,
         mode,
+        reveal_at_unix,
+        destroy_at_unix,
     )?;
     Ok(SealedMedia { item, chunks })
 }
@@ -1031,6 +1049,8 @@ pub fn seal_text(
         current_slot,
         ttl_slots,
         SealMode::StrictSeal,
+        0,
+        0,
     )
 }
 
@@ -1047,6 +1067,8 @@ pub fn seal_text_with_mode(
     current_slot: u64,
     ttl_slots: u64,
     mode: SealMode,
+    reveal_at_unix: u64,
+    destroy_at_unix: u64,
 ) -> Result<SealedItem> {
     // Text has no chunk list, so `manifest_root` stays zero (spec §8.3).
     seal_payload(
@@ -1064,6 +1086,8 @@ pub fn seal_text_with_mode(
         current_slot,
         ttl_slots,
         mode,
+        reveal_at_unix,
+        destroy_at_unix,
     )
 }
 
@@ -1086,6 +1110,8 @@ fn seal_payload(
     current_slot: u64,
     ttl_slots: u64,
     mode: SealMode,
+    reveal_at_unix: u64,
+    destroy_at_unix: u64,
 ) -> Result<SealedItem> {
     let n = gateway_ids.len() as u8;
     if threshold_t == 0 || threshold_t > n {
@@ -1151,6 +1177,8 @@ fn seal_payload(
         threshold_n: n,
         not_before_finalized_slot: current_slot,
         expires_at_slot,
+        reveal_at_unix,
+        destroy_at_unix,
         flags: 0,
         mode,
     };
@@ -1369,6 +1397,24 @@ fn try_open_inner(
     // envelope must match the leaf.
     if envelope.seal_id != leaf.seal_id {
         return OpenOutcome::Rejected { reason: "envelope/leaf seal_id mismatch".into() };
+    }
+
+    // (5c) Timelock window — read from the LEAF, which the sender signed and whose hash is
+    // anchored on-chain. Enforcing it here rather than in the app is what makes it more than
+    // an overlay: a relay cannot move the deadline without breaking the signature, and the
+    // gateways withholding shares means a patched client still has no key to use.
+    let now = now_unix();
+    if leaf.destroy_at_unix > 0 && now >= leaf.destroy_at_unix {
+        return OpenOutcome::Locked {
+            state: ItemState::Expired,
+            reason: "self-destructed — the window has closed".into(),
+        };
+    }
+    if leaf.reveal_at_unix > 0 && now < leaf.reveal_at_unix {
+        return OpenOutcome::Locked {
+            state: ItemState::DeliveredLocked,
+            reason: format!("timelocked until {}", leaf.reveal_at_unix),
+        };
     }
 
     // (5b) revocation / expiry.

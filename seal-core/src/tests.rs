@@ -79,6 +79,8 @@ impl World {
             self.chain.slot(),
             ttl,
             mode,
+            0,
+            0,
         )
         .expect("seal")
     }
@@ -127,6 +129,8 @@ impl World {
             self.chain.slot(),
             ttl,
             SealMode::StrictSeal,
+            0,
+            0,
         )
         .expect("seal media")
     }
@@ -794,6 +798,8 @@ fn empty_media_is_refused() {
         w.chain.slot(),
         100,
         SealMode::StrictSeal,
+        0,
+        0,
     );
     assert!(err.is_err());
 }
@@ -803,5 +809,82 @@ fn media_label(o: &MediaOutcome) -> String {
         MediaOutcome::Locked { reason, .. } => format!("Locked({reason})"),
         MediaOutcome::Opened { .. } => "Opened".to_string(),
         MediaOutcome::Rejected { reason } => format!("Rejected({reason})"),
+    }
+}
+
+#[test]
+fn the_timelock_lives_in_the_signed_leaf_and_cannot_be_moved() {
+    let mut w = world();
+    let now = now_unix();
+    let item = seal_text_with_mode(
+        b"open me later",
+        &w.sender_identity,
+        &w.sender_device,
+        &w.bob_device.public(),
+        sc::random_32(),
+        &w.gw_ids,
+        2,
+        w.chain.slot(),
+        100_000,
+        SealMode::StrictSeal,
+        now + 3600, // reveal
+        0,
+    )
+    .expect("seal");
+
+    // the window is IN the leaf, so the sender signature and the anchored leaf hash cover it
+    assert_eq!(item.signed_leaf.leaf.reveal_at_unix, now + 3600);
+
+    w.deposit_all(&item);
+    w.chain.submit_leaf(&item.signed_leaf, &w.sender_identity.public()).unwrap();
+    w.chain.finalize(&item.seal_id).unwrap();
+    let shares = w.collect(&item.seal_id);
+    assert_eq!(shares.len(), 3, "gateways released — finality is satisfied");
+
+    // FINALISED, every share in hand, and it STILL will not open: the timelock is enforced
+    // by the protocol core, not by the app drawing a lock over the top.
+    match w.open(&item, &shares) {
+        OpenOutcome::Locked { reason, .. } => assert!(reason.contains("timelocked"), "{reason}"),
+        other => panic!("timelocked item opened early: {other:?}"),
+    }
+
+    // Moving the deadline invalidates the sender signature — a relay cannot shorten it.
+    let mut tampered = item.signed_leaf.clone();
+    tampered.leaf.reveal_at_unix = now - 1;
+    match try_open(&item.envelope, &tampered, &w.sender_identity.public(), &w.bob_device, &shares, &w.chain) {
+        OpenOutcome::Rejected { reason } => assert!(reason.contains("signature"), "{reason}"),
+        other => panic!("edited deadline was accepted: {other:?}"),
+    }
+}
+
+#[test]
+fn a_destroyed_item_never_opens_even_with_every_share() {
+    let mut w = world();
+    let now = now_unix();
+    let item = seal_text_with_mode(
+        b"gone",
+        &w.sender_identity,
+        &w.sender_device,
+        &w.bob_device.public(),
+        sc::random_32(),
+        &w.gw_ids,
+        2,
+        w.chain.slot(),
+        100_000,
+        SealMode::StrictSeal,
+        0,
+        now - 1, // destroy_at already passed
+    )
+    .expect("seal");
+    w.deposit_all(&item);
+    w.chain.submit_leaf(&item.signed_leaf, &w.sender_identity.public()).unwrap();
+    w.chain.finalize(&item.seal_id).unwrap();
+    let shares = w.collect(&item.seal_id);
+    match w.open(&item, &shares) {
+        OpenOutcome::Locked { state, reason } => {
+            assert_eq!(state, ItemState::Expired);
+            assert!(reason.contains("self-destructed"), "{reason}");
+        }
+        other => panic!("self-destructed item opened: {other:?}"),
     }
 }

@@ -1684,7 +1684,7 @@ struct TimedSealSheet: View {
                     if exact { withAnimation(.easeInOut(duration: 0.22)) { exact = false } } else { onCancel() }
                 }.foregroundColor(.dvSub)
             }
-            Text("The gateways enforce this — the key can't be assembled outside the window, so it's cryptographic, not just \"please delete\".")
+            Text("The window is signed into the seal and anchored on-chain, and the gateways withhold the key outside it — so it can't be moved, and a patched app has nothing to open.")
                 .font(.system(size: 12)).foregroundColor(.dvSub)
             Picker("", selection: $mode) {
                 Text("🔒 Opens later").tag(0)

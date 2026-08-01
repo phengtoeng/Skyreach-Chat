@@ -54,6 +54,8 @@ fn main() -> Result<()> {
         100,
         100_000,
         SealMode::StrictSeal,
+        0,
+        0,
     )
     .map_err(|e| anyhow!("seal: {e}"))?;
     let seal_id_hex = hex::encode(item.signed_leaf.leaf.seal_id);

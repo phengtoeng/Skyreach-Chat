@@ -1881,7 +1881,9 @@ private fun TimedSealDialog(onDismiss: () -> Unit, onPick: (Long, Long) -> Unit)
             Column(Modifier.animateContentSize()) {
                 if (page == 0) {
                     Text(
-                        "The gateways enforce this — the key can't be assembled outside the window, so it's cryptographic, not just \"please delete\".",
+                        "The window is signed into the seal and anchored on-chain, and the gateways " +
+                            "withhold the key outside it — so it can't be moved, and a patched app has " +
+                            "nothing to open.",
                         color = Sub, fontSize = 12.sp,
                     )
                     Spacer(Modifier.height(14.dp))

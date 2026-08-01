@@ -78,7 +78,7 @@ fn seal_to_json(device_pub_hex: &str, text: &str, fast: bool) -> String {
     let sender_dev = sc::SignId::generate();
     let gw_ids: Vec<[u8; 32]> = (0..3).map(|_| sc::random_32()).collect();
     let mode = if fast { SealMode::FastSeal } else { SealMode::StrictSeal };
-    match seal_text_with_mode(text.as_bytes(), &sender_id, &sender_dev, &device_pub, sc::random_32(), &gw_ids, 2, 100, 100_000, mode) {
+    match seal_text_with_mode(text.as_bytes(), &sender_id, &sender_dev, &device_pub, sc::random_32(), &gw_ids, 2, 100, 100_000, mode, 0, 0) {
         Ok(item) => json!({
             "ok": true,
             "seal_id": hex::encode(item.signed_leaf.leaf.seal_id),
@@ -116,7 +116,10 @@ fn seal_shippable_json(
     let gw_ids: Vec<[u8; 32]> = (0..3).map(|_| sc::random_32()).collect();
     let tag = mailbox_tag(&device_pub);
     let mode = if fast { SealMode::FastSeal } else { SealMode::StrictSeal };
-    let item = match seal_text_with_mode(text.as_bytes(), &sender_id, &sender_dev, &device_pub, tag, &gw_ids, 2, 100, 100_000, mode) {
+    let item = match seal_text_with_mode(
+        text.as_bytes(), &sender_id, &sender_dev, &device_pub, tag, &gw_ids, 2, 100, 100_000, mode,
+        reveal_at.max(0) as u64, destroy_at.max(0) as u64,
+    ) {
         Ok(i) => i,
         Err(e) => return json!({ "ok": false, "error": e.to_string() }).to_string(),
     };
@@ -183,14 +186,13 @@ fn open_received_json(device_seed_hex: &str, bundle_str: &str, shares_str: &str)
 
     // Timelock enforcement (defense-in-depth; the gateways are the primary gate that withholds
     // the shares outside the window). Refuse to open before reveal_at or after destroy_at.
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-    let reveal_at = bundle.get("reveal_at").and_then(Value::as_i64).unwrap_or(0);
-    let destroy_at = bundle.get("destroy_at").and_then(Value::as_i64).unwrap_or(0);
-    if destroy_at > 0 && now >= destroy_at {
+    // window from the SIGNED leaf (see open_ctx) — the bundle's copy is unauthenticated
+    let now = now_unix();
+    if signed_leaf.leaf.destroy_at_unix > 0 && now >= signed_leaf.leaf.destroy_at_unix {
         return json!({ "ok": false, "reason": "destroyed" }).to_string();
     }
-    if reveal_at > 0 && now < reveal_at {
-        return json!({ "ok": false, "reason": "locked", "reveal_at": reveal_at }).to_string();
+    if signed_leaf.leaf.reveal_at_unix > 0 && now < signed_leaf.leaf.reveal_at_unix {
+        return json!({ "ok": false, "reason": "locked", "reveal_at": signed_leaf.leaf.reveal_at_unix }).to_string();
     }
 
     // gateways already enforced finality before releasing, so mark the seal finalised.
@@ -320,6 +322,8 @@ fn seal_media_file_json(
         100,
         100_000,
         mode,
+        reveal_at.max(0) as u64,
+        destroy_at.max(0) as u64,
     ) {
         Ok(s) => s,
         Err(e) => return json!({ "ok": false, "error": e.to_string() }).to_string(),
@@ -390,17 +394,16 @@ fn open_ctx(bundle_str: &str, shares_str: &str) -> std::result::Result<OpenCtx, 
         return Err(json!({ "ok": false, "reason": "incomplete bundle" }).to_string());
     };
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let reveal_at = bundle.get("reveal_at").and_then(Value::as_i64).unwrap_or(0);
-    let destroy_at = bundle.get("destroy_at").and_then(Value::as_i64).unwrap_or(0);
-    if destroy_at > 0 && now >= destroy_at {
+    // The window is read from the SIGNED leaf, never from the bundle JSON: the bundle is not
+    // covered by any signature, so a relay could have edited a deadline there. `try_open*`
+    // enforces the same values again — this is only to give the app a clean reason + deadline.
+    let now = now_unix();
+    let leaf = &signed_leaf.leaf;
+    if leaf.destroy_at_unix > 0 && now >= leaf.destroy_at_unix {
         return Err(json!({ "ok": false, "reason": "destroyed" }).to_string());
     }
-    if reveal_at > 0 && now < reveal_at {
-        return Err(json!({ "ok": false, "reason": "locked", "reveal_at": reveal_at }).to_string());
+    if leaf.reveal_at_unix > 0 && now < leaf.reveal_at_unix {
+        return Err(json!({ "ok": false, "reason": "locked", "reveal_at": leaf.reveal_at_unix }).to_string());
     }
 
     // gateways already enforced finality before releasing, so mark the seal finalised.
@@ -819,6 +822,8 @@ fn run_fast_demo() -> String {
         chain.slot(),
         500,
         SealMode::FastSeal,
+        0,
+        0,
     ) {
         Ok(i) => i,
         Err(e) => return json!({ "error": e.to_string() }).to_string(),

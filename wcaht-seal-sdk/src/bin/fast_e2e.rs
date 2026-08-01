@@ -48,6 +48,8 @@ fn main() -> Result<()> {
         chain.slot(),
         100_000,
         SealMode::FastSeal,
+        0,
+        0,
     )?;
     for e in &item.share_envelopes {
         if let Some(g) = gateways.iter_mut().find(|g| g.id == e.gateway_id) {
