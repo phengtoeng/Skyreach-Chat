@@ -38,6 +38,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
@@ -68,6 +69,15 @@ private val Ink = Color(0xFF101720)
 private val Sub = Color(0xFF8C99A6)
 private val Hair = Color(0xFFECEFF2)
 private val Green = Color(0xFF33C15A)
+private val BarBg = Color(0xFFFFFFFF)      // floating nav capsule / search button
+private val BarActive = Color(0xFFE9ECEF)  // pill behind the selected tab
+private val BadgeRed = Color(0xFFF03D3D)
+
+// Bottom-bar tabs, left to right.
+private const val TAB_CONTACTS = 0
+private const val TAB_CALLS = 1
+private const val TAB_CHATS = 2
+private const val TAB_SETTINGS = 3
 private val AvatarColors = listOf(
     Color(0xFF5B8DEF), Color(0xFFEF6F6C), Color(0xFF3FBF8F), Color(0xFFF0A84A),
     Color(0xFF9B7EDE), Color(0xFF48B0C7), Color(0xFFE07AAE),
@@ -480,7 +490,7 @@ private fun App(proto: String) {
             delay(3000)
         }
     }
-    var tab by remember { mutableStateOf(0) }
+    var tab by remember { mutableStateOf(TAB_CHATS) }
     var showNew by remember { mutableStateOf(false) }
     var scanned by remember { mutableStateOf<JSONObject?>(null) }
 
@@ -596,7 +606,7 @@ private fun App(proto: String) {
                 showNew = false; scanned = null
             },
         )
-        tab == 2 -> ProfileScreen(
+        tab == TAB_SETTINGS -> ProfileScreen(
             identity, tab,
             currentHost = Server.host,
             onTab = { tab = it },
@@ -646,15 +656,25 @@ private fun ChatListScreen(
 ) {
     SystemBars(Blue, darkIcons = false)
     var pendingDelete by remember { mutableStateOf<Chat?>(null) }
+    var searching by remember { mutableStateOf(false) }
+    var query by remember { mutableStateOf("") }
     // real contacts first (address / phone as subtitle), then the demo threads (minus hidden ones)
-    val rows = contacts.map {
+    val contactRows = contacts.map {
         val sub = when {
             it.address.isNotBlank() -> it.address.take(14) + "… · tap to seal"
             it.phone.isNotBlank() -> "+855 " + it.phone
             else -> "tap to seal"
         }
         Chat(it.name, sub, "", devicePub = it.devicePub, identityPub = it.identityPub, isContact = true)
-    } + CHATS.filter { it.name !in hidden }
+    }
+    // The Contacts tab lists only people you've actually saved; Chats/Calls also show the threads.
+    val all = if (tab == TAB_CONTACTS) contactRows else contactRows + CHATS.filter { it.name !in hidden }
+    val rows = if (query.isBlank()) all else all.filter { it.name.contains(query, ignoreCase = true) }
+    val title = when (tab) {
+        TAB_CONTACTS -> "Contacts"
+        TAB_CALLS -> "Calls"
+        else -> "Denvion"
+    }
     Column(Modifier.fillMaxSize().background(ScreenBg)) {
         Row(
             Modifier.fillMaxWidth().background(Blue).padding(horizontal = 16.dp, vertical = 14.dp),
@@ -662,12 +682,46 @@ private fun ChatListScreen(
         ) {
             Icon(Icons.Filled.Shield, null, tint = Color.White, modifier = Modifier.size(24.dp))
             Spacer(Modifier.width(8.dp))
-            Text("Denvion", color = Color.White, fontSize = 21.sp, fontWeight = FontWeight.Bold)
+            Text(title, color = Color.White, fontSize = 21.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.weight(1f))
-            Icon(Icons.Filled.Search, "Search", tint = Color.White, modifier = Modifier.size(24.dp))
+        }
+        if (searching) {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Row(
+                    Modifier.weight(1f).clip(RoundedCornerShape(22.dp)).background(Hair)
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Filled.Search, null, tint = Sub, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Box(Modifier.weight(1f)) {
+                        if (query.isEmpty()) Text("Search", color = Sub, fontSize = 15.sp)
+                        BasicTextField(
+                            value = query,
+                            onValueChange = { query = it },
+                            singleLine = true,
+                            textStyle = TextStyle(color = Ink, fontSize = 15.sp),
+                            cursorBrush = Brush.verticalGradient(listOf(Blue, Blue)),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                }
+                Spacer(Modifier.width(10.dp))
+                Text(
+                    "Cancel", color = Blue, fontSize = 15.sp,
+                    modifier = Modifier.clickable { searching = false; query = "" },
+                )
+            }
         }
         Box(Modifier.weight(1f)) {
-            LazyColumn(Modifier.fillMaxSize()) {
+            LazyColumn(
+                Modifier.fillMaxSize(),
+                // clear the floating bar + its shadow so the last row stays tappable
+                contentPadding = PaddingValues(bottom = 96.dp),
+            ) {
                 items(rows) { c ->
                     ChatRow(c, onClick = { onOpen(c) }, onLongClick = { pendingDelete = c })
                     Box(Modifier.padding(start = 84.dp).fillMaxWidth().height(1.dp).background(Hair))
@@ -677,10 +731,16 @@ private fun ChatListScreen(
                 onClick = onAdd,
                 containerColor = Blue,
                 contentColor = Color.White,
-                modifier = Modifier.align(Alignment.BottomEnd).padding(20.dp),
+                modifier = Modifier.align(Alignment.BottomEnd).padding(end = 20.dp, bottom = 104.dp),
             ) { Icon(Icons.Filled.PersonAdd, "Add contact") }
+            Box(Modifier.align(Alignment.BottomCenter)) {
+                BottomBar(
+                    tab, onTab,
+                    chatBadge = all.sumOf { it.unread },
+                    onSearch = { searching = !searching; if (!searching) query = "" },
+                )
+            }
         }
-        BottomBar(tab, onTab)
     }
 
     pendingDelete?.let { target ->
@@ -730,18 +790,46 @@ private fun ChatRow(c: Chat, onClick: () -> Unit, onLongClick: () -> Unit) {
     }
 }
 
+/**
+ * Floating bottom bar: a white capsule holding the four tabs, plus a detached round
+ * search button. It overlays the content (the lists pad their bottom for it) instead
+ * of docking to the window edge.
+ */
 @Composable
-private fun BottomBar(tab: Int, onTab: (Int) -> Unit) {
-    Column(Modifier.fillMaxWidth().background(ScreenBg)) {
-        Box(Modifier.fillMaxWidth().height(1.dp).background(Hair))
+private fun BottomBar(
+    tab: Int,
+    onTab: (Int) -> Unit,
+    chatBadge: Int = 0,
+    settingsAlert: Boolean = false,
+    onSearch: () -> Unit = {},
+) {
+    Row(
+        Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, bottom = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
         Row(
-            Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 10.dp),
+            Modifier.weight(1f)
+                .shadow(14.dp, CircleShape, clip = false)
+                .clip(CircleShape)
+                .background(BarBg)
+                .padding(horizontal = 6.dp, vertical = 6.dp),
             horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            NavItem(Icons.Filled.ChatBubble, "Chats", tab == 0) { onTab(0) }
-            NavItem(Icons.Filled.Call, "Calls", tab == 1) { onTab(1) }
-            NavItem(Icons.Filled.Settings, "Settings", tab == 2) { onTab(2) }
+            NavItem(Icons.Filled.Person, "Contacts", tab == TAB_CONTACTS) { onTab(TAB_CONTACTS) }
+            NavItem(Icons.Filled.Call, "Calls", tab == TAB_CALLS) { onTab(TAB_CALLS) }
+            NavItem(Icons.Filled.ChatBubble, "Chats", tab == TAB_CHATS, badge = chatBadge) { onTab(TAB_CHATS) }
+            NavItem(Icons.Filled.Settings, "Settings", tab == TAB_SETTINGS, dot = settingsAlert) { onTab(TAB_SETTINGS) }
         }
+        Box(
+            Modifier.size(58.dp)
+                .shadow(14.dp, CircleShape, clip = false)
+                .clip(CircleShape)
+                .background(BarBg)
+                .clickable(onClick = onSearch),
+            contentAlignment = Alignment.Center,
+        ) { Icon(Icons.Filled.Search, "Search", tint = Ink, modifier = Modifier.size(26.dp)) }
     }
 }
 
@@ -750,16 +838,38 @@ private fun NavItem(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     label: String,
     active: Boolean,
+    badge: Int = 0,
+    dot: Boolean = false,
     onClick: () -> Unit,
 ) {
-    val c = if (active) Blue else Sub
+    val c = if (active) Blue else Ink
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
-        modifier = Modifier.clickable(onClick = onClick).padding(horizontal = 22.dp, vertical = 2.dp),
+        modifier = Modifier
+            .clip(CircleShape)
+            .background(if (active) BarActive else Color.Transparent)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 7.dp),
     ) {
-        Icon(icon, null, tint = c, modifier = Modifier.size(24.dp))
+        Box {
+            Icon(icon, null, tint = c, modifier = Modifier.size(23.dp))
+            if (badge > 0 || dot) {
+                Box(
+                    Modifier.align(Alignment.TopEnd).offset(x = 9.dp, y = (-6).dp)
+                        .defaultMinSize(minWidth = 16.dp, minHeight = 16.dp)
+                        .clip(CircleShape).background(BadgeRed)
+                        .padding(horizontal = 4.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        if (dot && badge == 0) "!" else "$badge",
+                        color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold,
+                    )
+                }
+            }
+        }
         Spacer(Modifier.height(3.dp))
-        Text(label, color = c, fontSize = 11.sp, fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal)
+        Text(label, color = c, fontSize = 11.sp, fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium)
     }
 }
 
@@ -791,154 +901,156 @@ private fun ProfileScreen(
             Spacer(Modifier.width(8.dp))
             Text("My Denvion ID", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
         }
-        Column(
-            Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(20.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Avatar(name, 76.dp)
-            Spacer(Modifier.height(10.dp))
-            Text(name, fontSize = 20.sp, fontWeight = FontWeight.SemiBold, color = Ink)
-
-            Spacer(Modifier.height(16.dp))
-            Text("Your display name", fontSize = 13.sp, color = Sub)
-            Spacer(Modifier.height(4.dp))
-            Text("This is the name shown when others add you or get your messages.", fontSize = 11.sp, color = Sub, textAlign = TextAlign.Center)
-            Spacer(Modifier.height(8.dp))
-            Row(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Color(0xFFF1F4F7)).padding(horizontal = 14.dp, vertical = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
+        Box(Modifier.weight(1f)) {
+            Column(
+                Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                Box(Modifier.weight(1f)) {
-                    if (myName.isEmpty()) Text("your name", color = Sub, fontSize = 15.sp)
-                    BasicTextField(
-                        value = myName,
-                        onValueChange = { myName = it },
-                        singleLine = true,
-                        textStyle = TextStyle(color = Ink, fontSize = 15.sp),
-                        cursorBrush = Brush.verticalGradient(listOf(Blue, Blue)),
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                }
-            }
-            Spacer(Modifier.height(10.dp))
-            Box(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
-                    .background(if (myName.isNotBlank() && myName != name) Blue else Color(0xFFCBD3DA))
-                    .clickable(enabled = myName.isNotBlank() && myName != name) { onSaveName(myName) }
-                    .padding(vertical = 14.dp),
-                contentAlignment = Alignment.Center,
-            ) { Text("Save name", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold) }
+                Avatar(name, 76.dp)
+                Spacer(Modifier.height(10.dp))
+                Text(name, fontSize = 20.sp, fontWeight = FontWeight.SemiBold, color = Ink)
 
-            Spacer(Modifier.height(18.dp))
-            Text("WCAHT identity address", fontSize = 12.sp, color = Sub)
-            Spacer(Modifier.height(2.dp))
-            SelectionContainer { Text(address, fontSize = 13.sp, color = Blue, textAlign = TextAlign.Center) }
-            Spacer(Modifier.height(20.dp))
-            if (qr != null) {
-                Image(
-                    bitmap = qr,
-                    contentDescription = "My QR code",
-                    modifier = Modifier.size(230.dp).clip(RoundedCornerShape(12.dp)).border(1.dp, Hair, RoundedCornerShape(12.dp)),
-                )
-            }
-            Spacer(Modifier.height(18.dp))
-            Text("Share this code so others can add you", fontSize = 13.sp, color = Sub, textAlign = TextAlign.Center)
-            Spacer(Modifier.height(6.dp))
-            SelectionContainer {
-                Text(
-                    card, fontSize = 11.sp, color = Ink, textAlign = TextAlign.Center,
-                    modifier = Modifier.clip(RoundedCornerShape(10.dp)).background(Color(0xFFF1F4F7)).padding(12.dp),
-                )
-            }
-            Spacer(Modifier.height(8.dp))
-            val ctxCopy = LocalContext.current
-            Box(
-                Modifier.clip(RoundedCornerShape(10.dp)).background(Blue)
-                    .clickable {
-                        val clip = ctxCopy.getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
-                        clip?.setPrimaryClip(android.content.ClipData.newPlainText("denvion code", card))
-                        android.widget.Toast.makeText(ctxCopy, "Code copied — paste it on the other device", android.widget.Toast.LENGTH_SHORT).show()
+                Spacer(Modifier.height(16.dp))
+                Text("Your display name", fontSize = 13.sp, color = Sub)
+                Spacer(Modifier.height(4.dp))
+                Text("This is the name shown when others add you or get your messages.", fontSize = 11.sp, color = Sub, textAlign = TextAlign.Center)
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Color(0xFFF1F4F7)).padding(horizontal = 14.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box(Modifier.weight(1f)) {
+                        if (myName.isEmpty()) Text("your name", color = Sub, fontSize = 15.sp)
+                        BasicTextField(
+                            value = myName,
+                            onValueChange = { myName = it },
+                            singleLine = true,
+                            textStyle = TextStyle(color = Ink, fontSize = 15.sp),
+                            cursorBrush = Brush.verticalGradient(listOf(Blue, Blue)),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
                     }
-                    .padding(horizontal = 18.dp, vertical = 10.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Filled.ContentCopy, null, tint = Color.White, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text("Copy my code", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                 }
-            }
+                Spacer(Modifier.height(10.dp))
+                Box(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                        .background(if (myName.isNotBlank() && myName != name) Blue else Color(0xFFCBD3DA))
+                        .clickable(enabled = myName.isNotBlank() && myName != name) { onSaveName(myName) }
+                        .padding(vertical = 14.dp),
+                    contentAlignment = Alignment.Center,
+                ) { Text("Save name", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold) }
 
-            Spacer(Modifier.height(24.dp))
-            Box(Modifier.fillMaxWidth().height(1.dp).background(Hair))
-            Spacer(Modifier.height(16.dp))
-            Text("Let others add you by phone number", fontSize = 13.sp, color = Sub, textAlign = TextAlign.Center)
-            Spacer(Modifier.height(10.dp))
-            Row(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Color(0xFFF1F4F7)).padding(horizontal = 14.dp, vertical = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text("+855", color = Ink, fontSize = 15.sp)
-                Spacer(Modifier.width(12.dp))
-                Box(Modifier.weight(1f)) {
-                    if (myPhone.isEmpty()) Text("your number", color = Sub, fontSize = 15.sp)
-                    BasicTextField(
-                        value = myPhone,
-                        onValueChange = { myPhone = it.filter { c -> c.isDigit() || c == ' ' } },
-                        textStyle = TextStyle(color = Ink, fontSize = 15.sp),
-                        cursorBrush = Brush.verticalGradient(listOf(Blue, Blue)),
-                        modifier = Modifier.fillMaxWidth(),
+                Spacer(Modifier.height(18.dp))
+                Text("WCAHT identity address", fontSize = 12.sp, color = Sub)
+                Spacer(Modifier.height(2.dp))
+                SelectionContainer { Text(address, fontSize = 13.sp, color = Blue, textAlign = TextAlign.Center) }
+                Spacer(Modifier.height(20.dp))
+                if (qr != null) {
+                    Image(
+                        bitmap = qr,
+                        contentDescription = "My QR code",
+                        modifier = Modifier.size(230.dp).clip(RoundedCornerShape(12.dp)).border(1.dp, Hair, RoundedCornerShape(12.dp)),
                     )
                 }
-            }
-            Spacer(Modifier.height(10.dp))
-            Box(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
-                    .background(if (myPhone.isNotBlank()) Blue else Color(0xFFCBD3DA))
-                    .clickable(enabled = myPhone.isNotBlank()) { onPublish(myPhone.trim()) }
-                    .padding(vertical = 14.dp),
-                contentAlignment = Alignment.Center,
-            ) { Text("Publish my number to the directory", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold) }
-            Spacer(Modifier.height(6.dp))
-            Text("Only a hash of your number is stored — never the number itself.", fontSize = 11.sp, color = Sub, textAlign = TextAlign.Center)
-
-            Spacer(Modifier.height(24.dp))
-            Box(Modifier.fillMaxWidth().height(1.dp).background(Hair))
-            Spacer(Modifier.height(16.dp))
-            Text("Server", fontSize = 13.sp, color = Sub)
-            Spacer(Modifier.height(4.dp))
-            Text(
-                "Host running the relay + gateways + directory. Both people must point at the same one.",
-                fontSize = 11.sp, color = Sub, textAlign = TextAlign.Center,
-            )
-            Spacer(Modifier.height(10.dp))
-            Row(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Color(0xFFF1F4F7)).padding(horizontal = 14.dp, vertical = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Box(Modifier.weight(1f)) {
-                    if (host.isEmpty()) Text("server IP or hostname", color = Sub, fontSize = 15.sp)
-                    BasicTextField(
-                        value = host,
-                        onValueChange = { host = it.trim() },
-                        singleLine = true,
-                        textStyle = TextStyle(color = Ink, fontSize = 15.sp),
-                        cursorBrush = Brush.verticalGradient(listOf(Blue, Blue)),
-                        modifier = Modifier.fillMaxWidth(),
+                Spacer(Modifier.height(18.dp))
+                Text("Share this code so others can add you", fontSize = 13.sp, color = Sub, textAlign = TextAlign.Center)
+                Spacer(Modifier.height(6.dp))
+                SelectionContainer {
+                    Text(
+                        card, fontSize = 11.sp, color = Ink, textAlign = TextAlign.Center,
+                        modifier = Modifier.clip(RoundedCornerShape(10.dp)).background(Color(0xFFF1F4F7)).padding(12.dp),
                     )
                 }
+                Spacer(Modifier.height(8.dp))
+                val ctxCopy = LocalContext.current
+                Box(
+                    Modifier.clip(RoundedCornerShape(10.dp)).background(Blue)
+                        .clickable {
+                            val clip = ctxCopy.getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+                            clip?.setPrimaryClip(android.content.ClipData.newPlainText("denvion code", card))
+                            android.widget.Toast.makeText(ctxCopy, "Code copied — paste it on the other device", android.widget.Toast.LENGTH_SHORT).show()
+                        }
+                        .padding(horizontal = 18.dp, vertical = 10.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Filled.ContentCopy, null, tint = Color.White, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Copy my code", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+
+                Spacer(Modifier.height(24.dp))
+                Box(Modifier.fillMaxWidth().height(1.dp).background(Hair))
+                Spacer(Modifier.height(16.dp))
+                Text("Let others add you by phone number", fontSize = 13.sp, color = Sub, textAlign = TextAlign.Center)
+                Spacer(Modifier.height(10.dp))
+                Row(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Color(0xFFF1F4F7)).padding(horizontal = 14.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("+855", color = Ink, fontSize = 15.sp)
+                    Spacer(Modifier.width(12.dp))
+                    Box(Modifier.weight(1f)) {
+                        if (myPhone.isEmpty()) Text("your number", color = Sub, fontSize = 15.sp)
+                        BasicTextField(
+                            value = myPhone,
+                            onValueChange = { myPhone = it.filter { c -> c.isDigit() || c == ' ' } },
+                            textStyle = TextStyle(color = Ink, fontSize = 15.sp),
+                            cursorBrush = Brush.verticalGradient(listOf(Blue, Blue)),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                }
+                Spacer(Modifier.height(10.dp))
+                Box(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                        .background(if (myPhone.isNotBlank()) Blue else Color(0xFFCBD3DA))
+                        .clickable(enabled = myPhone.isNotBlank()) { onPublish(myPhone.trim()) }
+                        .padding(vertical = 14.dp),
+                    contentAlignment = Alignment.Center,
+                ) { Text("Publish my number to the directory", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold) }
+                Spacer(Modifier.height(6.dp))
+                Text("Only a hash of your number is stored — never the number itself.", fontSize = 11.sp, color = Sub, textAlign = TextAlign.Center)
+
+                Spacer(Modifier.height(24.dp))
+                Box(Modifier.fillMaxWidth().height(1.dp).background(Hair))
+                Spacer(Modifier.height(16.dp))
+                Text("Server", fontSize = 13.sp, color = Sub)
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "Host running the relay + gateways + directory. Both people must point at the same one.",
+                    fontSize = 11.sp, color = Sub, textAlign = TextAlign.Center,
+                )
+                Spacer(Modifier.height(10.dp))
+                Row(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Color(0xFFF1F4F7)).padding(horizontal = 14.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box(Modifier.weight(1f)) {
+                        if (host.isEmpty()) Text("server IP or hostname", color = Sub, fontSize = 15.sp)
+                        BasicTextField(
+                            value = host,
+                            onValueChange = { host = it.trim() },
+                            singleLine = true,
+                            textStyle = TextStyle(color = Ink, fontSize = 15.sp),
+                            cursorBrush = Brush.verticalGradient(listOf(Blue, Blue)),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                }
+                Spacer(Modifier.height(10.dp))
+                Box(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                        .background(if (host.isNotBlank()) Blue else Color(0xFFCBD3DA))
+                        .clickable(enabled = host.isNotBlank()) { onSaveHost(host.trim()) }
+                        .padding(vertical = 14.dp),
+                    contentAlignment = Alignment.Center,
+                ) { Text("Save server", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold) }
+                Spacer(Modifier.height(96.dp)) // clear the floating bar
             }
-            Spacer(Modifier.height(10.dp))
-            Box(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
-                    .background(if (host.isNotBlank()) Blue else Color(0xFFCBD3DA))
-                    .clickable(enabled = host.isNotBlank()) { onSaveHost(host.trim()) }
-                    .padding(vertical = 14.dp),
-                contentAlignment = Alignment.Center,
-            ) { Text("Save server", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold) }
-            Spacer(Modifier.height(16.dp))
+            Box(Modifier.align(Alignment.BottomCenter)) { BottomBar(tab, onTab) }
         }
-        BottomBar(tab, onTab)
     }
 }
 

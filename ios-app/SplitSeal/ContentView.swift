@@ -22,7 +22,15 @@ extension Color {
     static let dvSub = Color(hex: 0x8C99A6)
     static let dvHair = Color(hex: 0xECEFF2)
     static let dvGreen = Color(hex: 0x33C15A)
+    static let dvBarActive = Color(hex: 0xE9ECEF)  // pill behind the selected tab
+    static let dvBadge = Color(hex: 0xF03D3D)
 }
+
+// Bottom-bar tabs, left to right.
+let TAB_CONTACTS = 0
+let TAB_CALLS = 1
+let TAB_CHATS = 2
+let TAB_SETTINGS = 3
 
 private let avatarColors: [Color] =
     [0x5B8DEF, 0xEF6F6C, 0x3FBF8F, 0xF0A84A, 0x9B7EDE, 0x48B0C7, 0xE07AAE].map { Color(hex: $0) }
@@ -382,7 +390,7 @@ struct ContentView: View {
     @State private var contacts: [Contact] = loadContacts()
     @State private var hidden: Set<String> = Store.hiddenChats()
     @State private var openChat: Chat? = nil
-    @State private var tab = 0
+    @State private var tab = TAB_CHATS
     @State private var showNew = false
     @State private var showScanner = false
     @State private var scanned: [String: Any]? = nil
@@ -515,7 +523,7 @@ struct ContentView: View {
                     onCancel: { showNew = false; scanned = nil },
                     onSave: saveContact
                 )
-            } else if tab == 2 {
+            } else if tab == TAB_SETTINGS {
                 ProfileView(identity: identity, tab: tab, onTab: { tab = $0 }, onSaveName: { saveName($0) }, onPublish: { phone in
                     var id = identity
                     id["phone"] = phone
@@ -560,45 +568,74 @@ struct ChatListView: View {
     let tab: Int
     let onTab: (Int) -> Void
     @State private var pendingDelete: Chat? = nil
+    @State private var searching = false
+    @State private var query = ""
     var body: some View {
-        let rows = contacts.map { c -> Chat in
+        let contactRows = contacts.map { c -> Chat in
             let sub = !c.address.isEmpty ? String(c.address.prefix(14)) + "… · tap to seal"
                 : (!c.phone.isEmpty ? "+855 " + c.phone : "tap to seal")
             return Chat(name: c.name, last: sub, time: "", devicePub: c.devicePub, identityPub: c.identityPub, isContact: true)
-        } + CHATS.filter { !hidden.contains($0.name) }
+        }
+        // The Contacts tab lists only people you've actually saved; Chats/Calls also show the threads.
+        let all = tab == TAB_CONTACTS ? contactRows : contactRows + CHATS.filter { !hidden.contains($0.name) }
+        let rows = query.isEmpty ? all : all.filter { $0.name.localizedCaseInsensitiveContains(query) }
+        let title = tab == TAB_CONTACTS ? "Contacts" : (tab == TAB_CALLS ? "Calls" : "Denvion")
         VStack(spacing: 0) {
             HStack(spacing: 8) {
                 Image(systemName: "shield.fill").foregroundColor(.white).font(.system(size: 20))
-                Text("Denvion").font(.system(size: 21, weight: .bold)).foregroundColor(.white)
+                Text(title).font(.system(size: 21, weight: .bold)).foregroundColor(.white)
                 Spacer()
-                Image(systemName: "magnifyingglass").foregroundColor(.white).font(.system(size: 20))
             }
             .padding(.horizontal, 16).padding(.vertical, 14)
             .frame(maxWidth: .infinity)
             .background(Color.dvBlue.ignoresSafeArea(edges: .top))
 
-            ZStack(alignment: .bottomTrailing) {
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(rows.indices, id: \.self) { i in
-                            let c = rows[i]
-                            ChatRow(c).contentShape(Rectangle())
-                                .onTapGesture { onOpen(c) }
-                                .contextMenu {
-                                    Button(role: .destructive) { pendingDelete = c } label: { Label("Delete Chat", systemImage: "trash") }
-                                }
-                            Rectangle().fill(Color.dvHair).frame(height: 1).padding(.leading, 84)
-                        }
+            if searching {
+                HStack(spacing: 10) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "magnifyingglass").foregroundColor(.dvSub).font(.system(size: 15))
+                        TextField("Search", text: $query)
+                            .font(.system(size: 15)).foregroundColor(.dvInk)
+                            .autocorrectionDisabled()
                     }
+                    .padding(.horizontal, 14).padding(.vertical, 10)
+                    .background(Color.dvHair).clipShape(Capsule())
+                    Text("Cancel").font(.system(size: 15)).foregroundColor(.dvBlue)
+                        .onTapGesture { searching = false; query = "" }
                 }
-                Button(action: onAdd) {
-                    Image(systemName: "person.badge.plus").foregroundColor(.white).font(.system(size: 22))
-                        .frame(width: 56, height: 56).background(Color.dvBlue).clipShape(RoundedRectangle(cornerRadius: 16))
-                        .shadow(color: .dvBlue.opacity(0.4), radius: 6, y: 3)
-                }.padding(20)
+                .padding(.horizontal, 16).padding(.vertical, 10)
             }
 
-            BottomBar(tab: tab, onTab: onTab)
+            ZStack(alignment: .bottom) {
+                ZStack(alignment: .bottomTrailing) {
+                    ScrollView {
+                        LazyVStack(spacing: 0) {
+                            ForEach(rows.indices, id: \.self) { i in
+                                let c = rows[i]
+                                ChatRow(c).contentShape(Rectangle())
+                                    .onTapGesture { onOpen(c) }
+                                    .contextMenu {
+                                        Button(role: .destructive) { pendingDelete = c } label: { Label("Delete Chat", systemImage: "trash") }
+                                    }
+                                Rectangle().fill(Color.dvHair).frame(height: 1).padding(.leading, 84)
+                            }
+                            // clear the floating bar + its shadow so the last row stays tappable
+                            Color.clear.frame(height: 96)
+                        }
+                    }
+                    Button(action: onAdd) {
+                        Image(systemName: "person.badge.plus").foregroundColor(.white).font(.system(size: 22))
+                            .frame(width: 56, height: 56).background(Color.dvBlue).clipShape(RoundedRectangle(cornerRadius: 16))
+                            .shadow(color: .dvBlue.opacity(0.4), radius: 6, y: 3)
+                    }.padding(.trailing, 20).padding(.bottom, 104)
+                }
+
+                BottomBar(
+                    tab: tab, onTab: onTab,
+                    chatBadge: all.reduce(0) { $0 + $1.unread },
+                    onSearch: { searching.toggle(); if !searching { query = "" } }
+                )
+            }
         }
         .background(Color.white)
         .alert("Delete chat", isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } })) {
@@ -635,32 +672,66 @@ private struct ChatRow: View {
     }
 }
 
+/// Floating bottom bar: a white capsule holding the four tabs, plus a detached round
+/// search button. It overlays the content (the lists pad their bottom for it) instead
+/// of docking to the window edge.
 private struct BottomBar: View {
     let tab: Int
     let onTab: (Int) -> Void
+    var chatBadge: Int = 0
+    var settingsAlert: Bool = false
+    var onSearch: () -> Void = {}
     var body: some View {
-        VStack(spacing: 0) {
-            Rectangle().fill(Color.dvHair).frame(height: 1)
-            HStack {
-                NavItem(icon: "bubble.left.fill", label: "Chats", active: tab == 0) { onTab(0) }
-                NavItem(icon: "phone.fill", label: "Calls", active: tab == 1) { onTab(1) }
-                NavItem(icon: "gearshape.fill", label: "Settings", active: tab == 2) { onTab(2) }
+        HStack(spacing: 10) {
+            HStack(spacing: 0) {
+                NavItem(icon: "person.fill", label: "Contacts", active: tab == TAB_CONTACTS) { onTab(TAB_CONTACTS) }
+                NavItem(icon: "phone.fill", label: "Calls", active: tab == TAB_CALLS) { onTab(TAB_CALLS) }
+                NavItem(icon: "bubble.left.fill", label: "Chats", active: tab == TAB_CHATS, badge: chatBadge) { onTab(TAB_CHATS) }
+                NavItem(icon: "gearshape.fill", label: "Settings", active: tab == TAB_SETTINGS, dot: settingsAlert) { onTab(TAB_SETTINGS) }
             }
-            .frame(maxWidth: .infinity)
-            .padding(.top, 8).padding(.bottom, 4)
+            .padding(6)
+            .background(Color.white)
+            .clipShape(Capsule())
+            .shadow(color: .black.opacity(0.16), radius: 12, y: 4)
+
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 22, weight: .medium))
+                .foregroundColor(.dvInk)
+                .frame(width: 58, height: 58)
+                .background(Color.white)
+                .clipShape(Circle())
+                .shadow(color: .black.opacity(0.16), radius: 12, y: 4)
+                .contentShape(Circle())
+                .onTapGesture(perform: onSearch)
         }
-        .background(Color.white)
+        .padding(.horizontal, 12)
+        .padding(.bottom, 6)
     }
 }
 
 private struct NavItem: View {
-    let icon: String; let label: String; let active: Bool; let onTap: () -> Void
+    let icon: String; let label: String; let active: Bool
+    var badge: Int = 0
+    var dot: Bool = false
+    let onTap: () -> Void
     var body: some View {
         VStack(spacing: 3) {
             Image(systemName: icon).font(.system(size: 21))
-            Text(label).font(.system(size: 11, weight: active ? .semibold : .regular))
+                .overlay(alignment: .topTrailing) {
+                    if badge > 0 || dot {
+                        Text(dot && badge == 0 ? "!" : "\(badge)")
+                            .font(.system(size: 10, weight: .bold)).foregroundColor(.white)
+                            .padding(.horizontal, 4).frame(minWidth: 16, minHeight: 16)
+                            .background(Color.dvBadge).clipShape(Capsule())
+                            .offset(x: 11, y: -8)
+                    }
+                }
+            Text(label).font(.system(size: 11, weight: active ? .semibold : .medium))
         }
-        .foregroundColor(active ? .dvBlue : .dvSub)
+        .foregroundColor(active ? .dvBlue : .dvInk)
+        .padding(.horizontal, 14).padding(.vertical, 7)
+        .background(active ? Color.dvBarActive : Color.clear)
+        .clipShape(Capsule())
         .frame(maxWidth: .infinity)
         .contentShape(Rectangle())
         .onTapGesture(perform: onTap)
@@ -690,88 +761,91 @@ struct ProfileView: View {
             .padding(16).frame(maxWidth: .infinity)
             .background(Color.dvBlue.ignoresSafeArea(edges: .top))
 
-            ScrollView {
-                VStack(spacing: 14) {
-                    Avatar(name, 76)
-                    Text(name).font(.system(size: 20, weight: .semibold)).foregroundColor(.dvInk)
+            ZStack(alignment: .bottom) {
+                ScrollView {
+                    VStack(spacing: 14) {
+                        Avatar(name, 76)
+                        Text(name).font(.system(size: 20, weight: .semibold)).foregroundColor(.dvInk)
 
-                    VStack(spacing: 6) {
-                        Text("Your display name").font(.system(size: 13)).foregroundColor(.dvSub)
-                        Text("This is the name shown when others add you or get your messages.")
-                            .font(.system(size: 11)).foregroundColor(.dvSub).multilineTextAlignment(.center)
-                        TextField("your name", text: $myName)
-                            .textInputAutocapitalization(.words).foregroundColor(.dvInk).multilineTextAlignment(.center)
-                            .padding(12).background(Color(hex: 0xF1F4F7)).clipShape(RoundedRectangle(cornerRadius: 12))
-                        Button(action: { onSaveName(myName) }) {
-                            Text("Save name")
+                        VStack(spacing: 6) {
+                            Text("Your display name").font(.system(size: 13)).foregroundColor(.dvSub)
+                            Text("This is the name shown when others add you or get your messages.")
+                                .font(.system(size: 11)).foregroundColor(.dvSub).multilineTextAlignment(.center)
+                            TextField("your name", text: $myName)
+                                .textInputAutocapitalization(.words).foregroundColor(.dvInk).multilineTextAlignment(.center)
+                                .padding(12).background(Color(hex: 0xF1F4F7)).clipShape(RoundedRectangle(cornerRadius: 12))
+                            Button(action: { onSaveName(myName) }) {
+                                Text("Save name")
+                                    .font(.system(size: 15, weight: .semibold)).foregroundColor(.white)
+                                    .frame(maxWidth: .infinity).padding(.vertical, 14)
+                                    .background(myName.trimmingCharacters(in: .whitespaces).isEmpty || myName == name ? Color(hex: 0xCBD3DA) : Color.dvBlue)
+                                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                            }.disabled(myName.trimmingCharacters(in: .whitespaces).isEmpty || myName == name)
+                        }
+                        .onAppear { if myName.isEmpty { myName = name } }
+
+                        VStack(spacing: 2) {
+                            Text("WCAHT identity address").font(.system(size: 12)).foregroundColor(.dvSub)
+                            Text(address).font(.system(size: 13)).foregroundColor(.dvBlue)
+                                .multilineTextAlignment(.center).textSelection(.enabled)
+                        }
+                        if let qr = qrImage(card) {
+                            qr.interpolation(.none).resizable().frame(width: 230, height: 230)
+                                .clipShape(RoundedRectangle(cornerRadius: 12))
+                                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.dvHair))
+                        }
+                        Text("Share this code so others can add you").font(.system(size: 13)).foregroundColor(.dvSub)
+                        Text(card).font(.system(size: 11)).foregroundColor(.dvInk)
+                            .multilineTextAlignment(.center).textSelection(.enabled)
+                            .padding(12).background(Color(hex: 0xF1F4F7)).clipShape(RoundedRectangle(cornerRadius: 10))
+                        Button(action: { UIPasteboard.general.string = card }) {
+                            Label("Copy my code", systemImage: "doc.on.doc")
+                                .font(.system(size: 13, weight: .semibold)).foregroundColor(.white)
+                                .padding(.horizontal, 18).padding(.vertical, 10)
+                                .background(Color.dvBlue).clipShape(RoundedRectangle(cornerRadius: 10))
+                        }
+
+                        Divider().padding(.vertical, 8)
+                        Text("Let others add you by phone number").font(.system(size: 13)).foregroundColor(.dvSub)
+                        HStack {
+                            Text("+855").foregroundColor(.dvInk)
+                            TextField("your number", text: $myPhone).keyboardType(.numberPad).foregroundColor(.dvInk)
+                        }
+                        .padding(12).background(Color(hex: 0xF1F4F7)).clipShape(RoundedRectangle(cornerRadius: 12))
+                        Button(action: { if !myPhone.isEmpty { onPublish(myPhone.trimmingCharacters(in: .whitespaces)) } }) {
+                            Text("Publish my number to the directory")
                                 .font(.system(size: 15, weight: .semibold)).foregroundColor(.white)
                                 .frame(maxWidth: .infinity).padding(.vertical, 14)
-                                .background(myName.trimmingCharacters(in: .whitespaces).isEmpty || myName == name ? Color(hex: 0xCBD3DA) : Color.dvBlue)
+                                .background(myPhone.isEmpty ? Color(hex: 0xCBD3DA) : Color.dvBlue)
                                 .clipShape(RoundedRectangle(cornerRadius: 12))
-                        }.disabled(myName.trimmingCharacters(in: .whitespaces).isEmpty || myName == name)
-                    }
-                    .onAppear { if myName.isEmpty { myName = name } }
+                        }.disabled(myPhone.isEmpty)
+                        Text("Only a hash of your number is stored — never the number itself.")
+                            .font(.system(size: 11)).foregroundColor(.dvSub).multilineTextAlignment(.center)
 
-                    VStack(spacing: 2) {
-                        Text("WCAHT identity address").font(.system(size: 12)).foregroundColor(.dvSub)
-                        Text(address).font(.system(size: 13)).foregroundColor(.dvBlue)
-                            .multilineTextAlignment(.center).textSelection(.enabled)
+                        Divider().padding(.vertical, 8)
+                        Text("Server").font(.system(size: 13)).foregroundColor(.dvSub)
+                        Text("Host running the relay + gateways + directory. Both people must point at the same one.")
+                            .font(.system(size: 11)).foregroundColor(.dvSub).multilineTextAlignment(.center)
+                        TextField("server IP or hostname", text: $host)
+                            .textInputAutocapitalization(.never).foregroundColor(.dvInk)
+                            .padding(12).background(Color(hex: 0xF1F4F7)).clipShape(RoundedRectangle(cornerRadius: 12))
+                        Button(action: {
+                            let h = host.trimmingCharacters(in: .whitespaces)
+                            if !h.isEmpty { Server.host = h; host = h }
+                        }) {
+                            Text("Save server")
+                                .font(.system(size: 15, weight: .semibold)).foregroundColor(.white)
+                                .frame(maxWidth: .infinity).padding(.vertical, 14)
+                                .background(host.isEmpty ? Color(hex: 0xCBD3DA) : Color.dvBlue)
+                                .clipShape(RoundedRectangle(cornerRadius: 12))
+                        }.disabled(host.isEmpty)
+                        Color.clear.frame(height: 96) // clear the floating bar
                     }
-                    if let qr = qrImage(card) {
-                        qr.interpolation(.none).resizable().frame(width: 230, height: 230)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
-                            .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.dvHair))
-                    }
-                    Text("Share this code so others can add you").font(.system(size: 13)).foregroundColor(.dvSub)
-                    Text(card).font(.system(size: 11)).foregroundColor(.dvInk)
-                        .multilineTextAlignment(.center).textSelection(.enabled)
-                        .padding(12).background(Color(hex: 0xF1F4F7)).clipShape(RoundedRectangle(cornerRadius: 10))
-                    Button(action: { UIPasteboard.general.string = card }) {
-                        Label("Copy my code", systemImage: "doc.on.doc")
-                            .font(.system(size: 13, weight: .semibold)).foregroundColor(.white)
-                            .padding(.horizontal, 18).padding(.vertical, 10)
-                            .background(Color.dvBlue).clipShape(RoundedRectangle(cornerRadius: 10))
-                    }
-
-                    Divider().padding(.vertical, 8)
-                    Text("Let others add you by phone number").font(.system(size: 13)).foregroundColor(.dvSub)
-                    HStack {
-                        Text("+855").foregroundColor(.dvInk)
-                        TextField("your number", text: $myPhone).keyboardType(.numberPad).foregroundColor(.dvInk)
-                    }
-                    .padding(12).background(Color(hex: 0xF1F4F7)).clipShape(RoundedRectangle(cornerRadius: 12))
-                    Button(action: { if !myPhone.isEmpty { onPublish(myPhone.trimmingCharacters(in: .whitespaces)) } }) {
-                        Text("Publish my number to the directory")
-                            .font(.system(size: 15, weight: .semibold)).foregroundColor(.white)
-                            .frame(maxWidth: .infinity).padding(.vertical, 14)
-                            .background(myPhone.isEmpty ? Color(hex: 0xCBD3DA) : Color.dvBlue)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
-                    }.disabled(myPhone.isEmpty)
-                    Text("Only a hash of your number is stored — never the number itself.")
-                        .font(.system(size: 11)).foregroundColor(.dvSub).multilineTextAlignment(.center)
-
-                    Divider().padding(.vertical, 8)
-                    Text("Server").font(.system(size: 13)).foregroundColor(.dvSub)
-                    Text("Host running the relay + gateways + directory. Both people must point at the same one.")
-                        .font(.system(size: 11)).foregroundColor(.dvSub).multilineTextAlignment(.center)
-                    TextField("server IP or hostname", text: $host)
-                        .textInputAutocapitalization(.never).foregroundColor(.dvInk)
-                        .padding(12).background(Color(hex: 0xF1F4F7)).clipShape(RoundedRectangle(cornerRadius: 12))
-                    Button(action: {
-                        let h = host.trimmingCharacters(in: .whitespaces)
-                        if !h.isEmpty { Server.host = h; host = h }
-                    }) {
-                        Text("Save server")
-                            .font(.system(size: 15, weight: .semibold)).foregroundColor(.white)
-                            .frame(maxWidth: .infinity).padding(.vertical, 14)
-                            .background(host.isEmpty ? Color(hex: 0xCBD3DA) : Color.dvBlue)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
-                    }.disabled(host.isEmpty)
+                    .padding(20)
                 }
-                .padding(20)
-            }
 
-            BottomBar(tab: tab, onTab: onTab)
+                BottomBar(tab: tab, onTab: onTab)
+            }
         }
         .background(Color.white)
     }
