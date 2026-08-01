@@ -104,6 +104,12 @@ pub struct AnchorSigner {
     from_b58: String,
 }
 
+/// A plain transfer's derived compute floor in the runtime. Declaring this (rather than the
+/// generic 200,000) is what keeps an anchor at the 5,000-kak signature floor.
+pub const ANCHOR_COMPUTE_UNITS: u64 = 5_000;
+/// The consensus minimum fee for a transfer at that budget.
+pub const ANCHOR_MIN_FEE: u64 = 5_000;
+
 impl AnchorSigner {
     pub fn from_seed(seed: &[u8; 32]) -> Self {
         let sk = SigningKey::from_bytes(seed);
@@ -125,8 +131,27 @@ impl AnchorSigner {
         timestamp: u64,
         fee: u64,
     ) -> Result<Value> {
+        self.transfer_tx_with_cu(to_b58, amount, recent_blockhash_hex, last_valid_slot, timestamp, fee, 200_000)
+    }
+
+    /// As `transfer_tx`, but declaring the compute budget explicitly.
+    ///
+    /// This matters for cost, not just tidiness. The runtime charges
+    /// `max(base_signature_fee, declared_cu.max(derived_floor) * price_per_cu)`, and a plain
+    /// transfer's derived floor is only 5,000 CU. Declaring 200,000 therefore makes an anchor
+    /// cost 200,000 kak instead of the 5,000 floor — 40x, for nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn transfer_tx_with_cu(
+        &self,
+        to_b58: &str,
+        amount: u128,
+        recent_blockhash_hex: &str,
+        last_valid_slot: u64,
+        timestamp: u64,
+        fee: u64,
+        compute_units: u64,
+    ) -> Result<Value> {
         let rbh = decode_32(recent_blockhash_hex)?;
-        let compute_units: u64 = 200_000;
         let priority_fee: u64 = 0;
 
         let preimage = canonical_bytes_v2(
@@ -169,13 +194,15 @@ impl AnchorSigner {
         timestamp: u64,
         fee: u64,
     ) -> Result<Value> {
-        self.transfer_tx(
+        self.transfer_tx_with_cu(
             &bs58::encode(leaf_hash).into_string(),
             10_000, // tiny, above any dust floor; the anchor is a commitment
             recent_blockhash_hex,
             last_valid_slot,
             timestamp,
             fee,
+            // an anchor is a plain transfer — declare the transfer floor, not 200k
+            ANCHOR_COMPUTE_UNITS,
         )
     }
 

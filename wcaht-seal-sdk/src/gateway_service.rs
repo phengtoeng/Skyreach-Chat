@@ -113,7 +113,10 @@ fn anchor_leaf(
 ) -> Result<(String, u64)> {
     let (blockhash, slot) = rpc.recent_blockhash()?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let fee: u64 = std::env::var("WCAHT_ANCHOR_FEE").ok().and_then(|v| v.parse().ok()).unwrap_or(25_000);
+    let fee: u64 = std::env::var("WCAHT_ANCHOR_FEE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(crate::ANCHOR_MIN_FEE);
     let tx = signer.anchor_tx(leaf_hash, &blockhash, slot + 150, now, fee)?;
     let resp = rpc.submit_tx(&tx, api_key)?;
     let sig = tx.get("signature").and_then(Value::as_str).unwrap_or_default().to_string();
