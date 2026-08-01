@@ -363,7 +363,8 @@ pub enum SealStatus {
     Invalid,
 }
 
-#[derive(Clone, Debug)]
+/// Serializable so a batcher can serve it over HTTP and a recipient can verify it off the wire.
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SealProof {
     pub seal_id: [u8; 32],
     pub leaf_hash: [u8; 32],

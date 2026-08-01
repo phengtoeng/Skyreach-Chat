@@ -34,6 +34,14 @@ name = "wcaht-seal-media-e2e"
 path = "src/bin/media_e2e.rs"
 
 [[bin]]
+name = "wcaht-seal-batch-demo"
+path = "src/bin/batch_demo.rs"
+
+[[bin]]
+name = "wcaht-seal-batcher"
+path = "src/bin/batcher_server.rs"
+
+[[bin]]
 name = "wcaht-seal-relay"
 path = "src/bin/relay_server.rs"
 

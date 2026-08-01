@@ -21,6 +21,7 @@ use seal_core::{SealChain, SealProof, SealStatus};
 use serde_json::{json, Value};
 
 pub mod directory;
+pub mod batcher;
 pub mod gateway_service;
 pub mod relay;
 pub mod stats;
@@ -73,20 +74,42 @@ impl WcahtRpc {
 
     /// Submit a signed transfer JSON to `/transactions/submit`. `api_key` is the
     /// node's SubmitTransaction API key (WCAHT security_config).
+    /// Submit a signed transaction.
+    ///
+    /// Tries the admin endpoint when an API key is supplied, then falls back to the PUBLIC
+    /// JSON-RPC `sendTransaction`, which needs no key. The live nodes reject the documented
+    /// default admin key, so a service without the real one would otherwise be unable to
+    /// submit anything at all.
     pub fn submit_tx(&self, tx: &Value, api_key: Option<&str>) -> Result<Value> {
-        let mut req = self.http.post(format!("{}/transactions/submit", self.base)).json(tx);
         if let Some(k) = api_key {
-            req = req.header("x-api-key", k);
+            let resp = self
+                .http
+                .post(format!("{}/transactions/submit", self.base))
+                .header("x-api-key", k)
+                .json(tx)
+                .send()?;
+            if resp.status().is_success() {
+                return Ok(resp.json().unwrap_or(Value::Null));
+            }
         }
-        let resp = req.send()?;
-        let ok = resp.status().is_success();
+        self.submit_tx_rpc(tx)
+    }
+
+    /// Public JSON-RPC submission — no admin key required.
+    pub fn submit_tx_rpc(&self, tx: &Value) -> Result<Value> {
+        // The node expects the signed tx as a JSON *string* param, not an object —
+        // params: [tx_data]. Passing the object yields -32602 "Expected [tx_data] params".
+        let tx_json = serde_json::to_string(tx)?;
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "sendTransaction", "params": [tx_json],
+        });
+        let resp = self.http.post(format!("{}/rpc", self.base)).json(&body).send()?;
         let status = resp.status();
-        let body: Value = resp.json().unwrap_or(Value::Null);
-        if ok {
-            Ok(body)
-        } else {
-            Err(anyhow!("submit rejected ({status}): {body}"))
+        let out: Value = resp.json().unwrap_or(Value::Null);
+        if !status.is_success() || out.get("error").is_some() {
+            return Err(anyhow!("submit rejected ({status}): {out}"));
         }
+        Ok(out)
     }
 
     /// GET `/transaction/:signature` — the confirmed tx JSON (`{"status":"confirmed","slot":N,…}`).
