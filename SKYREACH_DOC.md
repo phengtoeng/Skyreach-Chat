@@ -15,10 +15,15 @@ and a WCAHT **seal** gates when it can be opened. Nothing opens until the seal r
 either at **hard L1 finality** (StrictSeal / vault) or on a **quorum of slashable gateway
 pre-confirmations** (FastSeal / sub-250ms fast path). This is protocol **DSCP-2**.
 
-**Status: DSCP-2 is feature-complete.** Protocol core, real on-chain anchoring, payload-prefetch
-delivery relay, gateway staking/slashing, and a dual-mode UI in both native apps are all built.
-**27 Rust tests green.** Three real transactions landed on the live chain (see §6). Not audited;
-Phase 3 (production services + media/groups/calls + audit) is what remains.
+**Status: DSCP-2 is feature-complete, and sealed MEDIA (photo/video) now works end to end.**
+Protocol core, real on-chain anchoring, payload-prefetch delivery relay, gateway
+staking/slashing, a dual-mode UI in both native apps, and chunked encrypted media with a
+`/blob` store on the live relays are all built. **45 Rust tests green.** Three real
+transactions landed on the live chain (see §6). Not audited; Phase 3 (production gateway
+services, groups/calls, audit) is what remains.
+
+⚠️ The **iOS media UI is written but has never been compiled** — it was authored on a Windows
+machine with no Xcode. Build it on a Mac before trusting it.
 
 - **Location:** `C:\Users\toeng\Desktop\WCAHT\denvion-splitseal\` — sibling of the WCAHT
   blockchain repo `PoASy3\`, **not inside it**.
@@ -91,7 +96,7 @@ Both apps drive the **same** Rust core; only the UI layer differs.
 
 ```bash
 cd denvion-splitseal
-cargo test          # 27 tests green (crypto, threat matrix, DSCP-2, registry, relay, SDK)
+cargo test          # 45 tests green (crypto, threat matrix, DSCP-2, registry, relay, media, SDK)
 cargo build         # clean, no warnings
 ```
 
@@ -163,11 +168,14 @@ The SplitSeal SDK talks to the real WCAHT chain (`PoASy3`). Facts learned the ha
 
 ---
 
-## 6b. Backend services on N6 + two-device testing
+## 6b. Backend services on N5/N6/N7 + two-device testing
 
 The apps talk to five stateless HTTP services (ciphertext + hashes only — **never** keys or
-plaintext). They are DEPLOYED + LIVE on WCAHT node **N6** (`51.79.176.134`), in a directory
-**separate from the validator** (`~/skyreach/`, ports well clear of the node's 8901/8902):
+plaintext). They are DEPLOYED + LIVE on **all three** WCAHT nodes — N5 `139.99.150.23`,
+N6 `51.79.176.134`, N7 `51.79.162.80` — each in a directory **separate from the validator**
+(`~/skyreach/`, ports well clear of the node's 8901/8902). The apps ship ciphertext to every
+relay and read from all of them, so any one node can be down and delivery still works.
+**N1 runs none of these**, and is not in the apps' node list.
 
 | service   | port | systemd unit         | role                                                  |
 |-----------|------|----------------------|-------------------------------------------------------|
@@ -183,17 +191,36 @@ ssh ubuntu@51.79.176.134
 sudo systemctl restart skyreach-relay skyreach-gw1 skyreach-gw2 skyreach-gw3 skyreach-directory
 tail -f ~/skyreach/logs/relay.log
 ```
-Redeploy after a Rust change (N6 has a minimal toolchain, builds natively):
+Redeploy after a Rust change. **Only N5 and N6 have cargo — N7 does not**, so build once and
+copy the binary; all three are x86_64 / glibc 2.39 so one build serves them all. Build
+`--release`: the deployed binaries are release (~3.3 MB), a debug build is ~72 MB.
+
 ```bash
+# 1. build on N6 (stable toolchain)
 # from denvion-splitseal/
 tar czf /tmp/sk.tgz Cargo.toml Cargo.lock seal-crypto seal-core seal-ffi wcaht-seal-sdk
-scp /tmp/sk.tgz ubuntu@51.79.176.134:~/ && ssh ubuntu@51.79.176.134 '
+scp /tmp/sk.tgz ubuntu@51.79.176.134:sk.tgz
+ssh ubuntu@51.79.176.134 'source ~/.cargo/env &&
   rm -rf ~/skyreach-src && mkdir ~/skyreach-src && tar xzf ~/sk.tgz -C ~/skyreach-src &&
-  source ~/.cargo/env && cd ~/skyreach-src &&
-  cargo build -p wcaht-seal-sdk --bin wcaht-seal-relay --bin wcaht-seal-gateway --bin wcaht-seal-directory &&
-  cp target/debug/wcaht-seal-{relay,gateway,directory} ~/skyreach/bin/ &&
-  for n in relay gw1 gw2 gw3 directory; do sudo systemctl restart skyreach-$n; done'
+  cd ~/skyreach-src && cargo build --release -p wcaht-seal-sdk --bin wcaht-seal-relay'
+scp ubuntu@51.79.176.134:skyreach-src/target/release/wcaht-seal-relay /tmp/relay.new
+
+# 2. roll it out — CANARY FIRST (N7, not the app default), verify, then N6 and N5
+for h in 51.79.162.80 51.79.176.134 139.99.150.23; do
+  scp /tmp/relay.new ubuntu@$h:relay.new
+  ssh ubuntu@$h 'cd ~/skyreach/bin &&
+    cp -a wcaht-seal-relay wcaht-seal-relay.bak-$(date +%Y%m%d-%H%M%S) &&   # rollback copy
+    install -m 755 ~/relay.new wcaht-seal-relay &&
+    sudo systemctl restart skyreach-relay'
+  # verify before moving to the next node:
+  curl -s http://$h:9200/blob/$(printf 'a%.0s' {1..64})   # → {"message":"no such blob"}
+done
 ```
+
+Restarting the relay is safe: the inbox is an append log reloaded on start, so queued
+messages survive (verified — 25 items intact across all three restarts). Only restart the
+units whose binary actually changed. **Rollback** = `install -m 755` the `.bak-*` copy and
+restart.
 
 ### Sealed media (photo / video)
 
@@ -277,18 +304,24 @@ Android side: on a FRESH (non-emulator) checkout, rebuild the `.so` once —
    `{seal_id, bundle}` to the relay under **B's mailbox tag** + the 3 shares to the gateways.
 4. B's app polls **its own** mailbox tag (`ss_mailbox_tag(my device_pub)`) every ~3 s, collects the
    released shares, opens locally, shows it. On A's side you only see the outgoing "🔒 Sealed for B".
+5. **Photo/video:** tap the camera in the composer. A seals + uploads encrypted chunks to every
+   relay, then ships the manifest bundle. B opens the manifest, pulls the chunks it names,
+   verifies each against the manifest, decrypts, and renders. Tap a video to play it fullscreen.
 
 ### Gotchas for the 2-device test
 - **"Me" is a self-loopback, not another device.** The auto-created "Me" contact is linked to your
   OWN device key, so sealing to it ships to your own mailbox and your own poll echoes it right back —
   an on-device proof of the full pipeline, NOT a send to iOS. Use a REAL contact (the other phone).
-- **Messages aren't tagged by sender yet** (TOP FOLLOW-UP). Received messages are keyed by the
-  recipient's mailbox tag (the per-seal sender id is ephemeral), so ALL inbound — including "Me"
-  self-test messages — shows in EVERY real conversation. Before a clean iOS test either **Clear
-  storage** on the app (fresh identity + empty inbox; re-share codes), OR do the **sender-tagging
-  fix**: have the sender sign with their stable identity so the recipient routes each message to the
-  right chat (small change: FFI `ss_seal_shippable` takes the sender's identity seed + the recipient
-  filters by `sender_id_pub` == a contact's `identity_pub`; mirror on iOS + Android).
+- **Sender tagging is DONE** (this used to be the top follow-up). The sender signs with their
+  stable chat identity and embeds their card, so the bundle carries `sender_id_pub`; the recipient
+  routes each message to the chat whose `identity_pub` matches, and auto-creates the sender as a
+  replyable contact. Inbound no longer leaks into every conversation.
+- **Media needs the relay to have `/blob`.** If a photo fails to send, check the relay build:
+  `curl http://<host>:9200/blob/$(printf 'a%.0s' {1..64})` must answer `no such blob`, not
+  `not found` (that means an old binary). All three live nodes were updated 2026-08-01.
+- **Both devices must point at the same backend.** Settings ▸ Server. Leave it at the default
+  (`51.79.176.134`) to use the replicated live backbone; set any other host and the app pins to
+  that single machine (relay 9200, gateways 9201-9203 on consecutive ports — dev only).
 
 ---
 
@@ -336,7 +369,7 @@ Android side: on a FRESH (non-emulator) checkout, rebuild the `.so` once —
 
 ## 9. What's NEXT (Phase 3) — pick up here
 
-Prioritized, with entry points. None of this is started.
+Prioritized, with entry points. Media (item 5) is **done**; the rest is not started.
 
 1. **Production gateway services (multi-gateway).** Turn `Gateway` + `GatewayRegistry` into 3+
    independent long-running services that: hold shares, verify finality independently, issue
@@ -351,8 +384,15 @@ Prioritized, with entry points. None of this is started.
    the `PoASy3` team), or (b) a trusted registry service that custodies bonds and forfeits on a
    finalized slash-claim. Until then, treat slashing as "provable + published", not "auto-forfeited".
 4. **Device linking + proof screen** in the apps (show the seal proof / finality / pre-conf quorum).
-5. **Media / groups / calls** — encrypted chunked images/voice/docs (`ContentType::Media/Document`
-   already exists), MLS groups, `CALL_SESSION` (`ContentType::CallSession` exists as a stub).
+5. **Media** — ✅ **DONE for photo + video** (see §6b "Sealed media"): `seal_media_with_mode` /
+   `try_open_media` in `seal-core`, three `ss_*_media_*` FFI entry points, `/blob` on the relay,
+   pickers + rendering in the Android app. Deployed to N5/N6/N7 and verified live.
+   ▸ Remaining here: **voice notes and documents** (`ContentKind::Audio` / `File` already exist —
+   only the app-side capture/render is missing), **blob GC after `destroy_at`** (chunks currently
+   linger on the relay once the key is withheld), true **streaming** for very large files (the
+   FFI reads the whole file into memory, capped at 64 MiB), and an **inbox cursor**
+   (`GET /inbox/<tag>` still returns the whole mailbox on every 3s poll).
+   ▸ Then: **MLS groups**, `CALL_SESSION` live calls (`ContentType::CallSession` exists as a stub).
 6. **Real gateway staking economics** — min-bond calibration, partial slashing, unbonding periods.
 7. **24h soak + external crypto/protocol audit** before any real use.
 
