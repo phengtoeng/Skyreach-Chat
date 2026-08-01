@@ -5,6 +5,8 @@
 //! Wire contract:
 //!   POST /deposit                     body = KeyShareEnvelope JSON     → 200
 //!   POST /finalize/<hex seal_id>      (the gateway observed L1 finality) → 200
+//!        optional body { signed_leaf, sender_id_pub } installs the seal's timelock window,
+//!        taken from the SIGNED leaf — a bare {reveal_at,destroy_at} is refused
 //!   GET  /release/<hex seal_id>       → [KeyShareEnvelope]  (425 if not finalised yet)
 
 use std::collections::{HashMap, HashSet};
@@ -12,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
-use seal_core::KeyShareEnvelope;
+use seal_core::{KeyShareEnvelope, SignedLeaf};
 use serde_json::Value;
 
 #[derive(Default)]
@@ -24,6 +26,61 @@ struct GwStore {
     // reconstruct the key outside the window. This is what makes timelock/self-destruct
     // cryptographic (key-level), not a client-side "please delete" policy.
     windows: HashMap<String, (i64, i64)>,
+}
+
+/// Extract a timelock window from a `{signed_leaf, sender_id_pub}` body, but only if the leaf
+/// really is the sender's and really is this seal's.
+///
+/// `Ok(None)` = the body carried no leaf (legacy/no-window finalise). `Err` = it carried
+/// something that failed verification, which we refuse rather than silently ignore.
+fn verify_window(body: &str, sid_hex: &str, store: &Arc<Mutex<GwStore>>) -> Result<Option<(i64, i64)>, String> {
+    let Ok(v) = serde_json::from_str::<Value>(body) else {
+        return Err("unparseable finalize body".into());
+    };
+    // A bare {reveal_at, destroy_at} is exactly the forgeable thing we no longer accept.
+    if v.get("signed_leaf").is_none() {
+        if v.get("reveal_at").is_some() || v.get("destroy_at").is_some() {
+            return Err("a timelock window must arrive inside a signed leaf, not as bare fields".into());
+        }
+        return Ok(None);
+    }
+    let leaf: SignedLeaf = serde_json::from_value(v["signed_leaf"].clone())
+        .map_err(|e| format!("bad signed_leaf: {e}"))?;
+    let sender_pub: [u8; 32] = v
+        .get("sender_id_pub")
+        .and_then(Value::as_str)
+        .and_then(|s| hex::decode(s).ok())
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| "missing sender_id_pub".to_string())?;
+
+    // the leaf must be for the seal named in the path
+    if hex::encode(leaf.leaf.seal_id) != sid_hex {
+        return Err("signed leaf is for a different seal".into());
+    }
+    // the pubkey must be the one the leaf commits to, and the signature must verify over it
+    if seal_core::identity_commitment(&sender_pub) != leaf.leaf.sender_identity_commitment {
+        return Err("sender_id_pub does not match the leaf's identity commitment".into());
+    }
+    let sig: [u8; 64] = leaf
+        .sender_signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| "malformed sender signature".to_string())?;
+    if !seal_crypto::verify_sig(&sender_pub, &leaf.leaf.canonical_bytes(), &sig) {
+        return Err("invalid sender signature on the leaf".into());
+    }
+    // and it must be the SAME leaf our shares were issued against, so a valid leaf from
+    // elsewhere cannot be pointed at this seal's shares
+    {
+        let s = store.lock().unwrap();
+        if let Some(held) = s.shares.get(sid_hex) {
+            let want = leaf.leaf.leaf_hash();
+            if held.iter().any(|e| e.leaf_hash != want) {
+                return Err("leaf does not match the shares held for this seal".into());
+            }
+        }
+    }
+    Ok(Some((leaf.leaf.reveal_at_unix as i64, leaf.leaf.destroy_at_unix as i64)))
 }
 
 fn now_unix() -> i64 {
@@ -57,24 +114,36 @@ pub fn serve_gateway(addr: &str) -> Result<()> {
             }
             (tiny_http::Method::Post, path) if path.starts_with("/finalize/") => {
                 let sid = path["/finalize/".len()..].to_string();
-                // optional JSON body {reveal_at, destroy_at} sets the timelock window for this seal.
+                // The timelock window is taken from the SIGNED leaf, never from a bare
+                // {reveal_at, destroy_at} body: this endpoint has no authentication, so a
+                // caller-supplied window could be set by anyone. Body (optional):
+                //   { signed_leaf: SignedLeaf, sender_id_pub: hex }
+                // We verify the sender signature, that the leaf is for THIS seal, and that it
+                // is the same leaf our held shares were issued against — so the only window
+                // anyone can install is the one the sender actually signed.
                 let mut buf = String::new();
                 let _ = req.as_reader().read_to_string(&mut buf);
-                let (reveal_at, destroy_at) = serde_json::from_str::<Value>(&buf)
-                    .ok()
-                    .map(|v| {
-                        (
-                            v.get("reveal_at").and_then(Value::as_i64).unwrap_or(0),
-                            v.get("destroy_at").and_then(Value::as_i64).unwrap_or(0),
-                        )
-                    })
-                    .unwrap_or((0, 0));
-                let mut s = store.lock().unwrap();
-                s.finalised.insert(sid.clone());
-                if reveal_at > 0 || destroy_at > 0 {
-                    s.windows.insert(sid, (reveal_at, destroy_at));
+                let mut window: Option<(i64, i64)> = None;
+                let mut rejected: Option<String> = None;
+                if !buf.trim().is_empty() {
+                    match verify_window(&buf, &sid, &store) {
+                        Ok(Some(w)) => window = Some(w),
+                        Ok(None) => {}                      // no leaf supplied → no window
+                        Err(e) => rejected = Some(e),
+                    }
                 }
-                (200, r#"{"status":"finalised"}"#.to_string())
+                if let Some(e) = rejected {
+                    (400, err_json(&e))
+                } else {
+                    let mut s = store.lock().unwrap();
+                    s.finalised.insert(sid.clone());
+                    if let Some((r, d)) = window {
+                        if r > 0 || d > 0 {
+                            s.windows.insert(sid, (r, d));
+                        }
+                    }
+                    (200, r#"{"status":"finalised"}"#.to_string())
+                }
             }
             (tiny_http::Method::Get, path) if path.starts_with("/release/") => {
                 let sid = &path["/release/".len()..];
@@ -143,5 +212,79 @@ impl GatewayClient {
             return Ok(Vec::new());
         }
         Ok(resp.error_for_status()?.json()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use seal_core::{seal_text_with_mode, SealMode};
+    use seal_crypto as sc;
+
+    /// Build a real sealed item so we have a genuinely signed leaf to work with.
+    fn signed_item(reveal: u64, destroy: u64) -> (seal_core::SealedItem, [u8; 32]) {
+        let id = sc::SignId::generate();
+        let dev = sc::SignId::generate();
+        let bob = sc::DeviceKey::generate();
+        let gw: Vec<[u8; 32]> = (0..3).map(|_| sc::random_32()).collect();
+        let item = seal_text_with_mode(
+            b"x", &id, &dev, &bob.public(), sc::random_32(), &gw, 2, 100, 100_000,
+            SealMode::StrictSeal, reveal, destroy,
+        )
+        .unwrap();
+        (item, id.public())
+    }
+
+    fn body(item: &seal_core::SealedItem, sender_pub: &[u8; 32]) -> String {
+        serde_json::json!({
+            "signed_leaf": serde_json::to_value(&item.signed_leaf).unwrap(),
+            "sender_id_pub": hex::encode(sender_pub),
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_signed_leaf_installs_its_own_window() {
+        let (item, pubk) = signed_item(1_900_000_000, 0);
+        let sid = hex::encode(item.signed_leaf.leaf.seal_id);
+        let store = Arc::new(Mutex::new(GwStore::default()));
+        let w = verify_window(&body(&item, &pubk), &sid, &store).expect("verifies");
+        assert_eq!(w, Some((1_900_000_000, 0)));
+    }
+
+    #[test]
+    fn bare_numbers_are_refused_now() {
+        // This is the old forgeable shape: anyone could POST it and move a deadline.
+        let store = Arc::new(Mutex::new(GwStore::default()));
+        let e = verify_window(r#"{"reveal_at":1,"destroy_at":2}"#, "aa", &store).unwrap_err();
+        assert!(e.contains("signed leaf"), "{e}");
+    }
+
+    #[test]
+    fn a_tampered_deadline_is_refused() {
+        let (mut item, pubk) = signed_item(1_900_000_000, 0);
+        let sid = hex::encode(item.signed_leaf.leaf.seal_id);
+        item.signed_leaf.leaf.reveal_at_unix = 1; // shorten it — signature no longer covers this
+        let store = Arc::new(Mutex::new(GwStore::default()));
+        let e = verify_window(&body(&item, &pubk), &sid, &store).unwrap_err();
+        assert!(e.contains("invalid sender signature"), "{e}");
+    }
+
+    #[test]
+    fn a_valid_leaf_for_another_seal_is_refused() {
+        let (item, pubk) = signed_item(1_900_000_000, 0);
+        let store = Arc::new(Mutex::new(GwStore::default()));
+        // genuine, correctly signed leaf — but aimed at a different seal id
+        let e = verify_window(&body(&item, &pubk), &hex::encode([9u8; 32]), &store).unwrap_err();
+        assert!(e.contains("different seal"), "{e}");
+    }
+
+    #[test]
+    fn a_mismatched_sender_key_is_refused() {
+        let (item, _) = signed_item(1_900_000_000, 0);
+        let sid = hex::encode(item.signed_leaf.leaf.seal_id);
+        let store = Arc::new(Mutex::new(GwStore::default()));
+        let e = verify_window(&body(&item, &sc::SignId::generate().public()), &sid, &store).unwrap_err();
+        assert!(e.contains("identity commitment"), "{e}");
     }
 }

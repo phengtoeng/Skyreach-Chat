@@ -391,11 +391,15 @@ func shipSeal(_ ship: [String: Any]) async -> Bool {
             }
         }
     }
-    // the timelock window travels to the gateways: they withhold shares before reveal_at / after destroy_at.
-    let revealAt = ship["reveal_at"] as? Int64 ?? 0
-    let destroyAt = ship["destroy_at"] as? Int64 ?? 0
-    let window = (try? JSONSerialization.data(withJSONObject: ["reveal_at": revealAt, "destroy_at": destroyAt]))
-        .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+    // The timelock travels to the gateways as the SIGNED LEAF, not as bare numbers: the
+    // gateway verifies the sender signature and reads the window out of the leaf, so nobody
+    // else can install a different one.
+    var window = "{}"
+    if let b = ship["bundle"] as? [String: Any], let leaf = b["signed_leaf"] {
+        let payload: [String: Any] = ["signed_leaf": leaf, "sender_id_pub": b["sender_id_pub"] as? String ?? ""]
+        window = (try? JSONSerialization.data(withJSONObject: payload))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+    }
     if let shares = ship["shares"] as? [Any] {
         let gws = gatewayURLs
         for (i, sh) in shares.enumerated() where i < gws.count {

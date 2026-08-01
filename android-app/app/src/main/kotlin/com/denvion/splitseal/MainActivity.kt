@@ -415,8 +415,14 @@ private fun shipSeal(ship: JSONObject): Boolean {
     for (r in Server.relays) if (httpPost("$r/inbox/$tag", item.toString()) in 200..299) relayOk = true
     val shares = ship.getJSONArray("shares")
     val gateways = Server.gateways
-    // the timelock window travels to the gateways: they withhold shares before reveal_at / after destroy_at.
-    val window = JSONObject().put("reveal_at", ship.optLong("reveal_at")).put("destroy_at", ship.optLong("destroy_at")).toString()
+    // The timelock travels to the gateways as the SIGNED LEAF, not as bare numbers: the
+    // gateway verifies the sender signature and reads the window out of the leaf, so nobody
+    // else can install a different one.
+    val bundle = ship.getJSONObject("bundle")
+    val window = JSONObject()
+        .put("signed_leaf", bundle.opt("signed_leaf"))
+        .put("sender_id_pub", bundle.optString("sender_id_pub"))
+        .toString()
     for (i in 0 until minOf(shares.length(), gateways.size)) {
         httpPost("${gateways[i]}/deposit", shares.getJSONObject(i).toString())
         httpPost("${gateways[i]}/finalize/$sealId", window)
