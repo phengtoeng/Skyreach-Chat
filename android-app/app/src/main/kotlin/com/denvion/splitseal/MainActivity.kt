@@ -336,6 +336,10 @@ object Server {
         else nodeHosts.map { "http://$it:9201" }
     // Replicated directories (gossip + persist server-side): register to ALL, look up on ANY.
     val directories: List<String> get() = nodeHosts.map { "http://$it:9988" }
+    // Seal batchers: every message's leaf goes here to be committed under a SEAL_ROOT, and
+    // recipients fetch the merkle proof that their message is inside that finalised root.
+    val batchers: List<String> get() =
+        if (pinned) listOf("http://$host:9300") else nodeHosts.map { "http://$it:9300" }
 }
 
 private fun directoryLookup(phone: String): JSONObject? {
@@ -410,6 +414,8 @@ private fun shipSeal(ship: JSONObject): Boolean {
     val sealId = ship.optString("seal_id")
     // carry seal_id alongside the ciphertext so the recipient (who has neither) can collect shares.
     val item = JSONObject().put("seal_id", sealId).put("bundle", ship.getJSONObject("bundle"))
+    // the leaf also goes to the batchers, so this message ends up inside a committed SEAL_ROOT
+    runCatching { submitLeafForBatching(ship.getJSONObject("bundle")) }
     // replicate the ciphertext to every relay so any one of them can serve the recipient.
     var relayOk = false
     for (r in Server.relays) if (httpPost("$r/inbox/$tag", item.toString()) in 200..299) relayOk = true
@@ -428,6 +434,28 @@ private fun shipSeal(ship: JSONObject): Boolean {
         httpPost("${gateways[i]}/finalize/$sealId", window)
     }
     return relayOk
+}
+
+/** Hand this message's signed leaf to the batchers so it gets committed under a SEAL_ROOT.
+ *  Fire-and-forget: a batcher being down must never stop a message being delivered — the
+ *  capsule still opens on the gateways, it just has no batched proof yet. */
+private fun submitLeafForBatching(bundle: JSONObject) {
+    val body = JSONObject()
+        .put("signed_leaf", bundle.opt("signed_leaf"))
+        .put("sender_id_pub", bundle.optString("sender_id_pub"))
+        .toString()
+    for (b in Server.batchers) runCatching { httpPost("$b/leaf", body) }
+}
+
+/** The batched proof for this seal, verified against our OWN leaf. Empty when no batcher has
+ *  anchored it yet — 425 while pending is normal, not an error. */
+private fun fetchVerifiedProof(sealId: String, bundle: String): JSONObject? {
+    for (b in Server.batchers) {
+        val body = httpGet("$b/proof/$sealId") ?: continue
+        val v = runCatching { JSONObject(SealCore.verifySealProof(bundle, body)) }.getOrNull() ?: continue
+        if (v.optBoolean("ok")) return v
+    }
+    return null
 }
 
 /** Fetch every {seal_id,bundle} item for a mailbox tag from ALL relays, merged + deduped by
@@ -1601,6 +1629,11 @@ private fun ConversationScreen(
                     seen.add(sealId)
                     continue
                 }
+                // A verified batched proof is the strongest evidence available: it says THIS
+                // leaf is inside a root the chain committed. Prefer its slot over the chain's
+                // current tip, so opening is gated on the capsule's own anchoring.
+                val proof = withContext(Dispatchers.IO) { fetchVerifiedProof(sealId, bundle.toString()) }
+                val openSlot = proof?.optLong("finalized_slot") ?: chainSlot
 
                 // Media arrives as a manifest, not as bytes: open the manifest, pull the
                 // chunks the relay is holding, then decrypt and reassemble locally.
@@ -1608,7 +1641,7 @@ private fun ConversationScreen(
                     // Time-locked? Show a locked placeholder with a countdown rather than
                     // nothing at all, and keep polling — it opens by itself at revealAt.
                     val gate = withContext(Dispatchers.IO) {
-                        runCatching { JSONObject(SealCore.openMediaInfo(myDeviceSeed, bundle.toString(), shares, "", chainSlot)) }.getOrNull()
+                        runCatching { JSONObject(SealCore.openMediaInfo(myDeviceSeed, bundle.toString(), shares, "", openSlot)) }.getOrNull()
                     }
                     if (gate != null && !gate.optBoolean("ok")) {
                         when (gate.optString("reason")) {
@@ -1630,7 +1663,7 @@ private fun ConversationScreen(
                         }
                     }
                     val got = withContext(Dispatchers.IO) {
-                        receiveMedia(ctx, myDeviceSeed, sealId, bundle.toString(), shares, chainSlot)
+                        receiveMedia(ctx, myDeviceSeed, sealId, bundle.toString(), shares, openSlot)
                     }
                     if (got != null) {
                         // replace the locked placeholder, if one is on screen
@@ -1661,7 +1694,7 @@ private fun ConversationScreen(
                 }
 
                 val opened = runCatching {
-                    withContext(Dispatchers.IO) { JSONObject(SealCore.openReceived(myDeviceSeed, bundle.toString(), shares, chainSlot)) }
+                    withContext(Dispatchers.IO) { JSONObject(SealCore.openReceived(myDeviceSeed, bundle.toString(), shares, openSlot)) }
                 }.getOrNull()
                 if (opened != null && opened.optBoolean("ok")) {
                     seen.add(sealId)

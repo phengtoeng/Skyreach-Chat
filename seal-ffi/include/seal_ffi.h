@@ -102,6 +102,13 @@ char *ss_open_media_file(const char *device_seed, const char *bundle, const char
  * the recipient checks itself, rather than taking a gateway's word that finality happened. */
 char *ss_verify_anchor(const char *bundle, const char *tx_json);
 
+/* Verify a BATCHED seal proof against the bundle's own leaf:
+ *   { ok:true, seal_root, finalized_slot, leaf_count }  or  { ok:false, reason }.
+ * proof_json is the body of GET /proof/<seal_id> from a batcher. Many messages share one
+ * anchoring transaction; each still proves membership of the committed root by replaying its
+ * own merkle path, so a batcher cannot claim a message is in a root it is not in. */
+char *ss_verify_seal_proof(const char *bundle, const char *proof_json);
+
 /* Free a string returned by any ss_* function. Safe on NULL. */
 void ss_free(char *ptr);
 

@@ -574,6 +574,54 @@ fn verify_anchor_json(bundle_str: &str, tx_json: &str) -> String {
     }
 }
 
+/// Verify a batched seal proof against the bundle's OWN leaf.
+///
+/// The app fetches `GET /proof/<seal_id>` from a batcher and hands the JSON here. We
+/// recompute the leaf hash from the signed leaf the recipient already holds, require the
+/// proof to be for that leaf, and replay the merkle path to see whether it really
+/// reconstructs the root. A batcher that claims a message is in a root it is not in fails
+/// here — the arithmetic has to come out.
+///
+/// Returns `{ ok:true, seal_root, finalized_slot, leaf_count }` or `{ ok:false, reason }`.
+fn verify_seal_proof_json(bundle_str: &str, proof_json: &str) -> String {
+    let Ok(bundle): Result<Value, _> = serde_json::from_str(bundle_str) else {
+        return json!({ "ok": false, "reason": "bad bundle" }).to_string();
+    };
+    let signed_leaf: Option<SignedLeaf> =
+        serde_json::from_value(bundle.get("signed_leaf").cloned().unwrap_or(Value::Null)).ok();
+    let Some(signed_leaf) = signed_leaf else {
+        return json!({ "ok": false, "reason": "bundle has no signed leaf" }).to_string();
+    };
+    let proof: Option<SealProof> = serde_json::from_str(proof_json).ok();
+    let Some(proof) = proof else {
+        return json!({ "ok": false, "reason": "bad proof json" }).to_string();
+    };
+
+    // the proof must be about the leaf WE hold, not merely a well-formed proof
+    if proof.leaf_hash != signed_leaf.leaf.leaf_hash() {
+        return json!({ "ok": false, "reason": "proof is for a different leaf" }).to_string();
+    }
+    if proof.seal_id != signed_leaf.leaf.seal_id {
+        return json!({ "ok": false, "reason": "proof/leaf seal_id mismatch" }).to_string();
+    }
+    if !verify_seal_inclusion(
+        &proof.leaf_hash,
+        &proof.merkle_path,
+        proof.leaf_index,
+        proof.leaf_count,
+        &proof.seal_root,
+    ) {
+        return json!({ "ok": false, "reason": "proof does not reconstruct the root" }).to_string();
+    }
+    json!({
+        "ok": true,
+        "seal_root": hex::encode(proof.seal_root),
+        "finalized_slot": proof.finalized_slot,
+        "leaf_count": proof.leaf_count,
+    })
+    .to_string()
+}
+
 /// Privacy-preserving directory key for a phone number (never the raw number, never
 /// on-chain). `hash(normalized phone)` — what resolves to a WCAHT address in the directory.
 fn phone_commitment_json(phone: &str) -> String {
@@ -795,6 +843,15 @@ pub unsafe extern "C" fn ss_open_media_file(
 #[no_mangle]
 pub unsafe extern "C" fn ss_verify_anchor(bundle: *const c_char, tx_json: *const c_char) -> *mut c_char {
     to_c(verify_anchor_json(&cstr(bundle), &cstr(tx_json)))
+}
+
+/// Verify a batched seal proof against a bundle's leaf: `{ ok, seal_root, finalized_slot }`.
+///
+/// # Safety
+/// All arguments must be null or valid NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn ss_verify_seal_proof(bundle: *const c_char, proof_json: *const c_char) -> *mut c_char {
+    to_c(verify_seal_proof_json(&cstr(bundle), &cstr(proof_json)))
 }
 
 /// Free a string returned by any `ss_*` function. Safe on null.
@@ -1190,6 +1247,18 @@ pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeVerifyAnchor<'l
     ret(env, verify_anchor_json(&b, &t))
 }
 
+#[no_mangle]
+pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeVerifySealProof<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    bundle: JString<'local>,
+    proof_json: JString<'local>,
+) -> jstring {
+    let b = jstr(&mut env, &bundle);
+    let p = jstr(&mut env, &proof_json);
+    ret(env, verify_seal_proof_json(&b, &p))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1378,6 +1447,93 @@ mod tests {
             }
         })
         .to_string()
+    }
+
+    #[test]
+    fn a_batched_proof_only_verifies_for_its_own_leaf() {
+        use seal_core::{seal_batch_proof, seal_batch_root};
+        let alice: Value = serde_json::from_str(&new_identity_json("Alice")).unwrap();
+        let bob: Value = serde_json::from_str(&new_identity_json("Bob")).unwrap();
+
+        // three real messages, batched under one root
+        let ships: Vec<Value> = (0..3)
+            .map(|i| {
+                serde_json::from_str(&seal_shippable_json(
+                    alice["identity_seed"].as_str().unwrap(),
+                    alice["card"].as_str().unwrap(),
+                    bob["device_pub"].as_str().unwrap(),
+                    &format!("m{i}"), false, 0, 0, 0,
+                ))
+                .unwrap()
+            })
+            .collect();
+        let leaves: Vec<SignedLeaf> = ships
+            .iter()
+            .map(|s| serde_json::from_value(s["bundle"]["signed_leaf"].clone()).unwrap())
+            .collect();
+        let hashes: Vec<[u8; 32]> = leaves.iter().map(|l| l.leaf.leaf_hash()).collect();
+        let root = seal_batch_root(&hashes);
+
+        let proof_for = |i: usize| {
+            serde_json::to_string(&SealProof {
+                seal_id: leaves[i].leaf.seal_id,
+                leaf_hash: hashes[i],
+                merkle_path: seal_batch_proof(&hashes, i).unwrap(),
+                leaf_index: i as u32,
+                leaf_count: hashes.len() as u32,
+                seal_root: root,
+                finalized_slot: 999,
+            })
+            .unwrap()
+        };
+
+        // each message verifies with ITS proof
+        for i in 0..3 {
+            let r: Value =
+                serde_json::from_str(&verify_seal_proof_json(&ships[i]["bundle"].to_string(), &proof_for(i))).unwrap();
+            assert_eq!(r["ok"], true, "message {i}: {r}");
+            assert_eq!(r["finalized_slot"], 999);
+            assert_eq!(r["leaf_count"], 3);
+        }
+        // but NOT with someone else's proof from the same batch
+        let r: Value =
+            serde_json::from_str(&verify_seal_proof_json(&ships[0]["bundle"].to_string(), &proof_for(1))).unwrap();
+        assert_eq!(r["ok"], false);
+        assert_eq!(r["reason"], "proof is for a different leaf");
+    }
+
+    #[test]
+    fn a_forged_root_does_not_verify() {
+        use seal_core::seal_batch_proof;
+        let alice: Value = serde_json::from_str(&new_identity_json("Alice")).unwrap();
+        let bob: Value = serde_json::from_str(&new_identity_json("Bob")).unwrap();
+        let ship: Value = serde_json::from_str(&seal_shippable_json(
+            alice["identity_seed"].as_str().unwrap(),
+            alice["card"].as_str().unwrap(),
+            bob["device_pub"].as_str().unwrap(),
+            "solo", false, 0, 0, 0,
+        ))
+        .unwrap();
+        let leaf: SignedLeaf = serde_json::from_value(ship["bundle"]["signed_leaf"].clone()).unwrap();
+        let h = leaf.leaf.leaf_hash();
+
+        // a batcher claiming this leaf sits under a root it does not belong to
+        let bogus = SealProof {
+            seal_id: leaf.leaf.seal_id,
+            leaf_hash: h,
+            merkle_path: seal_batch_proof(&[h], 0).unwrap(),
+            leaf_index: 0,
+            leaf_count: 1,
+            seal_root: [0x11; 32], // invented
+            finalized_slot: 1,
+        };
+        let r: Value = serde_json::from_str(&verify_seal_proof_json(
+            &ship["bundle"].to_string(),
+            &serde_json::to_string(&bogus).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(r["ok"], false);
+        assert_eq!(r["reason"], "proof does not reconstruct the root");
     }
 
     #[test]

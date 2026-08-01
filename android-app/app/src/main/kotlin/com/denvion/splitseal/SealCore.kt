@@ -27,6 +27,7 @@ object SealCore {
     ): String
     private external fun nativeOpenMediaInfo(deviceSeed: String, bundle: String, shares: String, previewOut: String, currentSlot: Long): String
     private external fun nativeVerifyAnchor(bundle: String, txJson: String): String
+    private external fun nativeVerifySealProof(bundle: String, proofJson: String): String
     private external fun nativeOpenMediaFile(deviceSeed: String, bundle: String, shares: String, chunkDir: String, outPath: String, currentSlot: Long): String
 
     /** `{ "protocol":"DSCP-2", "version":2, "chain_id":7789 }` */
@@ -95,6 +96,16 @@ object SealCore {
      * recipient already holds, trusting neither the relay nor the gateways.
      */
     fun verifyAnchor(bundle: String, txJson: String): String = nativeVerifyAnchor(bundle, txJson)
+
+    /**
+     * Verify a BATCHED seal proof against this bundle's own leaf:
+     * `{ok, seal_root, finalized_slot, leaf_count}`.
+     *
+     * `proofJson` is the body of `GET /proof/<seal_id>` from a batcher. We recompute the leaf
+     * hash from the leaf we already hold and replay the merkle path — a batcher claiming a
+     * message is in a root it is not in fails here, because the arithmetic has to come out.
+     */
+    fun verifySealProof(bundle: String, proofJson: String): String = nativeVerifySealProof(bundle, proofJson)
 
     /**
      * Media step 1 — open the MANIFEST only, to learn what the item is and which chunks to

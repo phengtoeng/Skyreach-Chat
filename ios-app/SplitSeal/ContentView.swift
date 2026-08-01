@@ -269,6 +269,11 @@ enum Server {
 }
 // Replicated directories (gossip + persist server-side): register to ALL, look up on ANY.
 var directoryURLs: [String] { nodeHosts.map { "http://\($0):9988" } }
+// Seal batchers: every message's leaf goes here to be committed under a SEAL_ROOT, and
+// recipients fetch the merkle proof that their message is inside that finalised root.
+var batcherURLs: [String] {
+    serverPinned ? ["http://\(Server.host):9300"] : nodeHosts.map { "http://\($0):9300" }
+}
 
 func directoryLookup(_ phone: String) async -> [String: Any]? {
     let commitJson = SealCore.phoneCommitment(phone)
@@ -380,6 +385,8 @@ func shipSeal(_ ship: [String: Any]) async -> Bool {
     let tag = ship["mailbox_tag"] as? String ?? ""
     let sealId = ship["seal_id"] as? String ?? ""
     var relayOk = false
+    // the leaf also goes to the batchers, so this message ends up inside a committed SEAL_ROOT
+    if let b = ship["bundle"] as? [String: Any] { await submitLeafForBatching(b) }
     // carry seal_id alongside the ciphertext so the recipient (who has neither) can collect shares.
     // replicate to every relay so any one of them can serve the recipient.
     if let bundle = ship["bundle"] {
@@ -576,6 +583,30 @@ func verifiedAnchorSlot(_ sealId: String, _ bundle: String) async -> Int64 {
         }
     }
     return 0
+}
+
+/// Hand this message's signed leaf to the batchers so it gets committed under a SEAL_ROOT.
+/// Fire-and-forget: a batcher being down must never stop a message being delivered.
+func submitLeafForBatching(_ bundle: [String: Any]) async {
+    guard let leaf = bundle["signed_leaf"] else { return }
+    let payload: [String: Any] = ["signed_leaf": leaf, "sender_id_pub": bundle["sender_id_pub"] as? String ?? ""]
+    guard let d = try? JSONSerialization.data(withJSONObject: payload),
+          let s = String(data: d, encoding: .utf8) else { return }
+    for b in batcherURLs { _ = await httpPost("\(b)/leaf", s) }
+}
+
+/// The batched proof for this seal, verified against our OWN leaf. nil while no batcher has
+/// anchored it yet — a 425 pending is normal, not an error.
+func fetchVerifiedProof(_ sealId: String, _ bundle: String) async -> Int64? {
+    for b in batcherURLs {
+        guard let body = await httpGet("\(b)/proof/\(sealId)") else { continue }
+        let r = SealCore.verifySealProof(bundle, body)
+        if let v = (try? JSONSerialization.jsonObject(with: Data(r.utf8))) as? [String: Any],
+           (v["ok"] as? Bool) == true {
+            return (v["finalized_slot"] as? NSNumber)?.int64Value
+        }
+    }
+    return nil
 }
 
 func collectShares(_ sealId: String) async -> String {
@@ -1546,6 +1577,9 @@ struct ConversationView: View {
             // If an anchor exists and contradicts this bundle, the bundle is not what was
             // committed on-chain — drop it rather than opening it.
             if await verifiedAnchorSlot(sealId, bundleStr) < 0 { seen.insert(sealId); continue }
+            // A verified batched proof is the strongest evidence available: it says THIS leaf
+            // is inside a root the chain committed. Prefer its slot over the chain's tip.
+            let openSlot = await fetchVerifiedProof(sealId, bundleStr) ?? chainSlot
 
             // Media arrives as a manifest, not as bytes: open the manifest, pull the chunks
             // the relay is holding, then decrypt and reassemble locally.
@@ -1553,7 +1587,7 @@ struct ConversationView: View {
             if (leaf?["content_type"] as? String) == "Media" {
                 // Time-locked? Show a locked placeholder with a countdown rather than nothing at
                 // all, and keep polling — it opens by itself at revealAt.
-                let gateStr = SealCore.openMediaInfo(myDeviceSeed, bundleStr, shares, "", chainSlot)
+                let gateStr = SealCore.openMediaInfo(myDeviceSeed, bundleStr, shares, "", openSlot)
                 if let gate = (try? JSONSerialization.jsonObject(with: Data(gateStr.utf8))) as? [String: Any],
                    (gate["ok"] as? Bool) != true {
                     let reason = gate["reason"] as? String ?? ""
@@ -1567,7 +1601,7 @@ struct ConversationView: View {
                         continue // NOT marked seen: the next poll opens it once the window does
                     }
                 }
-                if let got = await receiveMedia(myDeviceSeed, sealId, bundleStr, shares, chainSlot) {
+                if let got = await receiveMedia(myDeviceSeed, sealId, bundleStr, shares, openSlot) {
                     seen.insert(sealId)
                     let label = got.2.isEmpty ? (got.1.hasPrefix("video") ? "Video" : "Photo") : got.2
                     // carry the destroy deadline across: the recipient's copy must burn too,
@@ -1586,7 +1620,7 @@ struct ConversationView: View {
                 continue // still locked / chunks not all there yet → retry on the next poll
             }
 
-            let openStr = SealCore.openReceived(myDeviceSeed, bundleStr, shares, chainSlot)
+            let openStr = SealCore.openReceived(myDeviceSeed, bundleStr, shares, openSlot)
             if let r = (try? JSONSerialization.jsonObject(with: Data(openStr.utf8))) as? [String: Any],
                (r["ok"] as? Bool) == true, let plain = r["plaintext"] as? String {
                 seen.insert(sealId)

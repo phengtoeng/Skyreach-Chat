@@ -104,6 +104,16 @@ enum SealCore {
         bundle.withCString { b in txJson.withCString { t in copy(ss_verify_anchor(b, t)) } }
     }
 
+    /// Verify a BATCHED seal proof against a bundle's own leaf:
+    /// `{ok, seal_root, finalized_slot, leaf_count}`.
+    ///
+    /// `proofJson` is the body of `GET /proof/<seal_id>` from a batcher. Many messages share
+    /// one anchoring transaction; each still proves membership by replaying its own merkle
+    /// path, so a batcher cannot claim a message is in a root it is not in.
+    static func verifySealProof(_ bundle: String, _ proofJson: String) -> String {
+        bundle.withCString { b in proofJson.withCString { p in copy(ss_verify_seal_proof(b, p)) } }
+    }
+
     /// Copy a Rust-owned C string into a Swift String and free the original.
     private static func copy(_ ptr: UnsafeMutablePointer<CChar>?) -> String {
         guard let ptr = ptr else { return "{}" }
