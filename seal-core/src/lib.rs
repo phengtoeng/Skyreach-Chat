@@ -367,7 +367,12 @@ pub enum SealStatus {
 pub struct SealProof {
     pub seal_id: [u8; 32],
     pub leaf_hash: [u8; 32],
-    pub merkle_path: Vec<[u8; 32]>, // empty for the single-leaf mock root
+    /// Sibling hashes bottom-up. Empty means the root IS the leaf (a one-leaf batch).
+    pub merkle_path: Vec<[u8; 32]>,
+    /// Position of this leaf in the batch — decides left/right at each level (spec §8.5).
+    pub leaf_index: u32,
+    /// How many leaves the batch held (spec §9.2). Needed to replay level widths.
+    pub leaf_count: u32,
     pub seal_root: [u8; 32],
     pub finalized_slot: u64,
 }
@@ -375,6 +380,11 @@ pub struct SealProof {
 struct SealRecord {
     leaf_hash: [u8; 32],
     root: [u8; 32],
+    /// Position + siblings within the batch this leaf was anchored in. Empty path + index 0
+    /// is the single-leaf case, where the root IS the leaf.
+    merkle_path: Vec<[u8; 32]>,
+    leaf_index: u32,
+    leaf_count: u32,
     finalized_slot: Option<u64>,
     revoked: bool,
 }
@@ -425,12 +435,55 @@ impl MockSealChain {
         let leaf_hash = leaf.leaf_hash();
         self.seals.insert(
             leaf.seal_id,
-            SealRecord { leaf_hash, root: leaf_hash, finalized_slot: None, revoked: false },
+            SealRecord {
+                leaf_hash,
+                // a lone seal is simply a one-leaf batch, so its root is the batch root of
+                // itself — keeping one verification rule for batched and unbatched alike
+                root: seal_batch_root(&[leaf_hash]),
+                merkle_path: Vec::new(),
+                leaf_index: 0,
+                leaf_count: 1,
+                finalized_slot: None,
+                revoked: false,
+            },
         );
         Ok(leaf.seal_id)
     }
 
     /// Simulate the batch reaching FINALISED at the current slot.
+    /// Submit a whole BATCH under one root — the SEAL_ROOT shape. Every leaf keeps its own
+    /// merkle path, so each message is still individually provable; only the anchoring
+    /// transaction is shared. This is what makes "a capsule per message" affordable.
+    pub fn submit_batch(&mut self, signed: &[(SignedLeaf, [u8; 32])]) -> Result<[u8; 32]> {
+        let leaf_hashes: Vec<[u8; 32]> = signed.iter().map(|(s, _)| s.leaf.leaf_hash()).collect();
+        let root = seal_batch_root(&leaf_hashes);
+        for (i, (sl, sender_identity_pub)) in signed.iter().enumerate() {
+            let leaf_hash = leaf_hashes[i];
+            let sig: [u8; 64] = sl
+                .sender_signature
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow!("malformed sender signature"))?;
+            if !sc::verify_sig(sender_identity_pub, &sl.leaf.canonical_bytes(), &sig) {
+                return Err(anyhow!("invalid sender signature in batch at index {i}"));
+            }
+            let path = seal_batch_proof(&leaf_hashes, i).ok_or_else(|| anyhow!("no proof for index {i}"))?;
+            self.seals.insert(
+                sl.leaf.seal_id,
+                SealRecord {
+                    leaf_hash,
+                    root,
+                    merkle_path: path,
+                    leaf_index: i as u32,
+                    leaf_count: signed.len() as u32,
+                    finalized_slot: None,
+                    revoked: false,
+                },
+            );
+        }
+        Ok(root)
+    }
+
     pub fn finalize(&mut self, seal_id: &[u8; 32]) -> Result<()> {
         let slot = self.current_slot;
         let rec = self.seals.get_mut(seal_id).ok_or_else(|| anyhow!("unknown seal"))?;
@@ -460,7 +513,9 @@ impl MockSealChain {
         Some(SealProof {
             seal_id: *seal_id,
             leaf_hash: r.leaf_hash,
-            merkle_path: Vec::new(),
+            merkle_path: r.merkle_path.clone(),
+            leaf_index: r.leaf_index,
+            leaf_count: r.leaf_count,
             seal_root: r.root,
             finalized_slot: r.finalized_slot?,
         })
@@ -894,6 +949,115 @@ fn manifest_root_of(chunk_hashes: &[[u8; 32]]) -> [u8; 32] {
     level[0]
 }
 
+// ─────────────────────── seal batches (spec §8.5, §9.2) ────────────────────
+//
+// A capsule per message does NOT mean a transaction per message. Many seal leaves are
+// batched under one `SEAL_ROOT`; each message then carries a merkle path proving THIS leaf
+// is inside THAT finalised root. One transaction anchors thousands of capsules, and the
+// recipient still verifies its own message rather than trusting the batcher.
+
+/// Merkle root over a batch of seal leaf hashes.
+///
+/// Leaves and interior nodes hash under different domains so an interior node can never be
+/// replayed as a leaf. An odd node is PROMOTED rather than duplicated — node-doubling lets
+/// two different leaf sets produce the same root.
+pub fn seal_batch_root(leaf_hashes: &[[u8; 32]]) -> [u8; 32] {
+    if leaf_hashes.is_empty() {
+        return [0u8; 32];
+    }
+    let mut level: Vec<[u8; 32]> =
+        leaf_hashes.iter().map(|h| sc::hash("DSCP-1/batch-leaf", h)).collect();
+    while level.len() > 1 {
+        level = pair_up(&level);
+    }
+    level[0]
+}
+
+fn pair_up(level: &[[u8; 32]]) -> Vec<[u8; 32]> {
+    let mut next = Vec::with_capacity(level.len().div_ceil(2));
+    for pair in level.chunks(2) {
+        if pair.len() == 2 {
+            let mut buf = [0u8; 64];
+            buf[..32].copy_from_slice(&pair[0]);
+            buf[32..].copy_from_slice(&pair[1]);
+            next.push(sc::hash("DSCP-1/batch-node", &buf));
+        } else {
+            next.push(pair[0]); // promote, never duplicate
+        }
+    }
+    next
+}
+
+/// The sibling path proving `index` is in the batch. Bottom-up; a promoted (odd) node
+/// contributes no sibling at that level.
+pub fn seal_batch_proof(leaf_hashes: &[[u8; 32]], index: usize) -> Option<Vec<[u8; 32]>> {
+    if index >= leaf_hashes.len() {
+        return None;
+    }
+    let mut level: Vec<[u8; 32]> =
+        leaf_hashes.iter().map(|h| sc::hash("DSCP-1/batch-leaf", h)).collect();
+    let mut i = index;
+    let mut path = Vec::new();
+    while level.len() > 1 {
+        let sibling = if i % 2 == 0 { i + 1 } else { i - 1 };
+        if sibling < level.len() {
+            path.push(level[sibling]);
+        }
+        // else: this node was promoted — nothing to combine with at this level
+        level = pair_up(&level);
+        i /= 2;
+    }
+    Some(path)
+}
+
+/// Recompute the batch root from a leaf + its path and check it matches.
+///
+/// This is what makes a batched capsule verifiable BY THE RECIPIENT: the batcher cannot
+/// claim a message is in a root it is not in, because the arithmetic has to come out.
+///
+/// `leaf_count` is required, not decorative. Because an odd node is PROMOTED rather than
+/// duplicated, some levels contribute no sibling — so the path length alone does not tell you
+/// which level you are on. Replaying the level widths from the batch size is what keeps the
+/// left/right decision in step with how the root was built. (Getting this wrong verified
+/// every leaf except the promoted ones, which is exactly the sort of bug that would only
+/// show up on odd-sized batches in production.)
+pub fn verify_seal_inclusion(
+    leaf_hash: &[u8; 32],
+    merkle_path: &[[u8; 32]],
+    leaf_index: u32,
+    leaf_count: u32,
+    root: &[u8; 32],
+) -> bool {
+    if leaf_count == 0 || leaf_index >= leaf_count {
+        return false;
+    }
+    let mut node = sc::hash("DSCP-1/batch-leaf", leaf_hash);
+    let mut i = leaf_index as usize;
+    let mut width = leaf_count as usize;
+    let mut used = 0usize;
+    while width > 1 {
+        let sibling_idx = if i % 2 == 0 { i + 1 } else { i.wrapping_sub(1) };
+        if sibling_idx < width {
+            let Some(sibling) = merkle_path.get(used) else { return false };
+            used += 1;
+            let mut buf = [0u8; 64];
+            if i % 2 == 0 {
+                buf[..32].copy_from_slice(&node);
+                buf[32..].copy_from_slice(sibling);
+            } else {
+                buf[..32].copy_from_slice(sibling);
+                buf[32..].copy_from_slice(&node);
+            }
+            node = sc::hash("DSCP-1/batch-node", &buf);
+        }
+        // else: promoted this level — the node carries up unchanged, no sibling consumed
+        i /= 2;
+        width = width.div_ceil(2);
+    }
+    // a path with unused siblings is not the path for this leaf
+    used == merkle_path.len() && node == *root
+}
+
 /// Per-chunk key: a KDF subkey of `K_content`, distinct for every (seal, index).
 /// Distinct keys mean the random per-chunk nonce can never collide into a reuse.
 fn chunk_key(k_content: &[u8; 32], seal_id: &[u8; 32], index: u32) -> [u8; 32] {
@@ -1274,8 +1438,19 @@ fn release_gate(
     // Strongest path: hard L1 finality (accepted in both modes).
     if let Some(proof) = chain.proof(&leaf.seal_id) {
         if proof.finalized_slot >= leaf.not_before_finalized_slot {
-            if proof.leaf_hash != leaf.leaf_hash() || proof.seal_root != proof.leaf_hash {
-                return Gate::Rejected { reason: "seal inclusion proof does not match leaf".into() };
+            // The proof must be for OUR leaf, and the leaf must actually reconstruct the
+            // finalised root. An empty path means a one-leaf batch, where the root IS the leaf.
+            if proof.leaf_hash != leaf.leaf_hash() {
+                return Gate::Rejected { reason: "seal proof is for a different leaf".into() };
+            }
+            if !verify_seal_inclusion(
+                &proof.leaf_hash,
+                &proof.merkle_path,
+                proof.leaf_index,
+                proof.leaf_count,
+                &proof.seal_root,
+            ) {
+                return Gate::Rejected { reason: "seal inclusion proof does not reconstruct the root".into() };
             }
             return Gate::Open;
         }

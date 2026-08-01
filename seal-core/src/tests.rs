@@ -888,3 +888,91 @@ fn a_destroyed_item_never_opens_even_with_every_share() {
         other => panic!("self-destructed item opened: {other:?}"),
     }
 }
+
+// ───────────────── batched capsules (SEAL_ROOT, spec §8.5 / §9.2) ────────────
+
+#[test]
+fn every_message_in_a_batch_keeps_its_own_capsule() {
+    // ONE root anchors many messages, and each still opens only on ITS own proof.
+    let mut w = world();
+    let items: Vec<SealedItem> = (0..7).map(|i| w.seal(format!("msg {i}").as_bytes(), 2, 1000)).collect();
+
+    let batch: Vec<(SignedLeaf, [u8; 32])> =
+        items.iter().map(|it| (it.signed_leaf.clone(), w.sender_identity.public())).collect();
+    let root = w.chain.submit_batch(&batch).expect("batch");
+
+    for it in &items {
+        w.deposit_all(it);
+    }
+    // before finality every one of them is still locked, batch or not
+    for it in &items {
+        let shares = w.collect(&it.seal_id);
+        assert!(matches!(w.open(it, &shares), OpenOutcome::Locked { .. }), "opened before finality");
+    }
+
+    // finalise the batch → each message opens with its own plaintext
+    for it in &items {
+        w.chain.finalize(&it.seal_id).unwrap();
+    }
+    for (i, it) in items.iter().enumerate() {
+        let shares = w.collect(&it.seal_id);
+        match w.open(it, &shares) {
+            OpenOutcome::Opened { plaintext } => assert_eq!(plaintext, format!("msg {i}").as_bytes()),
+            other => panic!("msg {i} failed to open: {other:?}"),
+        }
+        // and every proof points at the SAME root — one transaction, seven capsules
+        let p = w.chain.proof(&it.seal_id).expect("proof");
+        assert_eq!(p.seal_root, root);
+        assert_eq!(p.leaf_index, i as u32);
+        assert!(verify_seal_inclusion(&p.leaf_hash, &p.merkle_path, p.leaf_index, p.leaf_count, &p.seal_root));
+    }
+}
+
+#[test]
+fn a_leaf_outside_the_batch_cannot_borrow_its_root() {
+    // The whole point of the merkle path: a batcher cannot claim a message is in a root
+    // it was never put in.
+    let w = world();
+    let inside: Vec<[u8; 32]> = (0..5u8).map(|i| [i; 32]).collect();
+    let root = seal_batch_root(&inside);
+
+    // a genuine member verifies against the root...
+    for (i, leaf) in inside.iter().enumerate() {
+        let path = seal_batch_proof(&inside, i).unwrap();
+        assert!(verify_seal_inclusion(leaf, &path, i as u32, inside.len() as u32, &root), "member {i} failed");
+    }
+    // ...an outsider does not, whatever path or index it is handed
+    let outsider = [99u8; 32];
+    for i in 0..inside.len() {
+        let path = seal_batch_proof(&inside, i).unwrap();
+        assert!(!verify_seal_inclusion(&outsider, &path, i as u32, inside.len() as u32, &root), "outsider accepted at {i}");
+    }
+    // and a member cannot be replayed at the wrong position
+    let path0 = seal_batch_proof(&inside, 0).unwrap();
+    assert!(!verify_seal_inclusion(&inside[0], &path0, 3, inside.len() as u32, &root), "wrong index accepted");
+    let _ = w;
+}
+
+#[test]
+fn batch_root_changes_if_any_message_changes() {
+    let base: Vec<[u8; 32]> = (0..8u8).map(|i| [i; 32]).collect();
+    let root = seal_batch_root(&base);
+
+    let mut swapped = base.clone();
+    swapped.swap(2, 5);
+    assert_ne!(seal_batch_root(&swapped), root, "reordering must change the root");
+
+    let mut dropped = base.clone();
+    dropped.pop();
+    assert_ne!(seal_batch_root(&dropped), root, "dropping a message must change the root");
+
+    let mut altered = base.clone();
+    altered[4] = [200u8; 32];
+    assert_ne!(seal_batch_root(&altered), root, "altering a message must change the root");
+
+    // odd sizes are promoted, not duplicated — a duplicated tail would collide with n+1
+    let odd: Vec<[u8; 32]> = (0..5u8).map(|i| [i; 32]).collect();
+    let mut doubled = odd.clone();
+    doubled.push(odd[4]);
+    assert_ne!(seal_batch_root(&odd), seal_batch_root(&doubled), "duplicate-tail collision");
+}

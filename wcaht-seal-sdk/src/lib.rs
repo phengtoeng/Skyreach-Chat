@@ -381,8 +381,12 @@ impl SealChain for WcahtSealChain {
         Some(SealProof {
             seal_id: *seal_id,
             leaf_hash,
+            // A per-message anchor is a one-leaf batch: no siblings, and the root is that
+            // leaf's batch root. A batched anchor supplies a real path — same check either way.
             merkle_path: Vec::new(),
-            seal_root: leaf_hash,
+            leaf_index: 0,
+            leaf_count: 1,
+            seal_root: seal_core::seal_batch_root(&[leaf_hash]),
             finalized_slot: fin,
         })
     }
