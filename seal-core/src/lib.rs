@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{anyhow, Result};
 use seal_crypto as sc;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 pub const CHAIN_ID: u64 = 7789;
 /// DSCP-2: adds FastSeal pre-confirmations alongside StrictSeal L1-finality vault mode.
@@ -770,9 +771,237 @@ pub struct SealedItem {
     pub share_envelopes: Vec<KeyShareEnvelope>,
 }
 
+// ─────────────────────────────── media items ────────────────────────────────
+//
+// An image or video is NEVER carried in the envelope, and never lands anywhere readable.
+// The envelope carries an encrypted [`MediaManifest`]; the pixels live in separately
+// encrypted chunks that the relay stores as opaque blobs. The chain sees only
+// `manifest_root` — 32 bytes with no filename, mime, size, or thumbnail in it.
+//
+//   sender ──encrypted chunks───────────────▶ relay    (opaque; unopenable without shares)
+//          ──encrypted manifest (envelope)──▶ relay    (mime/size/dimensions all sealed)
+//          ──signed leaf (manifest_root)────▶ WCAHT    (32 bytes)
+//          ──key shares────────────────────▶ gateways (encrypted to the recipient device)
+//
+// Every chunk key is a KDF subkey of `K_content`, which is Shamir-split across gateways.
+// So a recipient can pre-download an entire video that remains cryptographically
+// unopenable until the release gate opens — the same gate that drives time-reveal and
+// time-destroy for text.
+
+/// Default chunk size (spec §10.3: 1 MiB, configurable after real-device testing).
+pub const DEFAULT_CHUNK_SIZE: u32 = 1024 * 1024;
+
+/// Bound on a decoded manifest, so untrusted input cannot ask us to allocate absurdly.
+const MAX_CHUNK_COUNT: u32 = 100_000;
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentKind {
+    Image,
+    Audio,
+    File,
+    Video,
+}
+
+/// What may be rendered BEFORE the release gate opens (spec §10.3). A locked preview is
+/// only ever the blurred bytes sealed inside the manifest — a readable thumbnail is never
+/// uploaded as its own fetchable object.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviewPolicy {
+    None,
+    LockedBlur,
+}
+
+/// Spec §8.2. Encrypted before upload: mime, size, dimensions and the chunk list are all
+/// sealed inside the envelope, so neither the relay nor the chain learns them. Only
+/// `manifest_root` — the merkle root over the chunk hashes — is public, in the leaf.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MediaManifest {
+    pub protocol_version: u16,
+    pub seal_id: [u8; 32],
+    pub content_kind: ContentKind,
+    pub mime_type: String,
+    pub plaintext_size: u64,
+    pub chunk_size: u32,
+    pub chunk_count: u32,
+    pub ciphertext_chunk_hashes: Vec<[u8; 32]>,
+    pub preview_policy: PreviewPolicy,
+    /// Locally blurred preview bytes, encrypted with the rest of the manifest.
+    /// Empty unless `preview_policy` is `LockedBlur`.
+    pub preview: Vec<u8>,
+    /// Display hints, 0 when unknown. Encrypted along with everything else here.
+    pub width: u32,
+    pub height: u32,
+    pub duration_ms: u64,
+}
+
+/// One encrypted chunk as it travels to, and rests on, the relay.
+/// `bytes` is `nonce || ciphertext`; `ciphertext_hash` covers exactly those bytes.
+#[derive(Clone, Debug)]
+pub struct MediaChunk {
+    pub index: u32,
+    pub ciphertext_hash: [u8; 32],
+    pub bytes: Vec<u8>,
+}
+
+/// A sealed media item: the three routes of [`SealedItem`], plus the opaque chunks to upload.
+pub struct SealedMedia {
+    pub item: SealedItem,
+    pub chunks: Vec<MediaChunk>,
+}
+
+/// Merkle root over the chunk hashes → the leaf's `manifest_root`.
+///
+/// Leaves and interior nodes hash under different domains, so an interior node can never be
+/// reinterpreted as a leaf. An odd node is PROMOTED rather than duplicated, avoiding the
+/// duplicate-node root collision that node-doubling designs suffer from.
+fn manifest_root_of(chunk_hashes: &[[u8; 32]]) -> [u8; 32] {
+    if chunk_hashes.is_empty() {
+        return [0u8; 32];
+    }
+    let mut level: Vec<[u8; 32]> =
+        chunk_hashes.iter().map(|h| sc::hash("DSCP-1/manifest-leaf", h)).collect();
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        for pair in level.chunks(2) {
+            if pair.len() == 2 {
+                let mut buf = [0u8; 64];
+                buf[..32].copy_from_slice(&pair[0]);
+                buf[32..].copy_from_slice(&pair[1]);
+                next.push(sc::hash("DSCP-1/manifest-node", &buf));
+            } else {
+                next.push(pair[0]); // promote, never duplicate
+            }
+        }
+        level = next;
+    }
+    level[0]
+}
+
+/// Per-chunk key: a KDF subkey of `K_content`, distinct for every (seal, index).
+/// Distinct keys mean the random per-chunk nonce can never collide into a reuse.
+fn chunk_key(k_content: &[u8; 32], seal_id: &[u8; 32], index: u32) -> [u8; 32] {
+    let mut material = Vec::with_capacity(68);
+    material.extend_from_slice(k_content);
+    material.extend_from_slice(seal_id);
+    material.extend_from_slice(&index.to_le_bytes());
+    sc::derive_key("DSCP-1/media-chunk-key/v1", &material)
+}
+
+/// AAD binding a chunk to its seal AND its position, so chunks cannot be reordered or
+/// transplanted between items. Computed before the leaf exists, so it cannot use the leaf hash.
+fn chunk_aad(seal_id: &[u8; 32], index: u32, chunk_count: u32) -> [u8; 32] {
+    let mut ctx = Vec::with_capacity(48);
+    ctx.extend_from_slice(&CHAIN_ID.to_le_bytes());
+    ctx.extend_from_slice(seal_id);
+    ctx.extend_from_slice(&index.to_le_bytes());
+    ctx.extend_from_slice(&chunk_count.to_le_bytes());
+    sc::hash("DSCP-1/media-chunk-aad", &ctx)
+}
+
+/// Encrypt `plaintext` into positionally-bound chunks.
+fn encrypt_chunks(
+    plaintext: &[u8],
+    k_content: &[u8; 32],
+    seal_id: &[u8; 32],
+    chunk_size: u32,
+) -> Result<Vec<MediaChunk>> {
+    if chunk_size == 0 {
+        return Err(anyhow!("chunk_size must be non-zero"));
+    }
+    let count = plaintext.len().div_ceil(chunk_size as usize);
+    if count == 0 {
+        return Err(anyhow!("refusing to seal empty media"));
+    }
+    if count as u64 > MAX_CHUNK_COUNT as u64 {
+        return Err(anyhow!("media too large: {count} chunks exceeds cap {MAX_CHUNK_COUNT}"));
+    }
+    let chunk_count = count as u32;
+    let mut out = Vec::with_capacity(count);
+    for (i, piece) in plaintext.chunks(chunk_size as usize).enumerate() {
+        let index = i as u32;
+        let key = chunk_key(k_content, seal_id, index);
+        let aad = chunk_aad(seal_id, index, chunk_count);
+        let (ct, nonce) = sc::aead_seal(&key, &aad, piece)?;
+        let mut bytes = Vec::with_capacity(nonce.len() + ct.len());
+        bytes.extend_from_slice(&nonce);
+        bytes.extend_from_slice(&ct);
+        let ciphertext_hash = sc::hash("DSCP-1/media-chunk", &bytes);
+        out.push(MediaChunk { index, ciphertext_hash, bytes });
+    }
+    Ok(out)
+}
+
+/// Seal an image, video, voice note, or document (spec §8.2, §10.3, §11).
+///
+/// The bytes are chunked and encrypted locally; the envelope carries only the encrypted
+/// manifest. `preview` must ALREADY be blurred/downscaled by the caller — it is sealed
+/// inside the manifest and is never separately fetchable.
+#[allow(clippy::too_many_arguments)]
+pub fn seal_media_with_mode(
+    plaintext: &[u8],
+    kind: ContentKind,
+    mime_type: &str,
+    preview: &[u8],
+    preview_policy: PreviewPolicy,
+    dimensions: (u32, u32),
+    duration_ms: u64,
+    chunk_size: u32,
+    sender_identity: &sc::SignId,
+    sender_device: &sc::SignId,
+    recipient_device_pub: &[u8; 32],
+    recipient_mailbox_tag: [u8; 32],
+    gateway_ids: &[[u8; 32]],
+    threshold_t: u8,
+    current_slot: u64,
+    ttl_slots: u64,
+    mode: SealMode,
+) -> Result<SealedMedia> {
+    let seal_id = sc::random_32();
+    let k_content = sc::random_32();
+
+    let chunks = encrypt_chunks(plaintext, &k_content, &seal_id, chunk_size)?;
+    let chunk_hashes: Vec<[u8; 32]> = chunks.iter().map(|c| c.ciphertext_hash).collect();
+    let manifest_root = manifest_root_of(&chunk_hashes);
+
+    let manifest = MediaManifest {
+        protocol_version: PROTOCOL_VERSION,
+        seal_id,
+        content_kind: kind,
+        mime_type: mime_type.to_string(),
+        plaintext_size: plaintext.len() as u64,
+        chunk_size,
+        chunk_count: chunks.len() as u32,
+        ciphertext_chunk_hashes: chunk_hashes,
+        preview_policy,
+        preview: if preview_policy == PreviewPolicy::LockedBlur { preview.to_vec() } else { Vec::new() },
+        width: dimensions.0,
+        height: dimensions.1,
+        duration_ms,
+    };
+    let manifest_bytes = bincode::serialize(&manifest)?;
+
+    let item = seal_payload(
+        &manifest_bytes,
+        ContentType::Media,
+        manifest_root,
+        seal_id,
+        k_content,
+        sender_identity,
+        sender_device,
+        recipient_device_pub,
+        recipient_mailbox_tag,
+        gateway_ids,
+        threshold_t,
+        current_slot,
+        ttl_slots,
+        mode,
+    )?;
+    Ok(SealedMedia { item, chunks })
+}
+
 /// Seal a text item: encrypt locally, split the content key t-of-n, encrypt each
 /// share to the recipient device, and sign a leaf committing to it all (spec §6.2).
-#[allow(clippy::too_many_arguments)]
+///
 /// StrictSeal convenience wrapper (DSCP-1 behaviour: opens only at L1 finality).
 #[allow(clippy::too_many_arguments)]
 pub fn seal_text(
@@ -814,12 +1043,50 @@ pub fn seal_text_with_mode(
     ttl_slots: u64,
     mode: SealMode,
 ) -> Result<SealedItem> {
+    // Text has no chunk list, so `manifest_root` stays zero (spec §8.3).
+    seal_payload(
+        plaintext,
+        ContentType::Text,
+        [0u8; 32],
+        sc::random_32(),
+        sc::random_32(),
+        sender_identity,
+        sender_device,
+        recipient_device_pub,
+        recipient_mailbox_tag,
+        gateway_ids,
+        threshold_t,
+        current_slot,
+        ttl_slots,
+        mode,
+    )
+}
+
+/// The sealing core, shared by every content type. `payload` is what the envelope carries:
+/// the message itself for text, the encrypted [`MediaManifest`] for media. `seal_id` and
+/// `k_content` are passed in because media must chunk-encrypt with them before the leaf exists.
+#[allow(clippy::too_many_arguments)]
+fn seal_payload(
+    payload: &[u8],
+    content_type: ContentType,
+    manifest_root: [u8; 32],
+    seal_id: [u8; 32],
+    k_content: [u8; 32],
+    sender_identity: &sc::SignId,
+    sender_device: &sc::SignId,
+    recipient_device_pub: &[u8; 32],
+    recipient_mailbox_tag: [u8; 32],
+    gateway_ids: &[[u8; 32]],
+    threshold_t: u8,
+    current_slot: u64,
+    ttl_slots: u64,
+    mode: SealMode,
+) -> Result<SealedItem> {
     let n = gateway_ids.len() as u8;
     if threshold_t == 0 || threshold_t > n {
         return Err(anyhow!("invalid threshold t={threshold_t} n={n}"));
     }
-    let seal_id = sc::random_32();
-    let k_content = sc::random_32();
+    let plaintext = payload;
 
     let recip_dev_commit = device_commitment(recipient_device_pub);
     let sender_id_commit = identity_commitment(&sender_identity.public());
@@ -829,7 +1096,7 @@ pub fn seal_text_with_mode(
     let aad = compute_aad(
         CHAIN_ID,
         &seal_id,
-        ContentType::Text,
+        content_type,
         &recip_dev_commit,
         &sender_id_commit,
         expires_at_slot,
@@ -868,9 +1135,9 @@ pub fn seal_text_with_mode(
         protocol_version: PROTOCOL_VERSION,
         chain_id: CHAIN_ID,
         seal_id,
-        content_type: ContentType::Text,
+        content_type,
         ciphertext_hash: ct_hash,
-        manifest_root: [0u8; 32],
+        manifest_root,
         recipient_device_commitment: recip_dev_commit,
         sender_identity_commitment: sender_id_commit,
         sender_device_commitment: sender_dev_commit,
@@ -1043,6 +1310,33 @@ pub fn try_open_dscp2(
     pre_confirmations: &[PreConfirmation],
     chain: &impl SealChain,
 ) -> OpenOutcome {
+    let mut discard = None;
+    try_open_inner(
+        envelope,
+        signed_leaf,
+        sender_identity_pub,
+        recipient_device,
+        collected_shares,
+        pre_confirmations,
+        chain,
+        &mut discard,
+    )
+}
+
+/// Shared open path. `out_key` receives the reconstructed content key on success — media
+/// needs it to derive per-chunk keys, text does not. It is an out-parameter rather than a
+/// return value so that every early-return verification check below stays untouched.
+#[allow(clippy::too_many_arguments)]
+fn try_open_inner(
+    envelope: &EncryptedEnvelope,
+    signed_leaf: &SignedLeaf,
+    sender_identity_pub: &[u8; 32],
+    recipient_device: &sc::DeviceKey,
+    collected_shares: &[KeyShareEnvelope],
+    pre_confirmations: &[PreConfirmation],
+    chain: &impl SealChain,
+    out_key: &mut Option<[u8; 32]>,
+) -> OpenOutcome {
     let leaf = &signed_leaf.leaf;
 
     // (5a) version / chain binding.
@@ -1139,9 +1433,149 @@ pub fn try_open_dscp2(
         Err(_) => return OpenOutcome::Rejected { reason: "reconstructed key wrong length".into() },
     };
     match sc::aead_open(&k, &envelope.nonce, &aad, &envelope.ciphertext) {
-        Ok(plaintext) => OpenOutcome::Opened { plaintext },
+        Ok(plaintext) => {
+            *out_key = Some(k);
+            OpenOutcome::Opened { plaintext }
+        }
         Err(_) => OpenOutcome::Rejected { reason: "content authentication failed".into() },
     }
+}
+
+// ──────────────────────── recipient flow: media ─────────────────────────────
+
+/// Result of opening a media seal.
+pub enum MediaOutcome {
+    /// The gate has not opened, or the item is not yet fully verifiable.
+    Locked { state: ItemState, reason: String },
+    /// Manifest recovered. Chunks may now be fetched and decrypted through the opener.
+    Opened { manifest: MediaManifest, opener: MediaOpener },
+    Rejected { reason: String },
+}
+
+/// Holds the reconstructed content key for one media item so chunks can be decrypted
+/// on demand. The key never leaves this struct, and is zeroised on drop.
+pub struct MediaOpener {
+    seal_id: [u8; 32],
+    chunk_count: u32,
+    chunk_hashes: Vec<[u8; 32]>,
+    k_content: [u8; 32],
+}
+
+impl Drop for MediaOpener {
+    fn drop(&mut self) {
+        self.k_content.zeroize();
+    }
+}
+
+impl MediaOpener {
+    /// Decrypt one chunk fetched from the relay. `blob` is exactly the bytes the relay
+    /// served (`nonce || ciphertext`).
+    ///
+    /// The chunk hash is checked against the manifest FIRST, so a relay that alters or
+    /// substitutes a blob is caught before any decryption is attempted — and the AEAD tag
+    /// catches it again afterwards.
+    pub fn decrypt_chunk(&self, index: u32, blob: &[u8]) -> Result<Vec<u8>> {
+        if index >= self.chunk_count {
+            return Err(anyhow!("chunk index {index} out of range (count {})", self.chunk_count));
+        }
+        if sc::hash("DSCP-1/media-chunk", blob) != self.chunk_hashes[index as usize] {
+            return Err(anyhow!("chunk {index} does not match its manifest hash (content altered)"));
+        }
+        if blob.len() < sc::NONCE_LEN {
+            return Err(anyhow!("chunk {index} truncated"));
+        }
+        let (nonce_bytes, ct) = blob.split_at(sc::NONCE_LEN);
+        let nonce: [u8; sc::NONCE_LEN] = nonce_bytes.try_into().expect("checked length above");
+        let key = chunk_key(&self.k_content, &self.seal_id, index);
+        let aad = chunk_aad(&self.seal_id, index, self.chunk_count);
+        sc::aead_open(&key, &nonce, &aad, ct)
+    }
+
+    pub fn chunk_count(&self) -> u32 {
+        self.chunk_count
+    }
+}
+
+/// StrictSeal media entry point (no pre-confirmations → requires L1 finality).
+pub fn try_open_media(
+    envelope: &EncryptedEnvelope,
+    signed_leaf: &SignedLeaf,
+    sender_identity_pub: &[u8; 32],
+    recipient_device: &sc::DeviceKey,
+    collected_shares: &[KeyShareEnvelope],
+    chain: &impl SealChain,
+) -> MediaOutcome {
+    try_open_media_dscp2(envelope, signed_leaf, sender_identity_pub, recipient_device, collected_shares, &[], chain)
+}
+
+/// Open a media seal: run the same five-condition gate as text, then recover the manifest
+/// and bind it to the leaf. Returns an opener for the chunks.
+///
+/// The recipient may hold every chunk already — they are useless until this succeeds.
+#[allow(clippy::too_many_arguments)]
+pub fn try_open_media_dscp2(
+    envelope: &EncryptedEnvelope,
+    signed_leaf: &SignedLeaf,
+    sender_identity_pub: &[u8; 32],
+    recipient_device: &sc::DeviceKey,
+    collected_shares: &[KeyShareEnvelope],
+    pre_confirmations: &[PreConfirmation],
+    chain: &impl SealChain,
+) -> MediaOutcome {
+    let leaf = &signed_leaf.leaf;
+    if leaf.content_type != ContentType::Media {
+        return MediaOutcome::Rejected { reason: "leaf is not a media item".into() };
+    }
+    let mut key: Option<[u8; 32]> = None;
+    let manifest_bytes = match try_open_inner(
+        envelope,
+        signed_leaf,
+        sender_identity_pub,
+        recipient_device,
+        collected_shares,
+        pre_confirmations,
+        chain,
+        &mut key,
+    ) {
+        OpenOutcome::Opened { plaintext } => plaintext,
+        OpenOutcome::Locked { state, reason } => return MediaOutcome::Locked { state, reason },
+        OpenOutcome::Rejected { reason } => return MediaOutcome::Rejected { reason },
+    };
+    let Some(k_content) = key else {
+        return MediaOutcome::Rejected { reason: "content key unavailable after open".into() };
+    };
+
+    let manifest: MediaManifest = match bincode::deserialize(&manifest_bytes) {
+        Ok(m) => m,
+        Err(e) => return MediaOutcome::Rejected { reason: format!("malformed media manifest: {e}") },
+    };
+
+    // The manifest is authenticated by the envelope AEAD, but it must also match the leaf
+    // the sender signed — otherwise a manifest from one seal could be paired with another.
+    if manifest.protocol_version != PROTOCOL_VERSION {
+        return MediaOutcome::Rejected { reason: "unknown/downgraded manifest version".into() };
+    }
+    if manifest.seal_id != leaf.seal_id {
+        return MediaOutcome::Rejected { reason: "manifest/leaf seal_id mismatch".into() };
+    }
+    if manifest.chunk_count as usize != manifest.ciphertext_chunk_hashes.len() {
+        return MediaOutcome::Rejected { reason: "manifest chunk_count does not match hash list".into() };
+    }
+    if manifest.chunk_count == 0 || manifest.chunk_count > MAX_CHUNK_COUNT {
+        return MediaOutcome::Rejected { reason: "manifest chunk_count out of range".into() };
+    }
+    // THE binding: the chunk list must reproduce the root the sender signed into the leaf.
+    if manifest_root_of(&manifest.ciphertext_chunk_hashes) != leaf.manifest_root {
+        return MediaOutcome::Rejected { reason: "manifest_root mismatch (chunk list altered)".into() };
+    }
+
+    let opener = MediaOpener {
+        seal_id: leaf.seal_id,
+        chunk_count: manifest.chunk_count,
+        chunk_hashes: manifest.ciphertext_chunk_hashes.clone(),
+        k_content,
+    };
+    MediaOutcome::Opened { manifest, opener }
 }
 
 #[cfg(test)]

@@ -1023,6 +1023,7 @@ dependencies = [
  "bs58",
  "seal-crypto",
  "serde",
+ "zeroize",
 ]
 
 [[package]]

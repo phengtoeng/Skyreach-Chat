@@ -11,3 +11,4 @@ serde = { version = "1", features = ["derive"] }
 bincode = "1"
 anyhow = "1"
 bs58 = "0.5"
+zeroize = "1" # wipe the reconstructed media content key on drop

@@ -105,6 +105,48 @@ impl World {
             &self.chain,
         )
     }
+
+    // ── media helpers ──
+    fn seal_media(&self, bytes: &[u8], chunk_size: u32, t: u8, ttl: u64) -> SealedMedia {
+        seal_media_with_mode(
+            bytes,
+            ContentKind::Image,
+            "image/jpeg",
+            b"blurred-preview",
+            PreviewPolicy::LockedBlur,
+            (1920, 1080),
+            0,
+            chunk_size,
+            &self.sender_identity,
+            &self.sender_device,
+            &self.bob_device.public(),
+            sc::random_32(),
+            &self.gw_ids,
+            t,
+            self.chain.slot(),
+            ttl,
+            SealMode::StrictSeal,
+        )
+        .expect("seal media")
+    }
+    fn open_media(&self, m: &SealedMedia, shares: &[KeyShareEnvelope]) -> MediaOutcome {
+        try_open_media(
+            &m.item.envelope,
+            &m.item.signed_leaf,
+            &self.sender_identity.public(),
+            &self.bob_device,
+            shares,
+            &self.chain,
+        )
+    }
+    /// Reassemble the whole item from its chunks, as a real client would.
+    fn reassemble(&self, opener: &MediaOpener, chunks: &[MediaChunk]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for c in chunks {
+            out.extend_from_slice(&opener.decrypt_chunk(c.index, &c.bytes).expect("chunk decrypt"));
+        }
+        out
+    }
 }
 
 /// A world whose gateways carry signing identities, so they can issue slashable
@@ -586,4 +628,176 @@ fn phone_directory_resolves_number_to_address_without_storing_the_number() {
     assert_eq!(phone_commitment("+1 555-123-4567"), phone_commitment("15551234567"));
     // different numbers → different keys
     assert_ne!(phone_commitment("+15551234567"), phone_commitment("+15559999999"));
+}
+
+// ─────────────────────────────── media (§8.2 / §10.3 / §11) ──────────────────
+
+#[test]
+fn media_round_trips_through_chunks_after_finality() {
+    let mut w = world();
+    // 3.5 chunks, so the last one is a partial — the common off-by-one.
+    let picture: Vec<u8> = (0..3_500u32).map(|i| (i % 251) as u8).collect();
+    let m = w.seal_media(&picture, 1000, 2, 100);
+    assert_eq!(m.chunks.len(), 4);
+
+    w.deposit_all(&m.item);
+    w.chain.submit_leaf(&m.item.signed_leaf, &w.sender_identity.public()).unwrap();
+    w.chain.finalize(&m.item.seal_id).unwrap();
+    let shares = w.collect(&m.item.seal_id);
+
+    match w.open_media(&m, &shares) {
+        MediaOutcome::Opened { manifest, opener } => {
+            assert_eq!(manifest.content_kind, ContentKind::Image);
+            assert_eq!(manifest.mime_type, "image/jpeg");
+            assert_eq!(manifest.plaintext_size, picture.len() as u64);
+            assert_eq!(manifest.width, 1920);
+            assert_eq!(manifest.preview, b"blurred-preview");
+            assert_eq!(w.reassemble(&opener, &m.chunks), picture);
+        }
+        other => panic!("expected Opened, got {}", media_label(&other)),
+    }
+}
+
+#[test]
+fn media_chunks_are_useless_before_the_gate_opens() {
+    let mut w = world();
+    let video: Vec<u8> = (0..5_000u32).map(|i| (i % 97) as u8).collect();
+    let m = w.seal_media(&video, 1024, 2, 100);
+    w.deposit_all(&m.item);
+    w.chain.submit_leaf(&m.item.signed_leaf, &w.sender_identity.public()).unwrap();
+    // NOT finalised: the recipient may already hold every byte of ciphertext.
+    let shares = w.collect(&m.item.seal_id);
+
+    match w.open_media(&m, &shares) {
+        MediaOutcome::Locked { .. } => {}
+        other => panic!("media opened before finality: {}", media_label(&other)),
+    }
+    // and the chunks on their own reveal nothing about the plaintext
+    for c in &m.chunks {
+        assert_ne!(&c.bytes[..], &video[..c.bytes.len().min(video.len())]);
+    }
+}
+
+#[test]
+fn altered_chunk_is_rejected_against_the_manifest() {
+    let mut w = world();
+    let bytes: Vec<u8> = (0..2_048u32).map(|i| i as u8).collect();
+    let m = w.seal_media(&bytes, 512, 2, 100);
+    w.deposit_all(&m.item);
+    w.chain.submit_leaf(&m.item.signed_leaf, &w.sender_identity.public()).unwrap();
+    w.chain.finalize(&m.item.seal_id).unwrap();
+    let shares = w.collect(&m.item.seal_id);
+
+    let MediaOutcome::Opened { opener, .. } = w.open_media(&m, &shares) else {
+        panic!("expected Opened");
+    };
+    // a relay that flips one byte of one chunk is caught by the manifest hash
+    let mut tampered = m.chunks[1].bytes.clone();
+    tampered[7] ^= 0x01;
+    assert!(opener.decrypt_chunk(1, &tampered).is_err());
+    // the untouched chunk still opens
+    assert!(opener.decrypt_chunk(1, &m.chunks[1].bytes).is_ok());
+}
+
+#[test]
+fn chunks_cannot_be_reordered() {
+    let mut w = world();
+    let bytes: Vec<u8> = (0..2_048u32).map(|i| i as u8).collect();
+    let m = w.seal_media(&bytes, 512, 2, 100);
+    w.deposit_all(&m.item);
+    w.chain.submit_leaf(&m.item.signed_leaf, &w.sender_identity.public()).unwrap();
+    w.chain.finalize(&m.item.seal_id).unwrap();
+    let shares = w.collect(&m.item.seal_id);
+
+    let MediaOutcome::Opened { opener, .. } = w.open_media(&m, &shares) else {
+        panic!("expected Opened");
+    };
+    // serving chunk 2's bytes as chunk 0 fails: position is bound by both the manifest
+    // hash list and the per-chunk key/AAD.
+    assert!(opener.decrypt_chunk(0, &m.chunks[2].bytes).is_err());
+    // and an out-of-range index is refused rather than panicking
+    assert!(opener.decrypt_chunk(99, &m.chunks[0].bytes).is_err());
+}
+
+#[test]
+fn manifest_root_binds_the_chunk_list_to_the_signed_leaf() {
+    let w = world();
+    let bytes: Vec<u8> = (0..3_000u32).map(|i| i as u8).collect();
+    let m = w.seal_media(&bytes, 1000, 2, 100);
+
+    // the leaf commits to the real chunk list …
+    let hashes: Vec<[u8; 32]> = m.chunks.iter().map(|c| c.ciphertext_hash).collect();
+    assert_eq!(m.item.signed_leaf.leaf.manifest_root, manifest_root_of(&hashes));
+    assert_ne!(m.item.signed_leaf.leaf.manifest_root, [0u8; 32]);
+    assert_eq!(m.item.signed_leaf.leaf.content_type, ContentType::Media);
+
+    // … and dropping or swapping any chunk changes the root
+    let mut short = hashes.clone();
+    short.pop();
+    assert_ne!(manifest_root_of(&short), m.item.signed_leaf.leaf.manifest_root);
+    let mut swapped = hashes.clone();
+    swapped.swap(0, 1);
+    assert_ne!(manifest_root_of(&swapped), m.item.signed_leaf.leaf.manifest_root);
+}
+
+#[test]
+fn media_leaf_leaks_nothing_about_the_file() {
+    let w = world();
+    let bytes = b"JPEG-ish payload that should never be inferable from the chain".to_vec();
+    let m = w.seal_media(&bytes, 16, 2, 100);
+    let leaf = &m.item.signed_leaf.leaf;
+
+    // what goes on-chain is the leaf. It must not carry mime, filename, size, or preview.
+    let public = leaf.canonical_bytes();
+    assert!(!contains(&public, b"image/jpeg"), "mime type leaked into the leaf");
+    assert!(!contains(&public, b"blurred-preview"), "preview leaked into the leaf");
+    assert!(!contains(&public, &bytes), "plaintext leaked into the leaf");
+    // the plaintext length is not a public field either
+    assert!(!contains(&public, &(bytes.len() as u64).to_le_bytes()));
+
+    // the envelope the relay stores is ciphertext only
+    let relay_sees = &m.item.envelope.ciphertext;
+    assert!(!contains(relay_sees, b"image/jpeg"));
+    assert!(!contains(relay_sees, &bytes));
+}
+
+#[test]
+fn text_seals_still_have_a_zero_manifest_root() {
+    let w = world();
+    let item = w.seal(b"plain text", 2, 100);
+    assert_eq!(item.signed_leaf.leaf.manifest_root, [0u8; 32]);
+    assert_eq!(item.signed_leaf.leaf.content_type, ContentType::Text);
+}
+
+#[test]
+fn empty_media_is_refused() {
+    let w = world();
+    let err = seal_media_with_mode(
+        b"",
+        ContentKind::Video,
+        "video/mp4",
+        b"",
+        PreviewPolicy::None,
+        (0, 0),
+        0,
+        1024,
+        &w.sender_identity,
+        &w.sender_device,
+        &w.bob_device.public(),
+        sc::random_32(),
+        &w.gw_ids,
+        2,
+        w.chain.slot(),
+        100,
+        SealMode::StrictSeal,
+    );
+    assert!(err.is_err());
+}
+
+fn media_label(o: &MediaOutcome) -> String {
+    match o {
+        MediaOutcome::Locked { reason, .. } => format!("Locked({reason})"),
+        MediaOutcome::Opened { .. } => "Opened".to_string(),
+        MediaOutcome::Rejected { reason } => format!("Rejected({reason})"),
+    }
 }

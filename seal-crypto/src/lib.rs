@@ -32,6 +32,15 @@ pub fn random_32() -> [u8; 32] {
     b
 }
 
+/// BLAKE3 key-derivation mode — a reviewed KDF (spec §10.3), NOT a plain hash.
+///
+/// `context` must be a hardcoded, globally unique, application-specific string; it is what
+/// separates one derived key space from another. Used to derive a distinct per-chunk key
+/// from one content key, so no (key, nonce) pair can repeat across a media item's chunks.
+pub fn derive_key(context: &str, key_material: &[u8]) -> [u8; 32] {
+    blake3::derive_key(context, key_material)
+}
+
 /// Domain-separated BLAKE3 hash: `BLAKE3(domain || 0x1F || data)`.
 /// Every protocol object hashes under its own domain string (spec §7.2).
 pub fn hash(domain: &str, data: &[u8]) -> [u8; 32] {
