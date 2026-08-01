@@ -1871,21 +1871,31 @@ private struct Bubble: View {
     /// The locked card: a lock and a live countdown, and deliberately NO hint of the content —
     /// the preview is sealed inside the manifest, which cannot be opened before the window.
     private var lockedContent: some View {
-        VStack(spacing: 6) {
-            Image(systemName: "lock.fill").font(.system(size: 26)).foregroundColor(.dvSub)
-            Text(countdownLabel(m.revealAt - now))
-                .font(.system(size: 26, weight: .bold)).foregroundColor(.dvInk)
-            Text("Photo · opens in").font(.system(size: 12)).foregroundColor(.dvSub)
+        VStack(alignment: .leading, spacing: 6) {
+            VStack(spacing: 6) {
+                Image(systemName: "lock.fill").font(.system(size: 26)).foregroundColor(.dvSub)
+                Text(countdownLabel(m.revealAt - now))
+                    .font(.system(size: 26, weight: .bold)).foregroundColor(.dvInk)
+                Text("Photo · opens in").font(.system(size: 12)).foregroundColor(.dvSub)
+            }
+            .frame(width: 220, height: 160)
+            .background(Color(hex: 0xE3E9EF))
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            // the sender's own caption stays readable — they wrote it; only the picture is sealed
+            if !m.text.isEmpty, m.text != "Photo", m.text != "Video" {
+                Text(m.text).font(.system(size: 15)).foregroundColor(.dvInk)
+                    .frame(maxWidth: 220, alignment: .leading)
+            }
         }
-        .frame(width: 220, height: 160)
-        .background(Color(hex: 0xE3E9EF))
-        .clipShape(RoundedRectangle(cornerRadius: 12))
     }
 
     @ViewBuilder private var content: some View {
         switch m.state {
         case .sealing: sealing
         case .locked: lockedContent
+        // Sealed and not yet open: show the lock card on the SENDER's side too. A translucent
+        // scrim still let the picture read straight through it.
+        case _ where sealedNow && m.kind == .image: lockedContent
         default:
             switch m.kind {
             case .image: imageContent
@@ -1941,20 +1951,10 @@ private struct Bubble: View {
             }
             .frame(width: 220, height: 160).clipped().clipShape(RoundedRectangle(cornerRadius: 12))
 
-            if isVideo && !sealedNow {
+            if isVideo {
                 Image(systemName: "play.circle.fill")
                     .font(.system(size: 44)).foregroundColor(.white.opacity(0.85))
                     .frame(width: 220, height: 160)
-            }
-            // A still-sealed item reads as sealed on the sender's side too: the picture is
-            // theirs, but a frosted scrim + lock says plainly that nobody else can open it yet.
-            if sealedNow {
-                ZStack {
-                    Color(hex: 0xEDF1F5).opacity(0.8)
-                    Image(systemName: "lock.fill").font(.system(size: 30)).foregroundColor(.dvBlue)
-                }
-                .frame(width: 220, height: 160)
-                .clipShape(RoundedRectangle(cornerRadius: 12))
             }
             HStack(spacing: 3) { Text(m.time).font(.system(size: 11)).foregroundColor(.white); sealBadge }.padding(6)
         }

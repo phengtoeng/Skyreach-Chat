@@ -2043,18 +2043,25 @@ private fun SmokeDestroy(onFinished: () -> Unit, content: @Composable () -> Unit
 /** The locked card: a lock and a live countdown, and deliberately NO hint of the content —
  *  the preview is sealed inside the manifest, which cannot be opened before the window. */
 @Composable
-private fun LockedContent(m: Msg, now: Long) {
-    Column(
-        Modifier.size(width = 220.dp, height = 160.dp).clip(RoundedCornerShape(12.dp))
-            .background(Color(0xFFE3E9EF)),
-        verticalArrangement = Arrangement.Center,
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Icon(Icons.Filled.Lock, null, tint = Sub, modifier = Modifier.size(30.dp))
-        Spacer(Modifier.height(8.dp))
-        Text(countdown(m.revealAt - now), color = Ink, fontSize = 26.sp, fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(4.dp))
-        Text("Photo · opens in", color = Sub, fontSize = 12.sp)
+private fun LockedContent(m: Msg, now: Long, caption: String = "") {
+    Column(horizontalAlignment = Alignment.Start) {
+        Column(
+            Modifier.size(width = 220.dp, height = 160.dp).clip(RoundedCornerShape(12.dp))
+                .background(Color(0xFFE3E9EF)),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Icon(Icons.Filled.Lock, null, tint = Sub, modifier = Modifier.size(30.dp))
+            Spacer(Modifier.height(8.dp))
+            Text(countdown(m.revealAt - now), color = Ink, fontSize = 26.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(4.dp))
+            Text("Photo · opens in", color = Sub, fontSize = 12.sp)
+        }
+        // the sender's own caption stays readable — they wrote it; only the picture is sealed
+        if (caption.isNotBlank() && caption != "Photo" && caption != "Video") {
+            Spacer(Modifier.height(6.dp))
+            Text(caption, color = Ink, fontSize = 15.sp, modifier = Modifier.widthIn(max = 220.dp))
+        }
     }
 }
 
@@ -2080,7 +2087,10 @@ private fun Bubble(m: Msg, now: Long = 0L, onDestroyed: () -> Unit = {}) {
                 when {
                     m.state == State.SEALING -> SealingContent(m)
                     m.state == State.LOCKED -> LockedContent(m, now)
-                    m.kind == Kind.IMAGE -> ImageContent(m, sealedUntil = stillSealed)
+                    // Sealed and not yet open: show the lock card on the SENDER's side too.
+                    // A translucent scrim still let the picture read straight through it.
+                    stillSealed && m.kind == Kind.IMAGE -> LockedContent(m, now, caption = m.text)
+                    m.kind == Kind.IMAGE -> ImageContent(m)
                     m.kind == Kind.VOICE -> VoiceContent(m)
                     else -> TextContent(m)
                 }
@@ -2138,7 +2148,7 @@ private fun SealingContent(m: Msg) {
 }
 
 @Composable
-private fun ImageContent(m: Msg, sealedUntil: Boolean = false) {
+private fun ImageContent(m: Msg) {
     val ctx = LocalContext.current
     val isVideo = m.mediaMime.startsWith("video")
     // Decode the DECRYPTED local file. Nothing here ever touches the network — by this
@@ -2174,16 +2184,9 @@ private fun ImageContent(m: Msg, sealedUntil: Boolean = false) {
                         .background(Brush.verticalGradient(listOf(Color(0xFFF6B26B), Color(0xFF6FA8DC), Color(0xFF2E5B8A))))
                 )
             }
-            if (isVideo && !sealedUntil) {
+            if (isVideo) {
                 Box(Modifier.size(46.dp).background(Color(0x99000000), CircleShape), contentAlignment = Alignment.Center) {
                     Icon(Icons.Filled.PlayArrow, "Play", tint = Color.White, modifier = Modifier.size(30.dp))
-                }
-            }
-            // A still-sealed item reads as sealed on the sender's side too: the picture is
-            // theirs, but a frosted scrim + lock says plainly that nobody else can open it yet.
-            if (sealedUntil) {
-                Box(Modifier.fillMaxSize().background(Color(0xCCEDF1F5)), contentAlignment = Alignment.Center) {
-                    Icon(Icons.Filled.Lock, null, tint = Blue, modifier = Modifier.size(34.dp))
                 }
             }
             Row(Modifier.align(Alignment.BottomEnd).padding(6.dp), verticalAlignment = Alignment.CenterVertically) {
