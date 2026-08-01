@@ -538,6 +538,19 @@ func fetchInboxAll(_ tag: String) async -> [[String: Any]] {
     }
     return order.compactMap { byId[$0] }
 }
+/// The chain's current finalised slot, read from a WCAHT node's /health. Sealing uses it to
+/// put a chain-time floor in the leaf. 0 means "couldn't reach a node" — the seal still carries
+/// its signed wall-clock window, it just has no chain floor.
+func finalizedSlot() async -> Int64 {
+    for h in nodeHosts {
+        guard let body = await httpGet("http://\(h):8901/health"),
+              let d = (try? JSONSerialization.jsonObject(with: Data(body.utf8))) as? [String: Any],
+              let v = (d["finalized_slot"] as? NSNumber)?.int64Value, v > 0 else { continue }
+        return v
+    }
+    return 0
+}
+
 func collectShares(_ sealId: String) async -> String {
     var all: [Any] = []
     for gw in gatewayURLs {
@@ -1578,7 +1591,8 @@ struct ConversationView: View {
 
             let sealedStr = SealCore.sealMediaFile(
                 myIdentitySeed, myCard, chat.devicePub, src.path, mime,
-                isVideo ? "video" : "image", caption, preview?.path ?? "", chunkDir.path, fast, rv, dz
+                isVideo ? "video" : "image", caption, preview?.path ?? "", chunkDir.path, fast, rv, dz,
+                rv > 0 ? await finalizedSlot() : 0
             )
             if let p = preview { try? FileManager.default.removeItem(at: p) }
             guard let sealed = (try? JSONSerialization.jsonObject(with: Data(sealedStr.utf8))) as? [String: Any],
@@ -1641,7 +1655,8 @@ struct ConversationView: View {
                 // seal + SHIP over the relay + gateways; the recipient's device polls + opens.
                 // `ok` now means the RELAY actually accepted the ciphertext (real delivery signal).
                 var ok = false
-                let shipStr = SealCore.sealShippable(myIdentitySeed, myCard, chat.devicePub, text, fast, rv, dz)
+                let slot: Int64 = rv > 0 ? await finalizedSlot() : 0 // only needed for a reveal floor
+                let shipStr = SealCore.sealShippable(myIdentitySeed, myCard, chat.devicePub, text, fast, rv, dz, slot)
                 if let ship = (try? JSONSerialization.jsonObject(with: Data(shipStr.utf8))) as? [String: Any], (ship["ok"] as? Bool) == true {
                     ok = await shipSeal(ship)
                 }

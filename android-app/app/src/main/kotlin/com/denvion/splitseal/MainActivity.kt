@@ -446,6 +446,19 @@ private fun fetchInboxAll(tag: String): List<JSONObject> {
     return byId.values.toList()
 }
 
+/** The chain's current finalised slot, read from a WCAHT node's /health.
+ *  Sealing uses it to put a chain-time floor in the leaf: the slot the chain must finalise
+ *  past before the item may open. 0 means "couldn't reach a node" — the seal still carries
+ *  its signed wall-clock window, it just has no chain floor. */
+private fun finalizedSlot(): Long {
+    for (h in Server.nodeHosts) {
+        val body = httpGet("http://$h:8901/health") ?: continue
+        val v = runCatching { JSONObject(body).optLong("finalized_slot") }.getOrNull() ?: continue
+        if (v > 0) return v
+    }
+    return 0
+}
+
 /** Upload one encrypted media chunk to EVERY relay, addressed by its ciphertext hash.
  *  The relay verifies the hash matches the bytes, so it cannot substitute a chunk — and it
  *  holds no key, so it can never open one. True if at least one relay stored it. */
@@ -1671,12 +1684,13 @@ private fun ConversationScreen(
                 val src = cacheFromUri(ctx, uri, "pick-${System.nanoTime()}") ?: return@withContext null
                 val preview = buildPreview(ctx, src, isVideo)
                 val chunkDir = java.io.File(ctx.cacheDir, "out-${System.nanoTime()}")
+                val slot = if (rv > 0) finalizedSlot() else 0L // only needed for a reveal floor
                 val sealed = runCatching {
                     JSONObject(
                         SealCore.sealMediaFile(
                             myIdentitySeed, myCard, chat.devicePub, src.path, mime,
                             if (isVideo) "video" else "image", caption,
-                            preview?.path ?: "", chunkDir.path, fast, rv, dz,
+                            preview?.path ?: "", chunkDir.path, fast, rv, dz, slot,
                         )
                     )
                 }.getOrNull()
@@ -1734,7 +1748,8 @@ private fun ConversationScreen(
                 // `ok` now means the RELAY actually accepted the ciphertext (real delivery signal).
                 val ok = runCatching {
                     withContext(Dispatchers.IO) {
-                        val ship = JSONObject(SealCore.sealShippable(myIdentitySeed, myCard, chat.devicePub, text, fast, rv, dz))
+                        val slot = if (rv > 0) finalizedSlot() else 0L // only needed for a reveal floor
+                        val ship = JSONObject(SealCore.sealShippable(myIdentitySeed, myCard, chat.devicePub, text, fast, rv, dz, slot))
                         if (!ship.optBoolean("ok")) return@withContext false
                         shipSeal(ship)
                     }

@@ -18,12 +18,12 @@ object SealCore {
     private external fun nativePhoneCommitment(phone: String): String
     private external fun nativeMailboxTag(devicePub: String): String
     private external fun nativeSealTo(devicePub: String, text: String, fast: Boolean): String
-    private external fun nativeSealShippable(identitySeed: String, senderCard: String, devicePub: String, text: String, fast: Boolean, revealAt: Long, destroyAt: Long): String
+    private external fun nativeSealShippable(identitySeed: String, senderCard: String, devicePub: String, text: String, fast: Boolean, revealAt: Long, destroyAt: Long, currentSlot: Long): String
     private external fun nativeOpenReceived(deviceSeed: String, bundle: String, shares: String): String
     private external fun nativeSealMediaFile(
         identitySeed: String, senderCard: String, devicePub: String, inPath: String,
         mime: String, kind: String, caption: String, previewPath: String, outDir: String,
-        fast: Boolean, revealAt: Long, destroyAt: Long,
+        fast: Boolean, revealAt: Long, destroyAt: Long, currentSlot: Long,
     ): String
     private external fun nativeOpenMediaInfo(deviceSeed: String, bundle: String, shares: String, previewOut: String): String
     private external fun nativeOpenMediaFile(deviceSeed: String, bundle: String, shares: String, chunkDir: String, outPath: String): String
@@ -58,8 +58,8 @@ object SealCore {
     /** Seal (signed by MY identitySeed, with MY card embedded so the peer can reply) + return
      *  {ok, seal_id, mailbox_tag, bundle, shares, reveal_at, destroy_at}. revealAt/destroyAt are
      *  unix secs (0 = none) — a timelock window enforced by the gateways. */
-    fun sealShippable(identitySeed: String, senderCard: String, devicePub: String, text: String, fast: Boolean, revealAt: Long = 0, destroyAt: Long = 0): String =
-        nativeSealShippable(identitySeed, senderCard, devicePub, text, fast, revealAt, destroyAt)
+    fun sealShippable(identitySeed: String, senderCard: String, devicePub: String, text: String, fast: Boolean, revealAt: Long = 0, destroyAt: Long = 0, currentSlot: Long = 0): String =
+        nativeSealShippable(identitySeed, senderCard, devicePub, text, fast, revealAt, destroyAt, currentSlot)
 
     /** Open a collected message with the recipient's device seed. Returns {ok, plaintext} or {ok:false, reason}. */
     fun openReceived(deviceSeed: String, bundle: String, shares: String): String = nativeOpenReceived(deviceSeed, bundle, shares)
@@ -81,9 +81,9 @@ object SealCore {
     fun sealMediaFile(
         identitySeed: String, senderCard: String, devicePub: String, inPath: String,
         mime: String, kind: String, caption: String, previewPath: String, outDir: String,
-        fast: Boolean = false, revealAt: Long = 0, destroyAt: Long = 0,
+        fast: Boolean = false, revealAt: Long = 0, destroyAt: Long = 0, currentSlot: Long = 0,
     ): String = nativeSealMediaFile(
-        identitySeed, senderCard, devicePub, inPath, mime, kind, caption, previewPath, outDir, fast, revealAt, destroyAt,
+        identitySeed, senderCard, devicePub, inPath, mime, kind, caption, previewPath, outDir, fast, revealAt, destroyAt, currentSlot,
     )
 
     /**

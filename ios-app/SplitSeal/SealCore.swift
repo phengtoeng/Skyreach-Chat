@@ -46,8 +46,8 @@ enum SealCore {
     /// Seal (signed by MY identitySeed, with MY card embedded so the peer can reply) + return
     /// {ok, seal_id, mailbox_tag, bundle, shares, reveal_at, destroy_at}. revealAt/destroyAt are
     /// unix secs (0 = none) — a timelock window enforced by the gateways.
-    static func sealShippable(_ identitySeed: String, _ senderCard: String, _ devicePub: String, _ text: String, _ fast: Bool, _ revealAt: Int64 = 0, _ destroyAt: Int64 = 0) -> String {
-        identitySeed.withCString { i in senderCard.withCString { c in devicePub.withCString { d in text.withCString { t in copy(ss_seal_shippable(i, c, d, t, fast ? 1 : 0, revealAt, destroyAt)) } } } }
+    static func sealShippable(_ identitySeed: String, _ senderCard: String, _ devicePub: String, _ text: String, _ fast: Bool, _ revealAt: Int64 = 0, _ destroyAt: Int64 = 0, _ currentSlot: Int64 = 0) -> String {
+        identitySeed.withCString { i in senderCard.withCString { c in devicePub.withCString { d in text.withCString { t in copy(ss_seal_shippable(i, c, d, t, fast ? 1 : 0, revealAt, destroyAt, currentSlot)) } } } }
     }
 
     /// Open a collected message with the recipient's device seed. Returns {ok, plaintext} or {ok:false, reason}.
@@ -70,12 +70,12 @@ enum SealCore {
     static func sealMediaFile(
         _ identitySeed: String, _ senderCard: String, _ devicePub: String, _ inPath: String,
         _ mime: String, _ kind: String, _ caption: String, _ previewPath: String, _ outDir: String,
-        _ fast: Bool = false, _ revealAt: Int64 = 0, _ destroyAt: Int64 = 0
+        _ fast: Bool = false, _ revealAt: Int64 = 0, _ destroyAt: Int64 = 0, _ currentSlot: Int64 = 0
     ) -> String {
         identitySeed.withCString { i in senderCard.withCString { c in devicePub.withCString { d in
         inPath.withCString { p in mime.withCString { m in kind.withCString { k in
         caption.withCString { cap in previewPath.withCString { pv in outDir.withCString { o in
-            copy(ss_seal_media_file(i, c, d, p, m, k, cap, pv, o, fast ? 1 : 0, revealAt, destroyAt))
+            copy(ss_seal_media_file(i, c, d, p, m, k, cap, pv, o, fast ? 1 : 0, revealAt, destroyAt, currentSlot))
         } } } } } } } } }
     }
 

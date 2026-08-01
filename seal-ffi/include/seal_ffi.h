@@ -49,7 +49,10 @@ char *ss_seal_to(const char *device_pub, const char *text, int fast);
 /* reveal_at / destroy_at are unix seconds (0 = none): a timelock window. The gateways withhold
  * the key shares before reveal_at and drop them after destroy_at (self-destruct), so the recipient
  * cannot reconstruct the key outside the window; open_received enforces it too (defense-in-depth). */
-char *ss_seal_shippable(const char *identity_seed, const char *sender_card, const char *device_pub, const char *text, int fast, long long reveal_at, long long destroy_at);
+/* current_slot = the chain's finalised slot right now, or 0 if unknown. A non-zero value puts
+ * a chain-time floor in the leaf (not_before_finalized_slot): the slot the chain must finalise
+ * past before the item may open, so the timelock does not rest on a system clock. */
+char *ss_seal_shippable(const char *identity_seed, const char *sender_card, const char *device_pub, const char *text, int fast, long long reveal_at, long long destroy_at, long long current_slot);
 
 /* Open a message COLLECTED from the services:
  *   { ok, plaintext }  or  { ok:false, reason }  (device_seed = recipient's stored seed). */
@@ -74,7 +77,7 @@ char *ss_open_received(const char *device_seed, const char *bundle, const char *
 char *ss_seal_media_file(const char *identity_seed, const char *sender_card, const char *device_pub,
                          const char *in_path, const char *mime, const char *kind,
                          const char *caption, const char *preview_path, const char *out_dir,
-                         int fast, long long reveal_at, long long destroy_at);
+                         int fast, long long reveal_at, long long destroy_at, long long current_slot);
 
 /* Media step 1 — open the MANIFEST only, to learn what the item is and which chunks to fetch:
  *   { ok, mime_type, kind, plaintext_size, chunk_count, chunks:[hash], width, height, duration_ms }

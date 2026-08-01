@@ -26,6 +26,23 @@ unsafe fn cstr(p: *const c_char) -> String {
     }
 }
 
+/// WCAHT produces a slot every 400 ms.
+const SLOT_MS: u64 = 400;
+
+/// The chain-time floor for a seal: the slot the chain must have FINALISED past before the
+/// item may open. Returns `current_slot` unchanged when there is no reveal time, or when the
+/// caller could not tell us the chain's position (`current_slot == 0`), in which case the
+/// timelock rests on the signed wall-clock value alone.
+fn reveal_floor_slot(current_slot: i64, reveal_at: i64) -> u64 {
+    let base = current_slot.max(0) as u64;
+    if base == 0 || reveal_at <= 0 {
+        return base;
+    }
+    let now = now_unix() as i64;
+    let secs_ahead = (reveal_at - now).max(0) as u64;
+    base.saturating_add(secs_ahead.saturating_mul(1000) / SLOT_MS)
+}
+
 fn seed_from_hex(s: &str) -> [u8; 32] {
     let v = hex::decode(s.trim()).unwrap_or_default();
     let mut out = [0u8; 32];
@@ -104,6 +121,7 @@ fn seal_shippable_json(
     fast: bool,
     reveal_at: i64,
     destroy_at: i64,
+    current_slot: i64,
 ) -> String {
     let dp: Option<[u8; 32]> = hex::decode(device_pub_hex.trim()).ok().and_then(|v| v.try_into().ok());
     let Some(device_pub) = dp else {
@@ -117,7 +135,10 @@ fn seal_shippable_json(
     let tag = mailbox_tag(&device_pub);
     let mode = if fast { SealMode::FastSeal } else { SealMode::StrictSeal };
     let item = match seal_text_with_mode(
-        text.as_bytes(), &sender_id, &sender_dev, &device_pub, tag, &gw_ids, 2, 100, 100_000, mode,
+        text.as_bytes(), &sender_id, &sender_dev, &device_pub, tag, &gw_ids, 2,
+        // not_before_finalized_slot: the chain must finalise past this before it opens
+        reveal_floor_slot(current_slot, reveal_at),
+        100_000, mode,
         reveal_at.max(0) as u64, destroy_at.max(0) as u64,
     ) {
         Ok(i) => i,
@@ -265,6 +286,7 @@ fn seal_media_file_json(
     fast: bool,
     reveal_at: i64,
     destroy_at: i64,
+    current_slot: i64,
 ) -> String {
     let dp: Option<[u8; 32]> = hex::decode(device_pub_hex.trim()).ok().and_then(|v| v.try_into().ok());
     let Some(device_pub) = dp else {
@@ -319,7 +341,7 @@ fn seal_media_file_json(
         tag,
         &gw_ids,
         2,
-        100,
+        reveal_floor_slot(current_slot, reveal_at),
         100_000,
         mode,
         reveal_at.max(0) as u64,
@@ -630,8 +652,9 @@ pub unsafe extern "C" fn ss_seal_shippable(
     fast: i32,
     reveal_at: i64,
     destroy_at: i64,
+    current_slot: i64,
 ) -> *mut c_char {
-    to_c(seal_shippable_json(&cstr(identity_seed), &cstr(sender_card), &cstr(device_pub), &cstr(text), fast != 0, reveal_at, destroy_at))
+    to_c(seal_shippable_json(&cstr(identity_seed), &cstr(sender_card), &cstr(device_pub), &cstr(text), fast != 0, reveal_at, destroy_at, current_slot))
 }
 
 /// Open a collected message: `{ ok, plaintext }` or `{ ok:false, reason }`.
@@ -662,6 +685,7 @@ pub unsafe extern "C" fn ss_seal_media_file(
     fast: i32,
     reveal_at: i64,
     destroy_at: i64,
+    current_slot: i64,
 ) -> *mut c_char {
     to_c(seal_media_file_json(
         &cstr(identity_seed),
@@ -676,6 +700,7 @@ pub unsafe extern "C" fn ss_seal_media_file(
         fast != 0,
         reveal_at,
         destroy_at,
+        current_slot,
     ))
 }
 
@@ -995,12 +1020,13 @@ pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeSealShippable<'
     fast: jni::sys::jboolean,
     reveal_at: jni::sys::jlong,
     destroy_at: jni::sys::jlong,
+    current_slot: jni::sys::jlong,
 ) -> jstring {
     let is = jstr(&mut env, &identity_seed);
     let sc = jstr(&mut env, &sender_card);
     let dp = jstr(&mut env, &device_pub);
     let t = jstr(&mut env, &text);
-    ret(env, seal_shippable_json(&is, &sc, &dp, &t, fast != 0, reveal_at as i64, destroy_at as i64))
+    ret(env, seal_shippable_json(&is, &sc, &dp, &t, fast != 0, reveal_at as i64, destroy_at as i64, current_slot as i64))
 }
 
 #[no_mangle]
@@ -1034,6 +1060,7 @@ pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeSealMediaFile<'
     fast: jni::sys::jboolean,
     reveal_at: jni::sys::jlong,
     destroy_at: jni::sys::jlong,
+    current_slot: jni::sys::jlong,
 ) -> jstring {
     let is = jstr(&mut env, &identity_seed);
     let card = jstr(&mut env, &sender_card);
@@ -1046,7 +1073,7 @@ pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeSealMediaFile<'
     let od = jstr(&mut env, &out_dir);
     ret(
         env,
-        seal_media_file_json(&is, &card, &dp, &ip, &mt, &kd, &cap, &pv, &od, fast != 0, reveal_at as i64, destroy_at as i64),
+        seal_media_file_json(&is, &card, &dp, &ip, &mt, &kd, &cap, &pv, &od, fast != 0, reveal_at as i64, destroy_at as i64, current_slot as i64),
     )
 }
 
@@ -1119,11 +1146,11 @@ mod tests {
             let _ = mailbox_tag_json(s);
             let _ = phone_commitment_json(s);
             let _ = seal_to_json(s, s, false);
-            let _ = seal_shippable_json(s, s, s, s, true, 0, 0);
+            let _ = seal_shippable_json(s, s, s, s, true, 0, 0, 0);
             let _ = card_for_json(s, s, s);
             let _ = open_received_json(s, s, s);
             // the media entry points take PATHS from the platform — equally untrusted
-            let _ = seal_media_file_json(s, s, s, s, s, s, s, s, s, false, 0, 0);
+            let _ = seal_media_file_json(s, s, s, s, s, s, s, s, s, false, 0, 0, 0);
             let _ = open_media_info_json(s, s, s, s);
             let _ = open_media_file_json(s, s, s, s, s);
         }
@@ -1171,6 +1198,7 @@ mod tests {
             &tmp.join("preview.jpg"),
             &chunks_dir,
             false,
+            0,
             0,
             0,
         ))
@@ -1221,7 +1249,7 @@ mod tests {
                 alice["identity_seed"].as_str().unwrap(),
                 alice["card"].as_str().unwrap(),
                 bob["device_pub"].as_str().unwrap(),
-                &src, "image/jpeg", "image", "", "", &tmp.join(dir), false, reveal, destroy,
+                &src, "image/jpeg", "image", "", "", &tmp.join(dir), false, reveal, destroy, 0,
             ))
             .unwrap()
         };
@@ -1277,6 +1305,7 @@ mod tests {
             false,
             0,
             0,
+            0,
         ))
         .unwrap();
         assert_eq!(sealed["ok"], true, "{sealed}");
@@ -1313,6 +1342,7 @@ mod tests {
             "",
             &chunks_dir,
             false,
+            0,
             0,
             0,
         ))
@@ -1355,7 +1385,7 @@ mod tests {
         // ...and equal to the tag the SENDER ships to, so polling it receives the seal.
         let seed = bob["identity_seed"].as_str().unwrap();
         let card = bob["card"].as_str().unwrap();
-        let ship: Value = serde_json::from_str(&seal_shippable_json(seed, card, device_pub, "hi", false, 0, 0)).unwrap();
+        let ship: Value = serde_json::from_str(&seal_shippable_json(seed, card, device_pub, "hi", false, 0, 0, 0)).unwrap();
         assert_eq!(ship["ok"], true);
         assert_eq!(ship["mailbox_tag"], t1["mailbox_tag"]);
 
@@ -1375,7 +1405,7 @@ mod tests {
         let alice_seed = alice["identity_seed"].as_str().unwrap();
         let alice_card = alice["card"].as_str().unwrap();
 
-        let ship: Value = serde_json::from_str(&seal_shippable_json(alice_seed, alice_card, device_pub, "meet at 9", false, 0, 0)).unwrap();
+        let ship: Value = serde_json::from_str(&seal_shippable_json(alice_seed, alice_card, device_pub, "meet at 9", false, 0, 0, 0)).unwrap();
         // attribution: the bundle names ALICE's stable identity as the sender.
         assert_eq!(ship["bundle"]["sender_id_pub"], alice["identity_pub"]);
         // self-describing: the bundle carries Alice's card so Bob can reply without adding her first.
@@ -1406,19 +1436,19 @@ mod tests {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
 
         // reveal_at in the future -> LOCKED even with the shares in hand.
-        let s1: Value = serde_json::from_str(&seal_shippable_json(aseed, acard, dp, "future", false, now + 3600, 0)).unwrap();
+        let s1: Value = serde_json::from_str(&seal_shippable_json(aseed, acard, dp, "future", false, now + 3600, 0, 0)).unwrap();
         let o1: Value = serde_json::from_str(&open_received_json(ds, &s1["bundle"].to_string(), &s1["shares"].to_string())).unwrap();
         assert_eq!(o1["ok"], false);
         assert_eq!(o1["reason"], "locked");
 
         // destroy_at in the past -> DESTROYED, unopenable.
-        let s2: Value = serde_json::from_str(&seal_shippable_json(aseed, acard, dp, "gone", false, 0, now - 10)).unwrap();
+        let s2: Value = serde_json::from_str(&seal_shippable_json(aseed, acard, dp, "gone", false, 0, now - 10, 0)).unwrap();
         let o2: Value = serde_json::from_str(&open_received_json(ds, &s2["bundle"].to_string(), &s2["shares"].to_string())).unwrap();
         assert_eq!(o2["ok"], false);
         assert_eq!(o2["reason"], "destroyed");
 
         // a window that is open right now -> opens fine.
-        let s3: Value = serde_json::from_str(&seal_shippable_json(aseed, acard, dp, "now", false, now - 10, now + 3600)).unwrap();
+        let s3: Value = serde_json::from_str(&seal_shippable_json(aseed, acard, dp, "now", false, now - 10, now + 3600, 0)).unwrap();
         let o3: Value = serde_json::from_str(&open_received_json(ds, &s3["bundle"].to_string(), &s3["shares"].to_string())).unwrap();
         assert_eq!(o3["ok"], true, "open window should open: {o3}");
         assert_eq!(o3["plaintext"], "now");

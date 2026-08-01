@@ -26,6 +26,10 @@ struct GwStore {
     // reconstruct the key outside the window. This is what makes timelock/self-destruct
     // cryptographic (key-level), not a client-side "please delete" policy.
     windows: HashMap<String, (i64, i64)>,
+    /// Chain-time floor from the verified leaf: the slot the chain must have FINALISED past
+    /// before this seal's share may be released. Wall-clock windows depend on somebody's
+    /// system clock; this one depends on the chain having actually advanced.
+    floors: HashMap<String, u64>,
 }
 
 /// Extract a timelock window from a `{signed_leaf, sender_id_pub}` body, but only if the leaf
@@ -80,6 +84,11 @@ fn verify_window(body: &str, sid_hex: &str, store: &Arc<Mutex<GwStore>>) -> Resu
             }
         }
     }
+    store
+        .lock()
+        .unwrap()
+        .floors
+        .insert(sid_hex.to_string(), leaf.leaf.not_before_finalized_slot);
     Ok(Some((leaf.leaf.reveal_at_unix as i64, leaf.leaf.destroy_at_unix as i64)))
 }
 
@@ -91,6 +100,12 @@ fn now_unix() -> i64 {
 pub fn serve_gateway(addr: &str) -> Result<()> {
     let server = tiny_http::Server::http(addr).map_err(|e| anyhow!("gateway bind {addr}: {e}"))?;
     let store = Arc::new(Mutex::new(GwStore::default()));
+    // WCAHT_RPC=http://host:8901 lets this gateway verify chain time itself.
+    let chain_rpc = std::env::var("WCAHT_RPC").ok().map(|u| crate::WcahtRpc::new(&u));
+    match &chain_rpc {
+        Some(_) => println!("gateway: chain-time gate ON (WCAHT_RPC set)"),
+        None => println!("gateway: WCAHT_RPC unset — timelock rests on the signed wall-clock window only"),
+    }
 
     for mut req in server.incoming_requests() {
         let method = req.method().clone();
@@ -147,9 +162,22 @@ pub fn serve_gateway(addr: &str) -> Result<()> {
             }
             (tiny_http::Method::Get, path) if path.starts_with("/release/") => {
                 let sid = &path["/release/".len()..];
+                // Chain-time gate: when this gateway can see a WCAHT node, the seal's signed
+                // slot floor is checked against REAL finality before anything is released, so
+                // the timelock does not rest on a system clock. Without a node configured we
+                // fall back to the wall-clock window alone (logged at startup).
+                let chain_floor_ok = match (chain_rpc.as_ref(), store.lock().unwrap().floors.get(sid).copied()) {
+                    (Some(rpc), Some(floor)) if floor > 0 => match rpc.finalized_slot() {
+                        Ok(fin) => fin >= floor,
+                        Err(_) => false, // cannot see the chain → refuse rather than release early
+                    },
+                    _ => true,
+                };
                 let mut s = store.lock().unwrap();
                 if !s.finalised.contains(sid) {
                     (425, err_json("not finalised — no early release")) // 425 Too Early
+                } else if !chain_floor_ok {
+                    (425, err_json("chain has not finalised past the seal's slot floor")) // 425
                 } else if let Some(&(reveal_at, destroy_at)) = s.windows.get(sid) {
                     let now = now_unix();
                     if destroy_at > 0 && now >= destroy_at {
