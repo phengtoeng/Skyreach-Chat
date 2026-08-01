@@ -110,7 +110,10 @@ rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-and
 cargo install cargo-ndk
 
 # Android: build the core into jniLibs, then open android-app/ in Android Studio
-cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 \
+#   arm64-v8a = real phones, x86_64 = emulator. BUILD BOTH.
+#   (armeabi-v7a needs `rustup target add armv7-linux-androideabi` first — omit it otherwise,
+#    the command fails if the target is missing.)
+cargo ndk -t arm64-v8a -t x86_64 \
   -o android-app/app/src/main/jniLibs build --release -p seal-ffi
 
 # iOS: generate the project (project.yml wires the FFI + builds it as a prebuild step)
@@ -385,8 +388,14 @@ xcodebuild -project SplitSeal.xcodeproj -scheme SplitSeal \
 swap in `aarch64-apple-ios`. **Edit `project.yml`, never the generated project** — `xcodegen
 generate` overwrites both the `.xcodeproj` and `SplitSeal/Info.plist`.
 
-Android side: on a FRESH (non-emulator) checkout, rebuild the `.so` once —
-`cargo ndk -t x86_64 -o android-app/app/src/main/jniLibs build --release -p seal-ffi`.
+Android side: `jniLibs/` is **gitignored**, so a fresh clone has no native core and every machine
+must build it once:
+`cargo ndk -t arm64-v8a -t x86_64 -o android-app/app/src/main/jniLibs build --release -p seal-ffi`.
+⚠️ Build **both** ABIs. An `x86_64`-only build (what this line used to say) installs and runs
+happily on an emulator and then fails to install on every physical phone — the failure only shows
+up when you first try a real device. Verify with
+`unzip -l app-debug.apk | grep lib/` → expect `lib/arm64-v8a/` **and** `lib/x86_64/`.
+Needs `ANDROID_NDK_HOME` set (e.g. `~/Library/Android/sdk/ndk/<version>` on macOS).
 
 [XcodeGen]: https://github.com/yonaskolb/XcodeGen
 

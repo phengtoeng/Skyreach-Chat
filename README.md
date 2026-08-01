@@ -219,14 +219,22 @@ the SwiftUI app on iOS, and a `.so` loaded by the Kotlin app on Android.
 ### One-time toolchain
 ```bash
 rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
-rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+rustup target add aarch64-linux-android x86_64-linux-android
 cargo install cargo-ndk        # Android .so packaging
+# optional, only if you need 32-bit ARM:
+#   rustup target add armv7-linux-androideabi   (then add -t armeabi-v7a below)
 ```
+
+> **`android-app/app/src/main/jniLibs/` is gitignored** — the `.so` files are build
+> artifacts and are NOT in the repo. A fresh clone has no native core, so every
+> machine must run the `cargo ndk` build below once before the app will run.
 
 ### Android (Kotlin + Jetpack Compose) — `android-app/`
 ```bash
 # from repo root: build the core into the app's jniLibs
-cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 \
+#   arm64-v8a = real phones,  x86_64 = emulator.  BUILD BOTH — an x86_64-only
+#   build installs fine on an emulator and then fails on every physical device.
+cargo ndk -t arm64-v8a -t x86_64 \
   -o android-app/app/src/main/jniLibs build --release -p seal-ffi
 # then open android-app/ in Android Studio and Run  (or: cd android-app && ./gradlew installDebug)
 ```
