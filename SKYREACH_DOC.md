@@ -56,8 +56,10 @@ Two release modes, both bound into the signed seal leaf so they can't be silentl
 | Real WCAHT finality read + anchor/stake/slash txs (`wcaht-seal-sdk`) | ✅ done, 3 txs landed on-chain |
 | FFI: C ABI (iOS) + JNI (Android) | ✅ done, 2 tests |
 | Native apps (SwiftUI + Kotlin/Compose) with StrictSeal/FastSeal toggle | ✅ done; iOS builds + runs via `xcodegen` (§6b), two-device send/receive verified live |
-| Total Rust tests | **27 green** |
-| Production gateway/relay services, device linking, media/groups/calls, audit | ❌ Phase 3 |
+| Sealed media (photo/video): chunked + encrypted manifest + `/blob` relay store | ✅ done; verified end-to-end on the live backbone from Android |
+| Total Rust tests | **45 green** |
+| iOS media UI | ⚠️ written, NOT yet compiled — needs a Mac |
+| Production gateway services, device linking, groups/calls, audit | ❌ Phase 3 |
 
 ---
 
@@ -169,7 +171,7 @@ plaintext). They are DEPLOYED + LIVE on WCAHT node **N6** (`51.79.176.134`), in 
 
 | service   | port | systemd unit         | role                                                  |
 |-----------|------|----------------------|-------------------------------------------------------|
-| relay     | 9200 | `skyreach-relay`     | store-and-forward ciphertext inbox (per mailbox tag)  |
+| relay     | 9200 | `skyreach-relay`     | ciphertext inbox (per mailbox tag) **+ `/blob` media chunk store** |
 | gateway 1 | 9201 | `skyreach-gw1`       | holds share[0]; releases only after finality (425 until) |
 | gateway 2 | 9202 | `skyreach-gw2`       | holds share[1]                                        |
 | gateway 3 | 9203 | `skyreach-gw3`       | holds share[2]                                        |
@@ -192,6 +194,42 @@ scp /tmp/sk.tgz ubuntu@51.79.176.134:~/ && ssh ubuntu@51.79.176.134 '
   cp target/debug/wcaht-seal-{relay,gateway,directory} ~/skyreach/bin/ &&
   for n in relay gw1 gw2 gw3 directory; do sudo systemctl restart skyreach-$n; done'
 ```
+
+### Sealed media (photo / video)
+
+An image or video is **never** carried in the envelope and never rests anywhere readable.
+The envelope carries an **encrypted `MediaManifest`**; the pixels go out as separately
+encrypted chunks the relay stores as opaque blobs. The chain sees only `manifest_root` —
+32 bytes, with no filename, mime, size, dimensions or thumbnail in it.
+
+```
+sender ──encrypted chunks────────▶ relay    PUT /blob/<ciphertext-hash>   (opaque)
+       ──encrypted manifest──────▶ relay    POST /inbox/<mailbox tag>
+       ──signed leaf────────────▶ WCAHT    manifest_root, 32 bytes
+       ──key shares─────────────▶ gateways encrypted to the recipient device
+```
+
+Every chunk key is a KDF subkey of `K_content`, which is Shamir-split across the gateways.
+So the recipient can pre-download an entire video that stays cryptographically **unopenable**
+until the release gate opens — the same gate that drives time-reveal and time-destroy.
+
+Relay wire contract (raw binary, not JSON; 8 MiB cap; idempotent):
+```text
+PUT  /blob/<64-char lowercase hex>   body = nonce||ciphertext  → {"status":"stored"|"exists"}
+GET  /blob/<64-char lowercase hex>   → the bytes, or 404 {"message":"no such blob"}
+HEAD /blob/<64-char lowercase hex>   → 200 / 404
+```
+The relay **verifies the content address** — bytes must hash to the name they claim — so it
+cannot substitute a chunk. It holds no key and can never open one. The name is validated as
+strict 64-char lowercase hex because it becomes a filename (path-traversal gate). Blobs are
+**not** gossiped between relays: the client uploads to every relay itself.
+
+Receiving is two steps, because the chunk list lives *inside* the encrypted manifest:
+`ss_open_media_info` (open manifest → learn which chunks to fetch) → download →
+`ss_open_media_file` (verify each chunk against the manifest, decrypt, reassemble).
+
+Deployed to N5 + N6 + N7 on 2026-08-01. Verified live: a 184,808-byte photo round-tripped
+byte-identically, with the relay's stored copy at 7.997 bits/byte entropy and no image magic.
 
 ### Configurable backend in the app
 Both apps default their server host to **N6** (`51.79.176.134`) — nothing to set up to use the
