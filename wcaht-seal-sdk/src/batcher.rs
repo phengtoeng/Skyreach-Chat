@@ -20,7 +20,6 @@
 //!   GET  /stats   → { pending, batches, anchored, last_root }
 
 use std::collections::HashMap;
-use std::io::Read as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -42,6 +41,31 @@ struct BatcherStore {
     batches: u64,
     anchored: u64,
     last_root: Option<[u8; 32]>,
+    /// Last observed treasury balance in kak, and when. `None` until a poll succeeds — an
+    /// unknown balance is reported as unknown, never as healthy.
+    treasury_kak: Option<u128>,
+    treasury_checked_unix: u64,
+    /// Consecutive failed anchor attempts. Non-zero means messages are queueing but not
+    /// reaching the chain — which is how a dry treasury actually presents.
+    anchor_failures: u64,
+    last_anchor_error: Option<String>,
+    /// Leaves refused because the queue was full. Refusing is deliberate — see MAX_PENDING.
+    dropped_overflow: u64,
+}
+
+/// Warn well before anchoring becomes impossible. Default leaves ~200k anchors of headroom;
+/// override with `WCAHT_TREASURY_WARN_KAK`.
+const TREASURY_WARN_DEFAULT: u128 = 1_000_000_000;
+
+/// Hard ceiling on queued-but-unanchored leaves. Without it, a treasury that has run dry — or
+/// any sustained submit failure — grows `pending` without bound until the process is OOM
+/// killed, taking every already-anchored proof in memory with it. Refusing new leaves is
+/// strictly better: the sender still delivers the message, it just is not batched, and both
+/// apps already treat batching as best-effort (`submitLeafForBatching` is fire-and-forget).
+const MAX_PENDING: usize = 200_000;
+
+fn treasury_warn_threshold() -> u128 {
+    std::env::var("WCAHT_TREASURY_WARN_KAK").ok().and_then(|v| v.parse().ok()).unwrap_or(TREASURY_WARN_DEFAULT)
 }
 
 fn now_unix() -> u64 {
@@ -112,11 +136,17 @@ fn flush_batch(
     let submitted = rpc.submit_tx(&tx, api_key);
     let sig = tx.get("signature").and_then(Value::as_str).unwrap_or_default().to_string();
     if submitted.is_err() || sig.is_empty() {
+        let why = match submitted {
+            Err(e) => format!("{e}"),
+            Ok(_) => "submitted but the signed tx carried no signature".to_string(),
+        };
         let mut s = store.lock().unwrap();
         for p in batch {
             s.pending.push(p);
         }
-        return Err(anyhow!("anchor submit failed: {:?}", submitted.err()));
+        s.anchor_failures += 1;
+        s.last_anchor_error = Some(why.clone());
+        return Err(anyhow!("anchor submit failed: {why}"));
     }
     let anchored_slot = rpc.finalized_slot().unwrap_or(slot);
 
@@ -140,6 +170,8 @@ fn flush_batch(
     s.batches += 1;
     s.anchored += n as u64;
     s.last_root = Some(root);
+    s.anchor_failures = 0;
+    s.last_anchor_error = None;
     println!("batcher: anchored {n} leaves under root {} (tx {sig})", hex::encode(&root[..8]));
     Ok(n)
 }
@@ -174,6 +206,41 @@ pub fn serve_batcher(addr: &str) -> Result<()> {
 
     // the anchoring loop, independent of request handling
     if let (Some(rpc), Some(signer)) = (rpc, signer) {
+        // Treasury watch. Anchoring is sponsored, so the treasury draining is the one failure
+        // that stops every message being committed while everything still *looks* healthy —
+        // the batcher keeps accepting leaves and keeps answering 425. Poll it on its own
+        // thread (never in the anchor path, where a slow node would stall batching) and make
+        // the state visible on /stats and /health for something outside to alert on.
+        {
+            let store_t = store.clone();
+            let rpc_t = crate::WcahtRpc::new(rpc.base_url());
+            let addr = signer.address().to_string();
+            std::thread::spawn(move || loop {
+                match rpc_t.balance(&addr) {
+                    Ok(bal) => {
+                        let warn = treasury_warn_threshold();
+                        let anchors_left = bal / crate::ANCHOR_TOTAL_COST_KAK.max(1);
+                        {
+                            let mut s = store_t.lock().unwrap();
+                            s.treasury_kak = Some(bal);
+                            s.treasury_checked_unix = now_unix();
+                        }
+                        if bal < warn {
+                            eprintln!(
+                                "batcher: TREASURY LOW — {addr} holds {bal} kak, about {anchors_left} \
+                                 anchors left (warn below {warn}). Top it up: when it empties, \
+                                 messages stop being committed to any root."
+                            );
+                        }
+                    }
+                    // A failed poll is not itself a problem — the node may be restarting.
+                    // Leave the last known value and say so rather than inventing one.
+                    Err(e) => eprintln!("batcher: treasury balance check failed: {e}"),
+                }
+                std::thread::sleep(Duration::from_secs(60));
+            });
+        }
+
         let store_bg = store.clone();
         let key = api_key.clone();
         std::thread::spawn(move || loop {
@@ -204,10 +271,18 @@ pub fn serve_batcher(addr: &str) -> Result<()> {
                             let mut s = store.lock().unwrap();
                             let known = s.proofs.contains_key(&seal_id)
                                 || s.pending.iter().any(|p| p.leaf.leaf.seal_id == leaf.leaf.seal_id);
-                            if !known {
+                            if known {
+                                (200, serde_json::json!({ "queued": true, "seal_id": seal_id }).to_string())
+                            } else if s.pending.len() >= MAX_PENDING {
+                                // Backlog ceiling — anchoring is not keeping up (a dry treasury
+                                // looks exactly like this). Say so instead of queueing into an
+                                // OOM; the message itself still gets delivered unbatched.
+                                s.dropped_overflow += 1;
+                                (503, err_json("batcher backlog full — leaf not queued"))
+                            } else {
                                 s.pending.push(Pending { leaf, leaf_hash });
+                                (200, serde_json::json!({ "queued": true, "seal_id": seal_id }).to_string())
                             }
-                            (200, serde_json::json!({ "queued": true, "seal_id": seal_id }).to_string())
                         }
                         Err(e) => (400, err_json(&e)),
                     }
@@ -230,6 +305,50 @@ pub fn serve_batcher(addr: &str) -> Result<()> {
                         "batches": s.batches,
                         "anchored": s.anchored,
                         "last_root": s.last_root.map(hex::encode),
+                        "treasury_kak": s.treasury_kak.map(|b| b.to_string()),
+                        "treasury_anchors_left": s.treasury_kak.map(|b| (b / crate::ANCHOR_TOTAL_COST_KAK.max(1)) as u64),
+                        "treasury_checked_unix": s.treasury_checked_unix,
+                        "anchor_failures": s.anchor_failures,
+                        "last_anchor_error": s.last_anchor_error,
+                        "dropped_overflow": s.dropped_overflow,
+                        "anchor_cost_kak": crate::ANCHOR_TOTAL_COST_KAK as u64,
+                    })
+                    .to_string(),
+                )
+            }
+            // Alerting endpoint: 200 healthy, 503 degraded. Something outside should page on
+            // this — a batcher that cannot anchor keeps accepting leaves and answering 425,
+            // so it fails silently unless the failure is exposed somewhere with a status code.
+            (tiny_http::Method::Get, "/health") => {
+                let s = store.lock().unwrap();
+                let warn = treasury_warn_threshold();
+                let mut problems: Vec<String> = Vec::new();
+                if let Some(bal) = s.treasury_kak {
+                    if bal < warn {
+                        problems.push(format!(
+                            "treasury low: {bal} kak (~{} anchors left)",
+                            bal / crate::ANCHOR_TOTAL_COST_KAK.max(1)
+                        ));
+                    }
+                }
+                if s.anchor_failures > 0 {
+                    problems.push(format!(
+                        "{} consecutive anchor failures: {}",
+                        s.anchor_failures,
+                        s.last_anchor_error.as_deref().unwrap_or("unknown")
+                    ));
+                }
+                if s.dropped_overflow > 0 {
+                    problems.push(format!("{} leaves refused, backlog full", s.dropped_overflow));
+                }
+                let ok = problems.is_empty();
+                (
+                    if ok { 200 } else { 503 },
+                    serde_json::json!({
+                        "ok": ok,
+                        "problems": problems,
+                        "pending": s.pending.len(),
+                        "treasury_kak": s.treasury_kak.map(|b| b.to_string()),
                     })
                     .to_string(),
                 )

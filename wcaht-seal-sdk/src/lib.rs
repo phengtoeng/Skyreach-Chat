@@ -44,6 +44,12 @@ impl WcahtRpc {
         }
     }
 
+    /// The node URL this client talks to, so a caller can build a second client for a
+    /// side-channel (e.g. balance polling) without re-reading the environment.
+    pub fn base_url(&self) -> &str {
+        &self.base
+    }
+
     fn get_json(&self, path: &str) -> Result<Value> {
         Ok(self.http.get(format!("{}{}", self.base, path)).send()?.error_for_status()?.json()?)
     }
@@ -62,6 +68,22 @@ impl WcahtRpc {
             .and_then(Value::as_u64)
             .or_else(|| v.get("slot").and_then(Value::as_u64))
             .ok_or_else(|| anyhow!("no wall_clock_slot in /health"))
+    }
+
+    /// An account's balance in kak. The node answers `/balance/<addr>` with a bare number,
+    /// but tolerate an object form too so this keeps working if that endpoint is ever wrapped.
+    ///
+    /// Read this from a node you trust: a balance is only ever a hint here (it drives the
+    /// low-treasury warning), never a precondition for anchoring, so a stale or lying answer
+    /// can delay an alert but cannot cause a message to be dropped. Nodes have been observed
+    /// serving a stale balance for up to a minute after a transaction lands.
+    pub fn balance(&self, address: &str) -> Result<u128> {
+        let v = self.get_json(&format!("/balance/{address}"))?;
+        v.as_u64()
+            .or_else(|| v.get("balance").and_then(Value::as_u64))
+            .map(u128::from)
+            .or_else(|| v.as_str().and_then(|s| s.parse::<u128>().ok()))
+            .ok_or_else(|| anyhow!("no balance in /balance/{address} response"))
     }
 
     /// `(recent_blockhash_hex, last_valid_slot)` for signing an anchor tx.
@@ -132,6 +154,12 @@ pub struct AnchorSigner {
 pub const ANCHOR_COMPUTE_UNITS: u64 = 5_000;
 /// The consensus minimum fee for a transfer at that budget.
 pub const ANCHOR_MIN_FEE: u64 = 5_000;
+/// What an anchor actually moves. The destination is derived from a hash, so nobody holds its
+/// key and this amount is unspendable forever — it should be the least the chain will accept.
+/// Consensus asks only for `amount > 0` on a Transfer (`validation.rs`); there is no dust floor.
+pub const ANCHOR_AMOUNT_KAK: u128 = 1;
+/// What one anchoring transaction costs the treasury, all in.
+pub const ANCHOR_TOTAL_COST_KAK: u128 = ANCHOR_MIN_FEE as u128 + ANCHOR_AMOUNT_KAK;
 
 impl AnchorSigner {
     pub fn from_seed(seed: &[u8; 32]) -> Self {
@@ -219,7 +247,7 @@ impl AnchorSigner {
     ) -> Result<Value> {
         self.transfer_tx_with_cu(
             &bs58::encode(leaf_hash).into_string(),
-            10_000, // tiny, above any dust floor; the anchor is a commitment
+            ANCHOR_AMOUNT_KAK,
             recent_blockhash_hex,
             last_valid_slot,
             timestamp,
@@ -426,6 +454,23 @@ mod tests {
         let b = canonical_bytes_v2(&rbh, "alice", "bob", 1, 5000, 200_000, 0, 10, 123);
         assert_eq!(a, b);
         assert!(a.starts_with(b"TX::v2|"));
+    }
+
+    /// The anchor destination is a hash-derived address nobody can spend from, so anything we
+    /// send there is destroyed. Keep it at the consensus minimum (`amount > 0`) — if this ever
+    /// drifts upward again it is a silent, permanent leak of one amount per batch.
+    #[test]
+    fn anchor_moves_the_least_the_chain_allows() {
+        assert_eq!(ANCHOR_AMOUNT_KAK, 1, "anchor amount must stay at the consensus minimum");
+        assert!(ANCHOR_AMOUNT_KAK > 0, "consensus rejects a zero-amount Transfer");
+        assert_eq!(ANCHOR_TOTAL_COST_KAK, 5_001);
+
+        let signer = AnchorSigner::from_seed(&[7u8; 32]);
+        let tx = signer.anchor_tx(&[4u8; 32], &hex::encode([2u8; 32]), 100, 42, ANCHOR_MIN_FEE).unwrap();
+        assert_eq!(tx["amount"], serde_json::json!(ANCHOR_AMOUNT_KAK));
+        assert_eq!(tx["fee"], serde_json::json!(ANCHOR_MIN_FEE));
+        // the destination must still be the leaf hash itself — that IS the inclusion proof
+        assert_eq!(tx["to"], serde_json::json!(bs58::encode([4u8; 32]).into_string()));
     }
 
     #[test]
