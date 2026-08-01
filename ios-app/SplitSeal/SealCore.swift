@@ -55,6 +55,46 @@ enum SealCore {
         deviceSeed.withCString { s in bundle.withCString { b in shares.withCString { sh in copy(ss_open_received(s, b, sh)) } } }
     }
 
+    // ── media ──
+    // Media crosses this boundary as FILE PATHS, never as bytes: pushing a 40 MB video
+    // through the bridge would cost several copies of it in RAM. Rust reads the source file
+    // and writes each encrypted chunk out as its own file; only JSON metadata comes back.
+
+    /// Seal a media file to a contact's device. Writes one encrypted chunk per file into
+    /// `outDir`, named by its ciphertext hash. `previewPath` must ALREADY be a blurred /
+    /// downscaled image — it is sealed inside the manifest and never uploaded on its own;
+    /// pass "" for none. `kind` is "image" | "video" | "audio" | "file".
+    ///
+    /// Returns `{ok, seal_id, mailbox_tag, bundle, shares, chunk_count, chunks:[{index,hash,path,size}]}`
+    /// — the same bundle/shares shape a text seal produces, so `shipSeal` works unchanged.
+    static func sealMediaFile(
+        _ identitySeed: String, _ senderCard: String, _ devicePub: String, _ inPath: String,
+        _ mime: String, _ kind: String, _ previewPath: String, _ outDir: String,
+        _ fast: Bool = false, _ revealAt: Int64 = 0, _ destroyAt: Int64 = 0
+    ) -> String {
+        identitySeed.withCString { i in senderCard.withCString { c in devicePub.withCString { d in
+        inPath.withCString { p in mime.withCString { m in kind.withCString { k in
+        previewPath.withCString { pv in outDir.withCString { o in
+            copy(ss_seal_media_file(i, c, d, p, m, k, pv, o, fast ? 1 : 0, revealAt, destroyAt))
+        } } } } } } } }
+    }
+
+    /// Media step 1 — open the MANIFEST only, to learn what the item is and which chunks to
+    /// fetch: `{ok, mime_type, kind, chunk_count, chunks:[hash], plaintext_size}`.
+    /// Writes the locked preview to `previewOut` when the item carries one.
+    static func openMediaInfo(_ deviceSeed: String, _ bundle: String, _ shares: String, _ previewOut: String) -> String {
+        deviceSeed.withCString { s in bundle.withCString { b in shares.withCString { sh in
+        previewOut.withCString { pv in copy(ss_open_media_info(s, b, sh, pv)) } } } }
+    }
+
+    /// Media step 2 — every chunk having been downloaded into `chunkDir` (each file named by
+    /// its hex hash, exactly as `openMediaInfo` listed), decrypt and reassemble into `outPath`.
+    /// A missing or altered chunk fails here rather than producing a corrupt file.
+    static func openMediaFile(_ deviceSeed: String, _ bundle: String, _ shares: String, _ chunkDir: String, _ outPath: String) -> String {
+        deviceSeed.withCString { s in bundle.withCString { b in shares.withCString { sh in
+        chunkDir.withCString { c in outPath.withCString { o in copy(ss_open_media_file(s, b, sh, c, o)) } } } } }
+    }
+
     /// Copy a Rust-owned C string into a Swift String and free the original.
     private static func copy(_ ptr: UnsafeMutablePointer<CChar>?) -> String {
         guard let ptr = ptr else { return "{}" }

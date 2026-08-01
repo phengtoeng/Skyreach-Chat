@@ -45,9 +45,14 @@ targets:
         HEADER_SEARCH_PATHS:
           - "$(SRCROOT)/../seal-ffi/include"
         SWIFT_OBJC_BRIDGING_HEADER: "$(SRCROOT)/SplitSeal/SplitSeal-Bridging-Header.h"
-        OTHER_LDFLAGS:
+        # A simulator slice cannot run on a phone, so link the lib matching the active SDK.
+        # build_rust_ios.sh produces both.
+        OTHER_LDFLAGS[sdk=iphonesimulator*]:
           - "-force_load"
           - "$(SRCROOT)/build/libseal_ffi_sim.a"
+        OTHER_LDFLAGS[sdk=iphoneos*]:
+          - "-force_load"
+          - "$(SRCROOT)/build/libseal_ffi_ios.a"
     preBuildScripts:
       - name: Build Rust FFI
         script: |

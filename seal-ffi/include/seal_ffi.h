@@ -55,6 +55,39 @@ char *ss_seal_shippable(const char *identity_seed, const char *sender_card, cons
  *   { ok, plaintext }  or  { ok:false, reason }  (device_seed = recipient's stored seed). */
 char *ss_open_received(const char *device_seed, const char *bundle, const char *shares);
 
+/* ── media ────────────────────────────────────────────────────────────────────
+ * Media crosses this boundary as FILE PATHS, never as bytes: pushing a 40 MB video
+ * through the bridge would cost several copies of it in RAM. Rust reads the source
+ * file and writes each encrypted chunk out as its own file.
+ *
+ * The envelope carries only an encrypted manifest; the pixels live in the chunks,
+ * which the relay stores as opaque blobs. The chain sees just `manifest_root`. */
+
+/* Seal a media FILE (image/video/audio/document). Writes one encrypted chunk per file into
+ * out_dir, named by its ciphertext hash, and returns the SAME {bundle, shares} shape a text
+ * seal produces — so the existing ship/collect plumbing is unchanged:
+ *   { ok, seal_id, mailbox_tag, bundle, shares, chunk_count, chunks:[{index,hash,path,size}] }
+ * kind = "image" | "video" | "audio" | "file".
+ * preview_path must ALREADY be blurred/downscaled — it is sealed INSIDE the manifest and is
+ * never uploaded on its own (spec §10.3); pass "" for none. */
+char *ss_seal_media_file(const char *identity_seed, const char *sender_card, const char *device_pub,
+                         const char *in_path, const char *mime, const char *kind,
+                         const char *preview_path, const char *out_dir,
+                         int fast, long long reveal_at, long long destroy_at);
+
+/* Media step 1 — open the MANIFEST only, to learn what the item is and which chunks to fetch:
+ *   { ok, mime_type, kind, plaintext_size, chunk_count, chunks:[hash], width, height, duration_ms }
+ * Writes the locked preview to preview_out when the item carries one ("" to skip). */
+char *ss_open_media_info(const char *device_seed, const char *bundle, const char *shares,
+                         const char *preview_out);
+
+/* Media step 2 — with every chunk downloaded into chunk_dir (each file named by its hex hash,
+ * exactly as ss_open_media_info listed), decrypt and reassemble into out_path:
+ *   { ok, out_path, mime_type, kind, bytes }  or  { ok:false, reason }.
+ * A missing or altered chunk fails here rather than producing a corrupt file. */
+char *ss_open_media_file(const char *device_seed, const char *bundle, const char *shares,
+                         const char *chunk_dir, const char *out_path);
+
 /* Free a string returned by any ss_* function. Safe on NULL. */
 void ss_free(char *ptr);
 

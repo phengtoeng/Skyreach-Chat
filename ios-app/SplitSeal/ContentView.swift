@@ -1,6 +1,9 @@
 import SwiftUI
 import CoreImage.CIFilterBuiltins
 import AVFoundation
+import AVKit
+import PhotosUI
+import UniformTypeIdentifiers
 import UIKit
 import Contacts
 import ContactsUI
@@ -56,6 +59,8 @@ struct Msg: Identifiable {
     var sealedFor: String? = nil
     var revealAt: Int64 = 0  // unix secs: timelocked to open at/after this time (0 = none)
     var destroyAt: Int64 = 0 // unix secs: self-destructs after this time (0 = none)
+    var mediaPath: String = "" // decrypted file on THIS device only; never uploaded
+    var mediaMime: String = ""
 }
 
 /// Short "time from now" label for a unix-seconds target, e.g. "10m", "1h", "1d".
@@ -178,11 +183,16 @@ enum Store {
     }
     /// Append a message to a conversation (dedup by id); false if already stored.
     @discardableResult
-    static func addThreadMsg(_ peer: String, _ id: String, _ text: String, _ incoming: Bool) -> Bool {
+    static func addThreadMsg(
+        _ peer: String, _ id: String, _ text: String, _ incoming: Bool,
+        media: String = "", // local path to the DECRYPTED file (this device only)
+        mime: String = ""
+    ) -> Bool {
         guard !peer.isEmpty else { return false }
         var a = thread(peer)
         if a.contains(where: { ($0["id"] as? String) == id }) { return false }
-        a.append(["id": id, "text": text, "incoming": incoming, "ts": Date().timeIntervalSince1970])
+        a.append(["id": id, "text": text, "incoming": incoming, "ts": Date().timeIntervalSince1970,
+                  "media": media, "mime": mime])
         if let out = try? JSONSerialization.data(withJSONObject: a), let s = String(data: out, encoding: .utf8) {
             d.set(s, forKey: "thread_\(peer)")
         }
@@ -284,12 +294,52 @@ func directoryPublish(_ phone: String, _ card: String) async -> Bool {
 
 // The seal backbone runs on all 3 nodes (N5, N6, N7) so no single node is a point of failure.
 let nodeHosts = ["139.99.150.23", "51.79.176.134", "51.79.162.80"]
+/// True when Settings points us at one specific machine instead of the live backbone.
+private var serverPinned: Bool { !Server.host.isEmpty && Server.host != Server.defaultHost }
+
 // Replicated relays: ship the ciphertext to ALL, read from ALL (merge) — delivery survives any
 // node outage as long as one relay that got the message is up.
-var relayURLs: [String] { nodeHosts.map { "http://\($0):9200" } }
+// Pinned to one host (dev/self-host), everything runs on that machine instead.
+var relayURLs: [String] { serverPinned ? ["http://\(Server.host):9200"] : nodeHosts.map { "http://\($0):9200" } }
 // 3 INDEPENDENT gateways, one per node (t=2 of 3): no single machine holds all key shares,
-// and any one gateway can be down and messages still open.
-var gatewayURLs: [String] { nodeHosts.map { "http://\($0):9201" } }
+// and any one gateway can be down and messages still open. Pinned to one host they sit on
+// consecutive ports — convenient for a local stack, but NOT independent, so dev only.
+var gatewayURLs: [String] {
+    serverPinned
+        ? ["http://\(Server.host):9201", "http://\(Server.host):9202", "http://\(Server.host):9203"]
+        : nodeHosts.map { "http://\($0):9201" }
+}
+
+// ───────────────────────── media blob transport ─────────────────────────────
+
+/// Upload one encrypted media chunk to EVERY relay, addressed by its ciphertext hash.
+/// The relay verifies the hash matches the bytes, so it cannot substitute a chunk — and it
+/// holds no key, so it can never open one. True if at least one relay stored it.
+func uploadBlob(_ hashHex: String, _ bytes: Data) async -> Bool {
+    var ok = false
+    for r in relayURLs {
+        guard let url = URL(string: "\(r)/blob/\(hashHex)") else { continue }
+        var req = URLRequest(url: url)
+        req.httpMethod = "PUT"
+        req.timeoutInterval = 60 // uploads are not 4-second work
+        req.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        if let (_, resp) = try? await URLSession.shared.upload(for: req, from: bytes),
+           (200..<300).contains((resp as? HTTPURLResponse)?.statusCode ?? -1) { ok = true }
+    }
+    return ok
+}
+
+/// Fetch one encrypted chunk from whichever relay still has it.
+func downloadBlob(_ hashHex: String) async -> Data? {
+    for r in relayURLs {
+        guard let url = URL(string: "\(r)/blob/\(hashHex)") else { continue }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 60
+        if let (data, resp) = try? await URLSession.shared.data(for: req),
+           (resp as? HTTPURLResponse)?.statusCode == 200 { return data }
+    }
+    return nil
+}
 
 @discardableResult
 func httpPost(_ urlStr: String, _ body: String) async -> Int {
@@ -340,6 +390,119 @@ func shipSeal(_ ship: [String: Any]) async -> Bool {
     }
     return relayOk
 }
+// ───────────────────────────── media send / receive ─────────────────────────
+//
+// The picked file is written into the app's cache so Rust can chunk-encrypt it by path, and
+// ONLY the encrypted chunks are uploaded. The readable original never leaves the device.
+
+private var cacheDir: URL { FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0] }
+private var mediaDir: URL {
+    let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("media")
+    try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+    return d
+}
+
+/// A deliberately TINY thumbnail: it is sealed inside the manifest, so only the recipient ever
+/// sees it — and keeping it small is what makes it a blur rather than a readable preview
+/// (spec §10.3: never a readable thumbnail for a locked item).
+func buildPreview(_ src: URL, isVideo: Bool) -> URL? {
+    var image: UIImage?
+    if isVideo {
+        let asset = AVURLAsset(url: src)
+        let gen = AVAssetImageGenerator(asset: asset)
+        gen.appliesPreferredTrackTransform = true
+        if let cg = try? gen.copyCGImage(at: .zero, actualTime: nil) { image = UIImage(cgImage: cg) }
+    } else {
+        image = UIImage(contentsOfFile: src.path)
+    }
+    guard let img = image else { return nil }
+    let size = CGSize(width: 32, height: 32)
+    let small = UIGraphicsImageRenderer(size: size).image { _ in img.draw(in: CGRect(origin: .zero, size: size)) }
+    guard let data = small.jpegData(compressionQuality: 0.6) else { return nil }
+    let out = cacheDir.appendingPathComponent("preview-\(UUID().uuidString).jpg")
+    try? data.write(to: out)
+    return out
+}
+
+/// Upload every encrypted chunk listed by `sealMediaFile`, then delete the local copies.
+func uploadChunks(_ sealed: [String: Any]) async -> Bool {
+    guard let chunks = sealed["chunks"] as? [[String: Any]] else { return false }
+    for c in chunks {
+        guard let path = c["path"] as? String, let hash = c["hash"] as? String,
+              let bytes = FileManager.default.contents(atPath: path) else { return false }
+        let stored = await uploadBlob(hash, bytes)
+        if !stored { return false }
+        try? FileManager.default.removeItem(atPath: path) // the relay has it; don't keep ciphertext
+    }
+    return true
+}
+
+/// A video picked from the library, delivered as a FILE rather than as `Data` — a 40 MB
+/// clip loaded as `Data` would sit in memory in full, and Rust wants a path anyway.
+struct PickedMovie: Transferable {
+    let url: URL
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(contentType: .movie) { movie in
+            SentTransferredFile(movie.url)
+        } importing: { received in
+            let dest = FileManager.default.temporaryDirectory.appendingPathComponent("pick-\(UUID().uuidString).mov")
+            try? FileManager.default.removeItem(at: dest)
+            try FileManager.default.copyItem(at: received.file, to: dest)
+            return Self(url: dest)
+        }
+    }
+}
+
+/// Decoded thumbnails, cached by path. A bubble's body re-runs on every scroll pass, and
+/// re-decoding a multi-megabyte image each time makes the list crawl.
+enum MediaThumbs {
+    private static let cache = NSCache<NSString, UIImage>()
+
+    static func thumb(path: String, isVideo: Bool) -> UIImage? {
+        guard !path.isEmpty else { return nil }
+        if let hit = cache.object(forKey: path as NSString) { return hit }
+        var image: UIImage?
+        if isVideo {
+            let gen = AVAssetImageGenerator(asset: AVURLAsset(url: URL(fileURLWithPath: path)))
+            gen.appliesPreferredTrackTransform = true
+            if let cg = try? gen.copyCGImage(at: .zero, actualTime: nil) { image = UIImage(cgImage: cg) }
+        } else {
+            image = UIImage(contentsOfFile: path)
+        }
+        if let img = image { cache.setObject(img, forKey: path as NSString) }
+        return image
+    }
+}
+
+/// Receive one media seal: open the manifest, fetch every chunk the relay is holding, then
+/// decrypt and reassemble. Returns (localPath, mime), or nil while it is still locked or the
+/// chunks have not all arrived — the caller simply retries on the next poll.
+func receiveMedia(_ deviceSeed: String, _ sealId: String, _ bundle: String, _ shares: String) async -> (String, String)? {
+    let previewPath = cacheDir.appendingPathComponent("pv-\(sealId).jpg").path
+    let infoStr = SealCore.openMediaInfo(deviceSeed, bundle, shares, previewPath)
+    guard let info = (try? JSONSerialization.jsonObject(with: Data(infoStr.utf8))) as? [String: Any],
+          (info["ok"] as? Bool) == true,
+          let hashes = info["chunks"] as? [String] else { return nil } // locked, or shares pending
+
+    let chunkDir = cacheDir.appendingPathComponent("chunks/\(sealId)")
+    try? FileManager.default.createDirectory(at: chunkDir, withIntermediateDirectories: true)
+    for h in hashes {
+        let f = chunkDir.appendingPathComponent(h)
+        if FileManager.default.fileExists(atPath: f.path) { continue } // resume: never refetch
+        guard let bytes = await downloadBlob(h) else { return nil }
+        try? bytes.write(to: f)
+    }
+
+    let mime = info["mime_type"] as? String ?? "application/octet-stream"
+    let ext = mime.hasPrefix("video") ? "mp4" : (mime.contains("png") ? "png" : "jpg")
+    let out = mediaDir.appendingPathComponent("\(sealId).\(ext)")
+    let doneStr = SealCore.openMediaFile(deviceSeed, bundle, shares, chunkDir.path, out.path)
+    guard let done = (try? JSONSerialization.jsonObject(with: Data(doneStr.utf8))) as? [String: Any],
+          (done["ok"] as? Bool) == true else { return nil }
+    try? FileManager.default.removeItem(at: chunkDir) // plaintext assembled; ciphertext is dead weight
+    return (out.path, mime)
+}
+
 /// Fetch every {seal_id, bundle} item for a mailbox tag from ALL relays, merged + deduped by
 /// seal_id — the recipient finds its messages on whichever relay(s) happen to be up.
 func fetchInboxAll(_ tag: String) async -> [[String: Any]] {
@@ -1064,6 +1227,9 @@ struct ConversationView: View {
     @State private var revealAt: Int64 = 0
     @State private var destroyAt: Int64 = 0
     @State private var showTimer = false
+    @State private var pickedItem: PhotosPickerItem?
+    @State private var mediaError: String?
+    @State private var playing: URL?
 
     // A "real" conversation is linked to a contact's device key (vs. the demo threads).
     private var real: Bool { !chat.devicePub.isEmpty }
@@ -1107,6 +1273,42 @@ struct ConversationView: View {
         }
         .background(Color.dvConv)
         .navigationBarHidden(true)
+        // Load the picked item's raw bytes and seal them. Videos come back as a movie
+        // transferable; images as Data.
+        .onChange(of: pickedItem) { _, item in
+            guard let item else { return }
+            Task {
+                let isVideo = item.supportedContentTypes.contains { $0.conforms(to: .movie) }
+                var src: URL?
+                if isVideo {
+                    // as a FILE: a long clip loaded as Data would sit in memory in full
+                    src = (try? await item.loadTransferable(type: PickedMovie.self))?.url
+                } else if let data = try? await item.loadTransferable(type: Data.self) {
+                    let f = cacheDir.appendingPathComponent("pick-\(UUID().uuidString).jpg")
+                    try? data.write(to: f)
+                    src = f
+                }
+                await MainActor.run {
+                    if let src { sendMedia(src, isVideo ? "video/mp4" : "image/jpeg") }
+                    else { mediaError = "Couldn't read that item" }
+                    pickedItem = nil
+                }
+            }
+        }
+        .alert("Media", isPresented: Binding(get: { mediaError != nil }, set: { if !$0 { mediaError = nil } })) {
+            Button("OK", role: .cancel) { mediaError = nil }
+        } message: { Text(mediaError ?? "") }
+        // Play a DECRYPTED video from local storage — nothing here touches the network.
+        .fullScreenCover(item: Binding(get: { playing.map { PlayerItem(url: $0) } }, set: { if $0 == nil { playing = nil } })) { item in
+            VideoPlayer(player: AVPlayer(url: item.url))
+                .ignoresSafeArea()
+                .overlay(alignment: .topTrailing) {
+                    Button(action: { playing = nil }) {
+                        Image(systemName: "xmark.circle.fill").font(.system(size: 30)).foregroundColor(.white.opacity(0.9))
+                    }.padding()
+                }
+        }
+        .environment(\.playVideo, { url in playing = url })
         .task {
             // one-time: compute my inbox tag + restore persisted history, then live-poll
             if myTag.isEmpty, !myDevicePub.isEmpty {
@@ -1121,7 +1323,13 @@ struct ConversationView: View {
                     for o in Store.inbox(myTag) { if let id = o["id"] as? String { seen.insert(id) } }
                     // ...then restore the durable transcript for THIS peer (both directions, in order).
                     for o in Store.thread(chat.identityPub) {
-                        messages.append(Msg(text: o["text"] as? String ?? "", incoming: (o["incoming"] as? Bool) ?? false, time: "", state: .opened))
+                        let media = o["media"] as? String ?? ""
+                        messages.append(Msg(
+                            text: o["text"] as? String ?? "",
+                            incoming: (o["incoming"] as? Bool) ?? false, time: "",
+                            kind: media.isEmpty ? .text : .image, state: .opened,
+                            mediaPath: media, mediaMime: o["mime"] as? String ?? ""
+                        ))
                     }
                 }
                 while !Task.isCancelled {
@@ -1157,6 +1365,10 @@ struct ConversationView: View {
                     Image(systemName: "clock").font(.system(size: 21))
                         .foregroundColor(revealAt > 0 || destroyAt > 0 ? .dvBlue : .dvSub)
                 }
+                // PhotosPicker needs no photo-library permission for the items the user picks.
+                PhotosPicker(selection: $pickedItem, matching: .any(of: [.images, .videos])) {
+                    Image(systemName: "camera.fill").font(.system(size: 20)).foregroundColor(.dvSub)
+                }
                 HStack(spacing: 8) {
                     Image(systemName: "face.smiling").foregroundColor(.dvSub).font(.system(size: 20))
                     TextField("Message", text: $draft, axis: .vertical)
@@ -1188,6 +1400,25 @@ struct ConversationView: View {
                   let bundleStr = String(data: bd, encoding: .utf8) else { continue }
             let sender = (item["bundle"] as? [String: Any])?["sender_id_pub"] as? String ?? ""
             let shares = await collectShares(sealId)
+
+            // Media arrives as a manifest, not as bytes: open the manifest, pull the chunks
+            // the relay is holding, then decrypt and reassemble locally.
+            let leaf = ((item["bundle"] as? [String: Any])?["signed_leaf"] as? [String: Any])?["leaf"] as? [String: Any]
+            if (leaf?["content_type"] as? String) == "Media" {
+                if let got = await receiveMedia(myDeviceSeed, sealId, bundleStr, shares) {
+                    seen.insert(sealId)
+                    let label = got.1.hasPrefix("video") ? "Video" : "Photo"
+                    if Store.addInbox(myTag, sealId, label, sender) {
+                        Store.addThreadMsg(sender, sealId, label, true, media: got.0, mime: got.1)
+                        if sender == chat.identityPub {
+                            messages.append(Msg(text: label, incoming: true, time: nowTime(),
+                                                kind: .image, state: .opened, mediaPath: got.0, mediaMime: got.1))
+                        }
+                    }
+                }
+                continue // still locked / chunks not all there yet → retry on the next poll
+            }
+
             let openStr = SealCore.openReceived(myDeviceSeed, bundleStr, shares)
             if let r = (try? JSONSerialization.jsonObject(with: Data(openStr.utf8))) as? [String: Any],
                (r["ok"] as? Bool) == true, let plain = r["plaintext"] as? String {
@@ -1205,6 +1436,64 @@ struct ConversationView: View {
             }
             // timelocked ("locked") or shares still gathering → leave unseen; opens when the window does
         }
+    }
+
+    /// Seal and ship a picked photo/video. The readable file is written to our cache only so
+    /// Rust can chunk-encrypt it; ONLY the encrypted chunks are uploaded, addressed by
+    /// ciphertext hash. Our own copy stays local so the sent bubble can render it.
+    private func sendMedia(_ src: URL, _ mime: String) {
+        guard real else { return }
+        let isVideo = mime.hasPrefix("video")
+        let label = isVideo ? "Video" : "Photo"
+        messages.append(Msg(text: label, incoming: false, time: nowTime(), kind: .image,
+                            state: .sealing, mode: fastMode ? "FAST" : "STRICT"))
+        let idx = messages.count - 1
+        let fast = fastMode
+        let rv = revealAt, dz = destroyAt
+        revealAt = 0; destroyAt = 0
+        Task {
+            let preview = buildPreview(src, isVideo: isVideo)
+            let chunkDir = cacheDir.appendingPathComponent("out-\(UUID().uuidString)")
+
+            let sealedStr = SealCore.sealMediaFile(
+                myIdentitySeed, myCard, chat.devicePub, src.path, mime,
+                isVideo ? "video" : "image", preview?.path ?? "", chunkDir.path, fast, rv, dz
+            )
+            if let p = preview { try? FileManager.default.removeItem(at: p) }
+            guard let sealed = (try? JSONSerialization.jsonObject(with: Data(sealedStr.utf8))) as? [String: Any],
+                  (sealed["ok"] as? Bool) == true else {
+                try? FileManager.default.removeItem(at: chunkDir)
+                try? FileManager.default.removeItem(at: src)
+                await MainActor.run { failMedia(idx, label) }
+                return
+            }
+            // upload the opaque chunks, then the manifest bundle + key shares
+            let up = await uploadChunks(sealed)
+            try? FileManager.default.removeItem(at: chunkDir)
+            let shipped = up ? await shipSeal(sealed) : false
+            guard shipped else {
+                try? FileManager.default.removeItem(at: src)
+                await MainActor.run { failMedia(idx, label) }
+                return
+            }
+            // keep OUR readable copy locally so the sent bubble can render it
+            let mine = mediaDir.appendingPathComponent("sent-\(sealed["seal_id"] as? String ?? UUID().uuidString).\(isVideo ? "mp4" : "jpg")")
+            try? FileManager.default.removeItem(at: mine)
+            try? FileManager.default.moveItem(at: src, to: mine)
+            await MainActor.run {
+                guard idx < messages.count else { return }
+                messages[idx].state = .opened
+                messages[idx].sealedFor = chat.name
+                messages[idx].mediaPath = mine.path
+                messages[idx].mediaMime = mime
+                Store.addThreadMsg(chat.identityPub, "out-\(UUID().uuidString)", label, false, media: mine.path, mime: mime)
+            }
+        }
+    }
+
+    @MainActor private func failMedia(_ idx: Int, _ label: String) {
+        if idx < messages.count { messages.remove(at: idx) }
+        mediaError = "Couldn't send \(label) — check the server"
     }
 
     private func send() {
@@ -1291,8 +1580,27 @@ private func DateChip(_ text: String) -> some View {
 }
 
 // ─────────────────────────────── bubble ─────────────────────────────────────
+/// Wraps a local file URL so it can drive a `fullScreenCover(item:)`.
+struct PlayerItem: Identifiable {
+    let url: URL
+    var id: String { url.path }
+}
+
+/// Lets a deeply-nested bubble ask the conversation view to play a decrypted video,
+/// without threading a binding through every intermediate view.
+private struct PlayVideoKey: EnvironmentKey {
+    static let defaultValue: (URL) -> Void = { _ in }
+}
+extension EnvironmentValues {
+    var playVideo: (URL) -> Void {
+        get { self[PlayVideoKey.self] }
+        set { self[PlayVideoKey.self] = newValue }
+    }
+}
+
 private struct Bubble: View {
     let m: Msg
+    @Environment(\.playVideo) private var playVideo
     init(_ m: Msg) { self.m = m }
     var body: some View {
         HStack {
@@ -1345,12 +1653,37 @@ private struct Bubble: View {
     }
 
     private var imageContent: some View {
-        ZStack(alignment: .bottomTrailing) {
-            LinearGradient(colors: [Color(hex: 0xF6B26B), Color(hex: 0x6FA8DC), Color(hex: 0x2E5B8A)],
-                           startPoint: .top, endPoint: .bottom)
-                .frame(width: 220, height: 130).clipShape(RoundedRectangle(cornerRadius: 12))
+        // Renders the DECRYPTED local file. By this point the bytes exist in readable form
+        // only on this device — nothing here touches the network.
+        let isVideo = m.mediaMime.hasPrefix("video")
+        return ZStack(alignment: .bottomTrailing) {
+            Group {
+                if let img = decodedMedia {
+                    Image(uiImage: img).resizable().aspectRatio(contentMode: .fill)
+                } else {
+                    LinearGradient(colors: [Color(hex: 0xF6B26B), Color(hex: 0x6FA8DC), Color(hex: 0x2E5B8A)],
+                                   startPoint: .top, endPoint: .bottom)
+                }
+            }
+            .frame(width: 220, height: 160).clipped().clipShape(RoundedRectangle(cornerRadius: 12))
+
+            if isVideo {
+                Image(systemName: "play.circle.fill")
+                    .font(.system(size: 44)).foregroundColor(.white.opacity(0.85))
+                    .frame(width: 220, height: 160)
+            }
             HStack(spacing: 3) { Text(m.time).font(.system(size: 11)).foregroundColor(.white); sealBadge }.padding(6)
         }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            if isVideo, !m.mediaPath.isEmpty { playVideo(URL(fileURLWithPath: m.mediaPath)) }
+        }
+    }
+
+    /// First frame for a video, or the image itself — cached, since a bubble's body re-runs
+    /// on every scroll pass.
+    private var decodedMedia: UIImage? {
+        MediaThumbs.thumb(path: m.mediaPath, isVideo: m.mediaMime.hasPrefix("video"))
     }
 
     private var voiceContent: some View {
