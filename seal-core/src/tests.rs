@@ -112,6 +112,7 @@ impl World {
             bytes,
             ContentKind::Image,
             "image/jpeg",
+            "caption",
             b"blurred-preview",
             PreviewPolicy::LockedBlur,
             (1920, 1080),
@@ -747,9 +748,10 @@ fn media_leaf_leaks_nothing_about_the_file() {
     let m = w.seal_media(&bytes, 16, 2, 100);
     let leaf = &m.item.signed_leaf.leaf;
 
-    // what goes on-chain is the leaf. It must not carry mime, filename, size, or preview.
+    // what goes on-chain is the leaf. It must not carry mime, filename, size, caption or preview.
     let public = leaf.canonical_bytes();
     assert!(!contains(&public, b"image/jpeg"), "mime type leaked into the leaf");
+    assert!(!contains(&public, b"caption"), "caption leaked into the leaf");
     assert!(!contains(&public, b"blurred-preview"), "preview leaked into the leaf");
     assert!(!contains(&public, &bytes), "plaintext leaked into the leaf");
     // the plaintext length is not a public field either
@@ -758,6 +760,7 @@ fn media_leaf_leaks_nothing_about_the_file() {
     // the envelope the relay stores is ciphertext only
     let relay_sees = &m.item.envelope.ciphertext;
     assert!(!contains(relay_sees, b"image/jpeg"));
+    assert!(!contains(relay_sees, b"caption"), "caption leaked to the relay");
     assert!(!contains(relay_sees, &bytes));
 }
 
@@ -776,6 +779,7 @@ fn empty_media_is_refused() {
         b"",
         ContentKind::Video,
         "video/mp4",
+        "",
         b"",
         PreviewPolicy::None,
         (0, 0),

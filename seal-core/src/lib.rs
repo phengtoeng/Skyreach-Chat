@@ -825,6 +825,9 @@ pub struct MediaManifest {
     pub chunk_count: u32,
     pub ciphertext_chunk_hashes: Vec<[u8; 32]>,
     pub preview_policy: PreviewPolicy,
+    /// Text the sender attached to the photo/video. Sealed with the rest of the manifest, so
+    /// neither the relay nor the chain ever sees it — a caption is as private as the pixels.
+    pub caption: String,
     /// Locally blurred preview bytes, encrypted with the rest of the manifest.
     /// Empty unless `preview_policy` is `LockedBlur`.
     pub preview: Vec<u8>,
@@ -941,6 +944,7 @@ pub fn seal_media_with_mode(
     plaintext: &[u8],
     kind: ContentKind,
     mime_type: &str,
+    caption: &str,
     preview: &[u8],
     preview_policy: PreviewPolicy,
     dimensions: (u32, u32),
@@ -973,6 +977,7 @@ pub fn seal_media_with_mode(
         chunk_count: chunks.len() as u32,
         ciphertext_chunk_hashes: chunk_hashes,
         preview_policy,
+        caption: caption.to_string(),
         preview: if preview_policy == PreviewPolicy::LockedBlur { preview.to_vec() } else { Vec::new() },
         width: dimensions.0,
         height: dimensions.1,

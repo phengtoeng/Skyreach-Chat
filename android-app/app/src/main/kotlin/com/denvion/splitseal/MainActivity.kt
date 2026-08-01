@@ -12,7 +12,14 @@ import androidx.activity.result.contract.ActivityResultContracts
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -516,7 +523,7 @@ private fun uploadChunks(sealed: JSONObject): Boolean {
  * decrypt and reassemble. Returns (localPath, mime), or null while it is still locked or
  * the chunks have not all arrived — the caller simply retries on the next poll.
  */
-private fun receiveMedia(ctx: Context, deviceSeed: String, sealId: String, bundle: String, shares: String): Pair<String, String>? {
+private fun receiveMedia(ctx: Context, deviceSeed: String, sealId: String, bundle: String, shares: String): Triple<String, String, String>? {
     val previewPath = java.io.File(ctx.cacheDir, "pv-$sealId.jpg").path
     val info = runCatching { JSONObject(SealCore.openMediaInfo(deviceSeed, bundle, shares, previewPath)) }.getOrNull() ?: return null
     if (!info.optBoolean("ok")) return null // locked, or not enough shares released yet
@@ -544,7 +551,7 @@ private fun receiveMedia(ctx: Context, deviceSeed: String, sealId: String, bundl
     }.getOrNull() ?: return null
     if (!done.optBoolean("ok")) return null
     chunkDir.deleteRecursively() // plaintext is assembled; the ciphertext copies are dead weight
-    return out.path to mime
+    return Triple(out.path, mime, info.optString("caption"))
 }
 
 /** Collect released shares for a seal from all gateways. */
@@ -1523,6 +1530,9 @@ private fun ConversationScreen(
     val scope = rememberCoroutineScope()
     val polling = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
     val nowSecs = rememberNowSeconds() // drives reveal countdowns and destroy deadlines
+    // A picked photo/video waiting in the composer. It is NOT sent until the user taps send,
+    // so a caption can be typed alongside it.
+    var pending by remember { mutableStateOf<android.net.Uri?>(null) }
 
     LaunchedEffect(Unit) { if (messages.isNotEmpty()) listState.scrollToItem(messages.lastIndex) }
 
@@ -1575,7 +1585,7 @@ private fun ConversationScreen(
                     if (got != null) {
                         seen.add(sealId)
                         val sender = bundle.optString("sender_id_pub")
-                        val label = if (got.second.startsWith("video")) "Video" else "Photo"
+                        val label = got.third.ifBlank { if (got.second.startsWith("video")) "Video" else "Photo" }
                         // carry the destroy deadline across: the recipient's copy must burn too,
                         // otherwise a "self-destruct" only ever removed the sender's side.
                         val dz = bundle.optLong("destroy_at")
@@ -1631,14 +1641,14 @@ private fun ConversationScreen(
      * Rust can chunk-encrypt it; ONLY the encrypted chunks are uploaded, and they go to the
      * relay addressed by ciphertext hash. The sender's own copy stays local for the bubble.
      */
-    fun sendMedia(uri: android.net.Uri) {
+    fun sendMedia(uri: android.net.Uri, caption: String) {
         if (!real) {
             android.widget.Toast.makeText(ctx, "Add this person as a contact first", android.widget.Toast.LENGTH_SHORT).show()
             return
         }
         val mime = ctx.contentResolver.getType(uri) ?: "image/jpeg"
         val isVideo = mime.startsWith("video")
-        val label = if (isVideo) "Video" else "Photo"
+        val label = caption.ifBlank { if (isVideo) "Video" else "Photo" }
         val fast = fastMode
         val rv = revealAt; val dz = destroyAt
         messages.add(
@@ -1659,7 +1669,7 @@ private fun ConversationScreen(
                     JSONObject(
                         SealCore.sealMediaFile(
                             myIdentitySeed, myCard, chat.devicePub, src.path, mime,
-                            if (isVideo) "video" else "image",
+                            if (isVideo) "video" else "image", caption,
                             preview?.path ?: "", chunkDir.path, fast, rv, dz,
                         )
                     )
@@ -1690,9 +1700,18 @@ private fun ConversationScreen(
         }
     }
 
-    val pickMedia = rememberMediaPicker { uri -> sendMedia(uri) }
+    val pickMedia = rememberMediaPicker { uri -> pending = uri } // stage it; the user captions + sends
 
     fun send() {
+        // An attached photo/video takes the typed text as its (sealed) caption, so the two
+        // travel as ONE item rather than a picture followed by a stray message.
+        pending?.let { uri ->
+            val caption = draft.trim()
+            draft = ""
+            pending = null
+            sendMedia(uri, caption)
+            return
+        }
         val text = draft.trim()
         if (text.isEmpty()) return
         val fast = fastMode
@@ -1780,6 +1799,8 @@ private fun ConversationScreen(
             draft, { draft = it }, timerLabel, { showTimer = true }, { revealAt = 0L; destroyAt = 0L },
             onAttach = { pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)) },
             onSend = ::send,
+            attachment = pending,
+            onClearAttachment = { pending = null },
         )
     }
 
@@ -2154,6 +2175,12 @@ private fun ImageContent(m: Msg) {
                 SealBadge()
             }
         }
+        // the caption travelled sealed inside the manifest, so it is as private as the pixels
+        val caption = m.text
+        if (caption.isNotBlank() && caption != "Photo" && caption != "Video") {
+            Spacer(Modifier.height(6.dp))
+            Text(caption, color = Ink, fontSize = 15.sp, modifier = Modifier.widthIn(max = 220.dp))
+        }
     }
 }
 
@@ -2236,8 +2263,68 @@ private fun Composer(
     onClearTimer: () -> Unit,
     onAttach: () -> Unit,
     onSend: () -> Unit,
+    attachment: android.net.Uri? = null,
+    onClearAttachment: () -> Unit = {},
 ) {
+  val ctx = LocalContext.current
   Column(Modifier.fillMaxWidth().background(Color.White)) {
+    // A staged photo/video slides up into the composer and waits there. Whatever is typed
+    // becomes its caption, sealed inside the manifest, and both go in ONE item.
+    AnimatedVisibility(
+        visible = attachment != null,
+        enter = slideInVertically { it / 2 } + fadeIn() + expandVertically(),
+        exit = slideOutVertically { it / 2 } + fadeOut() + shrinkVertically(),
+    ) {
+        val uri = attachment
+        val thumb = remember(uri) {
+            uri?.let {
+                runCatching {
+                    val mime = ctx.contentResolver.getType(it).orEmpty()
+                    if (mime.startsWith("video")) {
+                        android.media.MediaMetadataRetriever().use { r ->
+                            ctx.contentResolver.openFileDescriptor(it, "r")?.use { fd ->
+                                r.setDataSource(fd.fileDescriptor); r.getFrameAtTime(0)
+                            }
+                        }
+                    } else {
+                        ctx.contentResolver.openInputStream(it)?.use { ins ->
+                            android.graphics.BitmapFactory.decodeStream(
+                                ins, null,
+                                android.graphics.BitmapFactory.Options().apply { inSampleSize = 4 },
+                            )
+                        }
+                    }
+                }.getOrNull()
+            }
+        }
+        Row(
+            Modifier.fillMaxWidth().padding(start = 14.dp, end = 14.dp, top = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box {
+                Box(Modifier.size(64.dp).clip(RoundedCornerShape(10.dp)).background(Hair)) {
+                    thumb?.let {
+                        Image(
+                            bitmap = it.asImageBitmap(), contentDescription = "Attached",
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                        )
+                    }
+                }
+                Box(
+                    Modifier.align(Alignment.TopEnd).offset(x = 6.dp, y = (-6).dp)
+                        .size(22.dp).clip(CircleShape).background(Ink.copy(alpha = 0.75f))
+                        .clickable(onClick = onClearAttachment),
+                    contentAlignment = Alignment.Center,
+                ) { Icon(Icons.Filled.Close, "Remove", tint = Color.White, modifier = Modifier.size(14.dp)) }
+            }
+            Spacer(Modifier.width(12.dp))
+            Column {
+                Text("Ready to seal", color = Ink, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                Text("Add a caption, then send", color = Sub, fontSize = 11.sp)
+            }
+        }
+    }
     if (timerLabel != null) {
         Row(
             Modifier.fillMaxWidth().padding(start = 14.dp, end = 14.dp, top = 8.dp),
@@ -2263,7 +2350,9 @@ private fun Composer(
         OutlinedTextField(
             value = value,
             onValueChange = onChange,
-            placeholder = { Text("Message", color = Sub, fontSize = 15.sp) },
+            placeholder = {
+                Text(if (attachment != null) "Add a caption…" else "Message", color = Sub, fontSize = 15.sp)
+            },
             leadingIcon = { Icon(Icons.Outlined.EmojiEmotions, null, tint = Sub, modifier = Modifier.size(22.dp)) },
             maxLines = 5,
             shape = RoundedCornerShape(24.dp),
@@ -2279,7 +2368,7 @@ private fun Composer(
             modifier = Modifier.weight(1f),
         )
         Spacer(Modifier.width(8.dp))
-        val active = value.isNotBlank()
+        val active = value.isNotBlank() || attachment != null
         Box(
             Modifier.size(46.dp).background(Blue, CircleShape).clickable(enabled = active, onClick = onSend),
             contentAlignment = Alignment.Center,

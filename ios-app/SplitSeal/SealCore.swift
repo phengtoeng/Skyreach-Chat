@@ -69,14 +69,14 @@ enum SealCore {
     /// — the same bundle/shares shape a text seal produces, so `shipSeal` works unchanged.
     static func sealMediaFile(
         _ identitySeed: String, _ senderCard: String, _ devicePub: String, _ inPath: String,
-        _ mime: String, _ kind: String, _ previewPath: String, _ outDir: String,
+        _ mime: String, _ kind: String, _ caption: String, _ previewPath: String, _ outDir: String,
         _ fast: Bool = false, _ revealAt: Int64 = 0, _ destroyAt: Int64 = 0
     ) -> String {
         identitySeed.withCString { i in senderCard.withCString { c in devicePub.withCString { d in
         inPath.withCString { p in mime.withCString { m in kind.withCString { k in
-        previewPath.withCString { pv in outDir.withCString { o in
-            copy(ss_seal_media_file(i, c, d, p, m, k, pv, o, fast ? 1 : 0, revealAt, destroyAt))
-        } } } } } } } }
+        caption.withCString { cap in previewPath.withCString { pv in outDir.withCString { o in
+            copy(ss_seal_media_file(i, c, d, p, m, k, cap, pv, o, fast ? 1 : 0, revealAt, destroyAt))
+        } } } } } } } } }
     }
 
     /// Media step 1 — open the MANIFEST only, to learn what the item is and which chunks to

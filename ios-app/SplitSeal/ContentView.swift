@@ -492,9 +492,9 @@ enum MediaThumbs {
 }
 
 /// Receive one media seal: open the manifest, fetch every chunk the relay is holding, then
-/// decrypt and reassemble. Returns (localPath, mime), or nil while it is still locked or the
+/// decrypt and reassemble. Returns (localPath, mime, caption), or nil while it is still locked or the
 /// chunks have not all arrived — the caller simply retries on the next poll.
-func receiveMedia(_ deviceSeed: String, _ sealId: String, _ bundle: String, _ shares: String) async -> (String, String)? {
+func receiveMedia(_ deviceSeed: String, _ sealId: String, _ bundle: String, _ shares: String) async -> (String, String, String)? {
     let previewPath = cacheDir.appendingPathComponent("pv-\(sealId).jpg").path
     let infoStr = SealCore.openMediaInfo(deviceSeed, bundle, shares, previewPath)
     guard let info = (try? JSONSerialization.jsonObject(with: Data(infoStr.utf8))) as? [String: Any],
@@ -517,7 +517,7 @@ func receiveMedia(_ deviceSeed: String, _ sealId: String, _ bundle: String, _ sh
     guard let done = (try? JSONSerialization.jsonObject(with: Data(doneStr.utf8))) as? [String: Any],
           (done["ok"] as? Bool) == true else { return nil }
     try? FileManager.default.removeItem(at: chunkDir) // plaintext assembled; ciphertext is dead weight
-    return (out.path, mime)
+    return (out.path, mime, info["caption"] as? String ?? "")
 }
 
 /// Fetch every {seal_id, bundle} item for a mailbox tag from ALL relays, merged + deduped by
@@ -1276,6 +1276,9 @@ struct ConversationView: View {
     @State private var pickedItem: PhotosPickerItem?
     @State private var mediaError: String?
     @State private var playing: URL?
+    /// A picked photo/video waiting in the composer. It is NOT sent until the user taps send,
+    /// so a caption can be typed alongside it.
+    @State private var pending: (url: URL, mime: String)?
     /// Wall-clock seconds, ticking once a second: drives reveal countdowns and destroy deadlines.
     @State private var nowSecs: Int64 = Int64(Date().timeIntervalSince1970)
     private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
@@ -1349,7 +1352,7 @@ struct ConversationView: View {
                     src = f
                 }
                 await MainActor.run {
-                    if let src { sendMedia(src, isVideo ? "video/mp4" : "image/jpeg") }
+                    if let src { pending = (src, isVideo ? "video/mp4" : "image/jpeg") }
                     else { mediaError = "Couldn't read that item" }
                     pickedItem = nil
                 }
@@ -1409,6 +1412,36 @@ struct ConversationView: View {
 
     private var composer: some View {
         VStack(spacing: 0) {
+            // A staged photo/video slides up into the composer and waits there. Whatever is
+            // typed becomes its caption, sealed inside the manifest, and both go in ONE item.
+            if let p = pending {
+                HStack(spacing: 12) {
+                    ZStack(alignment: .topTrailing) {
+                        Group {
+                            if let img = MediaThumbs.thumb(path: p.url.path, isVideo: p.mime.hasPrefix("video")) {
+                                Image(uiImage: img).resizable().aspectRatio(contentMode: .fill)
+                            } else {
+                                Color.dvHair
+                            }
+                        }
+                        .frame(width: 64, height: 64).clipped()
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        Button(action: { withAnimation(.easeInOut(duration: 0.2)) { pending = nil } }) {
+                            Image(systemName: "xmark").font(.system(size: 10, weight: .bold))
+                                .foregroundColor(.white).frame(width: 22, height: 22)
+                                .background(Color.dvInk.opacity(0.75)).clipShape(Circle())
+                        }
+                        .offset(x: 7, y: -7)
+                    }
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Ready to seal").font(.system(size: 13, weight: .semibold)).foregroundColor(.dvInk)
+                        Text("Add a caption, then send").font(.system(size: 11)).foregroundColor(.dvSub)
+                    }
+                    Spacer()
+                }
+                .padding(.horizontal, 14).padding(.top, 10)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
             if revealAt > 0 || destroyAt > 0 {
                 HStack(spacing: 6) {
                     Text(revealAt > 0 ? "🔒 Opens in \(relLabel(revealAt))" : "💥 Destroys in \(relLabel(destroyAt))")
@@ -1432,13 +1465,13 @@ struct ConversationView: View {
                 }
                 HStack(spacing: 8) {
                     Image(systemName: "face.smiling").foregroundColor(.dvSub).font(.system(size: 20))
-                    TextField("Message", text: $draft, axis: .vertical)
+                    TextField(pending == nil ? "Message" : "Add a caption…", text: $draft, axis: .vertical)
                         .lineLimit(1...4).font(.system(size: 15)).foregroundColor(.dvInk)
                 }
                 .padding(.horizontal, 12).padding(.vertical, 10)
                 .background(Color(hex: 0xF1F4F7)).clipShape(RoundedRectangle(cornerRadius: 22))
 
-                let active = !draft.trimmingCharacters(in: .whitespaces).isEmpty
+                let active = !draft.trimmingCharacters(in: .whitespaces).isEmpty || pending != nil
                 Button(action: send) {
                     Image(systemName: active ? "paperplane.fill" : "mic.fill").foregroundColor(.white).font(.system(size: 19))
                         .frame(width: 46, height: 46).background(Color.dvBlue).clipShape(Circle())
@@ -1447,6 +1480,7 @@ struct ConversationView: View {
             .padding(.horizontal, 10).padding(.vertical, 8)
         }
         .background(Color.white)
+        .animation(.easeInOut(duration: 0.22), value: pending?.url)
     }
 
     // Poll my inbox: fetch delivered ciphertext, collect released shares, open, show. One at a time.
@@ -1484,7 +1518,7 @@ struct ConversationView: View {
                 }
                 if let got = await receiveMedia(myDeviceSeed, sealId, bundleStr, shares) {
                     seen.insert(sealId)
-                    let label = got.1.hasPrefix("video") ? "Video" : "Photo"
+                    let label = got.2.isEmpty ? (got.1.hasPrefix("video") ? "Video" : "Photo") : got.2
                     // carry the destroy deadline across: the recipient's copy must burn too,
                     // otherwise "self-destruct" only ever removed the sender's side.
                     let dz = ((item["bundle"] as? [String: Any])?["destroy_at"] as? NSNumber)?.int64Value ?? 0
@@ -1523,10 +1557,10 @@ struct ConversationView: View {
     /// Seal and ship a picked photo/video. The readable file is written to our cache only so
     /// Rust can chunk-encrypt it; ONLY the encrypted chunks are uploaded, addressed by
     /// ciphertext hash. Our own copy stays local so the sent bubble can render it.
-    private func sendMedia(_ src: URL, _ mime: String) {
+    private func sendMedia(_ src: URL, _ mime: String, _ caption: String) {
         guard real else { return }
         let isVideo = mime.hasPrefix("video")
-        let label = isVideo ? "Video" : "Photo"
+        let label = caption.isEmpty ? (isVideo ? "Video" : "Photo") : caption
         let fast = fastMode
         let rv = revealAt, dz = destroyAt
         messages.append(Msg(text: label, incoming: false, time: nowTime(), kind: .image,
@@ -1540,7 +1574,7 @@ struct ConversationView: View {
 
             let sealedStr = SealCore.sealMediaFile(
                 myIdentitySeed, myCard, chat.devicePub, src.path, mime,
-                isVideo ? "video" : "image", preview?.path ?? "", chunkDir.path, fast, rv, dz
+                isVideo ? "video" : "image", caption, preview?.path ?? "", chunkDir.path, fast, rv, dz
             )
             if let p = preview { try? FileManager.default.removeItem(at: p) }
             guard let sealed = (try? JSONSerialization.jsonObject(with: Data(sealedStr.utf8))) as? [String: Any],
@@ -1580,6 +1614,15 @@ struct ConversationView: View {
     }
 
     private func send() {
+        // An attached photo/video takes the typed text as its (sealed) caption, so the two
+        // travel as ONE item rather than a picture followed by a stray message.
+        if let p = pending {
+            let caption = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+            draft = ""
+            pending = nil
+            sendMedia(p.url, p.mime, caption)
+            return
+        }
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         let fast = fastMode
@@ -1862,6 +1905,16 @@ private struct Bubble: View {
     }
 
     private var imageContent: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            imageOnly
+            // the caption travelled sealed inside the manifest, so it is as private as the pixels
+            if !m.text.isEmpty, m.text != "Photo", m.text != "Video" {
+                Text(m.text).font(.system(size: 15)).foregroundColor(.dvInk).frame(maxWidth: 220, alignment: .leading)
+            }
+        }
+    }
+
+    private var imageOnly: some View {
         // Renders the DECRYPTED local file. By this point the bytes exist in readable form
         // only on this device — nothing here touches the network.
         let isVideo = m.mediaMime.hasPrefix("video")

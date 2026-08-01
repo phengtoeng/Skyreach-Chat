@@ -68,11 +68,12 @@ char *ss_open_received(const char *device_seed, const char *bundle, const char *
  * seal produces — so the existing ship/collect plumbing is unchanged:
  *   { ok, seal_id, mailbox_tag, bundle, shares, chunk_count, chunks:[{index,hash,path,size}] }
  * kind = "image" | "video" | "audio" | "file".
+ * caption travels sealed INSIDE the manifest — as private as the pixels; "" for none.
  * preview_path must ALREADY be blurred/downscaled — it is sealed INSIDE the manifest and is
  * never uploaded on its own (spec §10.3); pass "" for none. */
 char *ss_seal_media_file(const char *identity_seed, const char *sender_card, const char *device_pub,
                          const char *in_path, const char *mime, const char *kind,
-                         const char *preview_path, const char *out_dir,
+                         const char *caption, const char *preview_path, const char *out_dir,
                          int fast, long long reveal_at, long long destroy_at);
 
 /* Media step 1 — open the MANIFEST only, to learn what the item is and which chunks to fetch:

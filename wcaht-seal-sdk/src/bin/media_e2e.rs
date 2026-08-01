@@ -68,6 +68,7 @@ fn main() -> Result<()> {
         &photo,
         ContentKind::Image,
         "image/jpeg",
+        "sent with a caption",
         b"<blurred preview bytes>",
         PreviewPolicy::LockedBlur,
         (4032, 3024),

@@ -22,7 +22,7 @@ object SealCore {
     private external fun nativeOpenReceived(deviceSeed: String, bundle: String, shares: String): String
     private external fun nativeSealMediaFile(
         identitySeed: String, senderCard: String, devicePub: String, inPath: String,
-        mime: String, kind: String, previewPath: String, outDir: String,
+        mime: String, kind: String, caption: String, previewPath: String, outDir: String,
         fast: Boolean, revealAt: Long, destroyAt: Long,
     ): String
     private external fun nativeOpenMediaInfo(deviceSeed: String, bundle: String, shares: String, previewOut: String): String
@@ -80,10 +80,10 @@ object SealCore {
      */
     fun sealMediaFile(
         identitySeed: String, senderCard: String, devicePub: String, inPath: String,
-        mime: String, kind: String, previewPath: String, outDir: String,
+        mime: String, kind: String, caption: String, previewPath: String, outDir: String,
         fast: Boolean = false, revealAt: Long = 0, destroyAt: Long = 0,
     ): String = nativeSealMediaFile(
-        identitySeed, senderCard, devicePub, inPath, mime, kind, previewPath, outDir, fast, revealAt, destroyAt,
+        identitySeed, senderCard, devicePub, inPath, mime, kind, caption, previewPath, outDir, fast, revealAt, destroyAt,
     )
 
     /**

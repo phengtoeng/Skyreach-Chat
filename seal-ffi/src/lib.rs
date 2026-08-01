@@ -257,6 +257,7 @@ fn seal_media_file_json(
     in_path: &str,
     mime: &str,
     kind: &str,
+    caption: &str,
     preview_path: &str,
     out_dir: &str,
     fast: bool,
@@ -304,6 +305,7 @@ fn seal_media_file_json(
         &bytes,
         kind_from_str(kind),
         mime,
+        caption,
         &preview,
         policy,
         (0, 0),
@@ -427,6 +429,7 @@ fn open_media_info_json(device_seed_hex: &str, bundle_str: &str, shares_str: &st
                 "ok": true,
                 "mime_type": manifest.mime_type,
                 "kind": kind_str(manifest.content_kind),
+                "caption": manifest.caption,
                 "plaintext_size": manifest.plaintext_size,
                 "chunk_count": manifest.chunk_count,
                 "chunks": hashes,
@@ -650,6 +653,7 @@ pub unsafe extern "C" fn ss_seal_media_file(
     in_path: *const c_char,
     mime: *const c_char,
     kind: *const c_char,
+    caption: *const c_char,
     preview_path: *const c_char,
     out_dir: *const c_char,
     fast: i32,
@@ -663,6 +667,7 @@ pub unsafe extern "C" fn ss_seal_media_file(
         &cstr(in_path),
         &cstr(mime),
         &cstr(kind),
+        &cstr(caption),
         &cstr(preview_path),
         &cstr(out_dir),
         fast != 0,
@@ -1018,6 +1023,7 @@ pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeSealMediaFile<'
     in_path: JString<'local>,
     mime: JString<'local>,
     kind: JString<'local>,
+    caption: JString<'local>,
     preview_path: JString<'local>,
     out_dir: JString<'local>,
     fast: jni::sys::jboolean,
@@ -1030,11 +1036,12 @@ pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeSealMediaFile<'
     let ip = jstr(&mut env, &in_path);
     let mt = jstr(&mut env, &mime);
     let kd = jstr(&mut env, &kind);
+    let cap = jstr(&mut env, &caption);
     let pv = jstr(&mut env, &preview_path);
     let od = jstr(&mut env, &out_dir);
     ret(
         env,
-        seal_media_file_json(&is, &card, &dp, &ip, &mt, &kd, &pv, &od, fast != 0, reveal_at as i64, destroy_at as i64),
+        seal_media_file_json(&is, &card, &dp, &ip, &mt, &kd, &cap, &pv, &od, fast != 0, reveal_at as i64, destroy_at as i64),
     )
 }
 
@@ -1111,7 +1118,7 @@ mod tests {
             let _ = card_for_json(s, s, s);
             let _ = open_received_json(s, s, s);
             // the media entry points take PATHS from the platform — equally untrusted
-            let _ = seal_media_file_json(s, s, s, s, s, s, s, s, false, 0, 0);
+            let _ = seal_media_file_json(s, s, s, s, s, s, s, s, s, false, 0, 0);
             let _ = open_media_info_json(s, s, s, s);
             let _ = open_media_file_json(s, s, s, s, s);
         }
@@ -1155,6 +1162,7 @@ mod tests {
             &src,
             "image/jpeg",
             "image",
+            "a caption only the recipient can read",
             &tmp.join("preview.jpg"),
             &chunks_dir,
             false,
@@ -1175,6 +1183,7 @@ mod tests {
         assert_eq!(info["ok"], true, "{info}");
         assert_eq!(info["mime_type"], "image/jpeg");
         assert_eq!(info["kind"], "image");
+        assert_eq!(info["caption"], "a caption only the recipient can read");
         assert_eq!(info["chunk_count"], 3);
         assert_eq!(info["plaintext_size"], picture.len() as u64);
         assert_eq!(std::fs::read(tmp.join("pv.out")).unwrap(), b"blurred");
@@ -1207,7 +1216,7 @@ mod tests {
                 alice["identity_seed"].as_str().unwrap(),
                 alice["card"].as_str().unwrap(),
                 bob["device_pub"].as_str().unwrap(),
-                &src, "image/jpeg", "image", "", &tmp.join(dir), false, reveal, destroy,
+                &src, "image/jpeg", "image", "", "", &tmp.join(dir), false, reveal, destroy,
             ))
             .unwrap()
         };
@@ -1258,6 +1267,7 @@ mod tests {
             "image/jpeg",
             "image",
             "",
+            "",
             &tmp.join("chunks"),
             false,
             0,
@@ -1294,6 +1304,7 @@ mod tests {
             &src,
             "video/mp4",
             "video",
+            "",
             "",
             &chunks_dir,
             false,
