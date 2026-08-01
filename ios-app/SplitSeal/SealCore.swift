@@ -51,8 +51,8 @@ enum SealCore {
     }
 
     /// Open a collected message with the recipient's device seed. Returns {ok, plaintext} or {ok:false, reason}.
-    static func openReceived(_ deviceSeed: String, _ bundle: String, _ shares: String) -> String {
-        deviceSeed.withCString { s in bundle.withCString { b in shares.withCString { sh in copy(ss_open_received(s, b, sh)) } } }
+    static func openReceived(_ deviceSeed: String, _ bundle: String, _ shares: String, _ currentSlot: Int64 = 0) -> String {
+        deviceSeed.withCString { s in bundle.withCString { b in shares.withCString { sh in copy(ss_open_received(s, b, sh, currentSlot)) } } }
     }
 
     // ── media ──
@@ -82,17 +82,17 @@ enum SealCore {
     /// Media step 1 — open the MANIFEST only, to learn what the item is and which chunks to
     /// fetch: `{ok, mime_type, kind, chunk_count, chunks:[hash], plaintext_size}`.
     /// Writes the locked preview to `previewOut` when the item carries one.
-    static func openMediaInfo(_ deviceSeed: String, _ bundle: String, _ shares: String, _ previewOut: String) -> String {
+    static func openMediaInfo(_ deviceSeed: String, _ bundle: String, _ shares: String, _ previewOut: String, _ currentSlot: Int64 = 0) -> String {
         deviceSeed.withCString { s in bundle.withCString { b in shares.withCString { sh in
-        previewOut.withCString { pv in copy(ss_open_media_info(s, b, sh, pv)) } } } }
+        previewOut.withCString { pv in copy(ss_open_media_info(s, b, sh, pv, currentSlot)) } } } }
     }
 
     /// Media step 2 — every chunk having been downloaded into `chunkDir` (each file named by
     /// its hex hash, exactly as `openMediaInfo` listed), decrypt and reassemble into `outPath`.
     /// A missing or altered chunk fails here rather than producing a corrupt file.
-    static func openMediaFile(_ deviceSeed: String, _ bundle: String, _ shares: String, _ chunkDir: String, _ outPath: String) -> String {
+    static func openMediaFile(_ deviceSeed: String, _ bundle: String, _ shares: String, _ chunkDir: String, _ outPath: String, _ currentSlot: Int64 = 0) -> String {
         deviceSeed.withCString { s in bundle.withCString { b in shares.withCString { sh in
-        chunkDir.withCString { c in outPath.withCString { o in copy(ss_open_media_file(s, b, sh, c, o)) } } } } }
+        chunkDir.withCString { c in outPath.withCString { o in copy(ss_open_media_file(s, b, sh, c, o, currentSlot)) } } } } }
     }
 
     /// Copy a Rust-owned C string into a Swift String and free the original.

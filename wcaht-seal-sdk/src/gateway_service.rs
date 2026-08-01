@@ -103,8 +103,10 @@ pub fn serve_gateway(addr: &str) -> Result<()> {
     // WCAHT_RPC=http://host:8901 lets this gateway verify chain time itself.
     let chain_rpc = std::env::var("WCAHT_RPC").ok().map(|u| crate::WcahtRpc::new(&u));
     match &chain_rpc {
-        Some(_) => println!("gateway: chain-time gate ON (WCAHT_RPC set)"),
-        None => println!("gateway: WCAHT_RPC unset — timelock rests on the signed wall-clock window only"),
+        Some(_) => println!("gateway: chain gate ON (WCAHT_RPC set) — finality and timelock both verified against the chain"),
+        None => println!(
+            "gateway: WCAHT_RPC unset — 'finalised' is TRUSTED FROM THE CALLER and the timelock              rests on the signed wall-clock window only. Set WCAHT_RPC in production."
+        ),
     }
 
     for mut req in server.incoming_requests() {
@@ -147,8 +149,19 @@ pub fn serve_gateway(addr: &str) -> Result<()> {
                         Err(e) => rejected = Some(e),
                     }
                 }
+                // "Finalised" used to be an unverified assertion: any caller could POST here
+                // and the gateway would release. With a node configured we check the chain
+                // ourselves — the seal's own slot floor must actually be finalised — and we
+                // require the signed leaf that carries it.
+                let chain_says_final = match (chain_rpc.as_ref(), store.lock().unwrap().floors.get(&sid).copied()) {
+                    (None, _) => true, // no node configured: legacy trust, logged at startup
+                    (Some(_), None) => false, // node configured but no signed leaf → not provable
+                    (Some(rpc), Some(floor)) => rpc.finalized_slot().map(|fin| fin >= floor).unwrap_or(false),
+                };
                 if let Some(e) = rejected {
                     (400, err_json(&e))
+                } else if !chain_says_final {
+                    (425, err_json("chain has not finalised this seal — send the signed leaf and wait"))
                 } else {
                     let mut s = store.lock().unwrap();
                     s.finalised.insert(sid.clone());

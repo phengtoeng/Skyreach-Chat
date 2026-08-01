@@ -498,9 +498,9 @@ enum MediaThumbs {
 /// Receive one media seal: open the manifest, fetch every chunk the relay is holding, then
 /// decrypt and reassemble. Returns (localPath, mime, caption), or nil while it is still locked or the
 /// chunks have not all arrived — the caller simply retries on the next poll.
-func receiveMedia(_ deviceSeed: String, _ sealId: String, _ bundle: String, _ shares: String) async -> (String, String, String)? {
+func receiveMedia(_ deviceSeed: String, _ sealId: String, _ bundle: String, _ shares: String, _ slot: Int64) async -> (String, String, String)? {
     let previewPath = cacheDir.appendingPathComponent("pv-\(sealId).jpg").path
-    let infoStr = SealCore.openMediaInfo(deviceSeed, bundle, shares, previewPath)
+    let infoStr = SealCore.openMediaInfo(deviceSeed, bundle, shares, previewPath, slot)
     guard let info = (try? JSONSerialization.jsonObject(with: Data(infoStr.utf8))) as? [String: Any],
           (info["ok"] as? Bool) == true,
           let hashes = info["chunks"] as? [String] else { return nil } // locked, or shares pending
@@ -517,7 +517,7 @@ func receiveMedia(_ deviceSeed: String, _ sealId: String, _ bundle: String, _ sh
     let mime = info["mime_type"] as? String ?? "application/octet-stream"
     let ext = mime.hasPrefix("video") ? "mp4" : (mime.contains("png") ? "png" : "jpg")
     let out = mediaDir.appendingPathComponent("\(sealId).\(ext)")
-    let doneStr = SealCore.openMediaFile(deviceSeed, bundle, shares, chunkDir.path, out.path)
+    let doneStr = SealCore.openMediaFile(deviceSeed, bundle, shares, chunkDir.path, out.path, slot)
     guard let done = (try? JSONSerialization.jsonObject(with: Data(doneStr.utf8))) as? [String: Any],
           (done["ok"] as? Bool) == true else { return nil }
     try? FileManager.default.removeItem(at: chunkDir) // plaintext assembled; ciphertext is dead weight
@@ -1505,7 +1505,11 @@ struct ConversationView: View {
         guard real, !myTag.isEmpty, !polling else { return }
         polling = true
         defer { polling = false }
-        for item in await fetchInboxAll(myTag) {
+        let inbox = await fetchInboxAll(myTag)
+        // read the chain once per pass so the core can check the seal's slot floor against real
+        // finality rather than trusting that the gateways released
+        let chainSlot: Int64 = inbox.isEmpty ? 0 : await finalizedSlot()
+        for item in inbox {
             guard let sealId = item["seal_id"] as? String, !sealId.isEmpty, !seen.contains(sealId),
                   let bundle = item["bundle"],
                   let bd = try? JSONSerialization.data(withJSONObject: bundle),
@@ -1519,7 +1523,7 @@ struct ConversationView: View {
             if (leaf?["content_type"] as? String) == "Media" {
                 // Time-locked? Show a locked placeholder with a countdown rather than nothing at
                 // all, and keep polling — it opens by itself at revealAt.
-                let gateStr = SealCore.openMediaInfo(myDeviceSeed, bundleStr, shares, "")
+                let gateStr = SealCore.openMediaInfo(myDeviceSeed, bundleStr, shares, "", chainSlot)
                 if let gate = (try? JSONSerialization.jsonObject(with: Data(gateStr.utf8))) as? [String: Any],
                    (gate["ok"] as? Bool) != true {
                     let reason = gate["reason"] as? String ?? ""
@@ -1533,7 +1537,7 @@ struct ConversationView: View {
                         continue // NOT marked seen: the next poll opens it once the window does
                     }
                 }
-                if let got = await receiveMedia(myDeviceSeed, sealId, bundleStr, shares) {
+                if let got = await receiveMedia(myDeviceSeed, sealId, bundleStr, shares, chainSlot) {
                     seen.insert(sealId)
                     let label = got.2.isEmpty ? (got.1.hasPrefix("video") ? "Video" : "Photo") : got.2
                     // carry the destroy deadline across: the recipient's copy must burn too,
@@ -1552,7 +1556,7 @@ struct ConversationView: View {
                 continue // still locked / chunks not all there yet → retry on the next poll
             }
 
-            let openStr = SealCore.openReceived(myDeviceSeed, bundleStr, shares)
+            let openStr = SealCore.openReceived(myDeviceSeed, bundleStr, shares, chainSlot)
             if let r = (try? JSONSerialization.jsonObject(with: Data(openStr.utf8))) as? [String: Any],
                (r["ok"] as? Bool) == true, let plain = r["plaintext"] as? String {
                 seen.insert(sealId)

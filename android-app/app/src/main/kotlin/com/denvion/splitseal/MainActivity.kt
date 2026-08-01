@@ -542,9 +542,9 @@ private fun uploadChunks(sealed: JSONObject): Boolean {
  * decrypt and reassemble. Returns (localPath, mime), or null while it is still locked or
  * the chunks have not all arrived — the caller simply retries on the next poll.
  */
-private fun receiveMedia(ctx: Context, deviceSeed: String, sealId: String, bundle: String, shares: String): Triple<String, String, String>? {
+private fun receiveMedia(ctx: Context, deviceSeed: String, sealId: String, bundle: String, shares: String, slot: Long): Triple<String, String, String>? {
     val previewPath = java.io.File(ctx.cacheDir, "pv-$sealId.jpg").path
-    val info = runCatching { JSONObject(SealCore.openMediaInfo(deviceSeed, bundle, shares, previewPath)) }.getOrNull() ?: return null
+    val info = runCatching { JSONObject(SealCore.openMediaInfo(deviceSeed, bundle, shares, previewPath, slot)) }.getOrNull() ?: return null
     if (!info.optBoolean("ok")) return null // locked, or not enough shares released yet
 
     val chunkDir = java.io.File(ctx.cacheDir, "chunks/$sealId").apply { mkdirs() }
@@ -566,7 +566,7 @@ private fun receiveMedia(ctx: Context, deviceSeed: String, sealId: String, bundl
     val mediaDir = java.io.File(ctx.filesDir, "media").apply { mkdirs() }
     val out = java.io.File(mediaDir, "$sealId.$ext")
     val done = runCatching {
-        JSONObject(SealCore.openMediaFile(deviceSeed, bundle, shares, chunkDir.path, out.path))
+        JSONObject(SealCore.openMediaFile(deviceSeed, bundle, shares, chunkDir.path, out.path, slot))
     }.getOrNull() ?: return null
     if (!done.optBoolean("ok")) return null
     chunkDir.deleteRecursively() // plaintext is assembled; the ciphertext copies are dead weight
@@ -663,6 +663,9 @@ private fun App(proto: String) {
         store.inbox(myTag).let { s -> for (i in 0 until s.length()) seenGlobal.add(s.getJSONObject(i).optString("id")) }
         while (openChat == null) {
             val items = withContext(Dispatchers.IO) { fetchInboxAll(myTag) }
+            // read the chain once per pass so the core can check the seal's slot floor against
+            // real finality rather than trusting that the gateways released
+            val chainSlot = if (items.isEmpty()) 0L else withContext(Dispatchers.IO) { finalizedSlot() }
             for (item in items) {
                 val sealId = item.optString("seal_id")
                 val bundle = item.optJSONObject("bundle") ?: continue
@@ -1561,6 +1564,7 @@ private fun ConversationScreen(
         if (!polling.compareAndSet(false, true)) return
         try {
             val items = withContext(Dispatchers.IO) { fetchInboxAll(myTag) }
+            val chainSlot = if (items.isEmpty()) 0L else withContext(Dispatchers.IO) { finalizedSlot() }
             for (item in items) {
                 val sealId = item.optString("seal_id")
                 val bundle = item.optJSONObject("bundle") ?: continue
@@ -1573,7 +1577,7 @@ private fun ConversationScreen(
                     // Time-locked? Show a locked placeholder with a countdown rather than
                     // nothing at all, and keep polling — it opens by itself at revealAt.
                     val gate = withContext(Dispatchers.IO) {
-                        runCatching { JSONObject(SealCore.openMediaInfo(myDeviceSeed, bundle.toString(), shares, "")) }.getOrNull()
+                        runCatching { JSONObject(SealCore.openMediaInfo(myDeviceSeed, bundle.toString(), shares, "", chainSlot)) }.getOrNull()
                     }
                     if (gate != null && !gate.optBoolean("ok")) {
                         when (gate.optString("reason")) {
@@ -1595,7 +1599,7 @@ private fun ConversationScreen(
                         }
                     }
                     val got = withContext(Dispatchers.IO) {
-                        receiveMedia(ctx, myDeviceSeed, sealId, bundle.toString(), shares)
+                        receiveMedia(ctx, myDeviceSeed, sealId, bundle.toString(), shares, chainSlot)
                     }
                     if (got != null) {
                         // replace the locked placeholder, if one is on screen
@@ -1626,7 +1630,7 @@ private fun ConversationScreen(
                 }
 
                 val opened = runCatching {
-                    withContext(Dispatchers.IO) { JSONObject(SealCore.openReceived(myDeviceSeed, bundle.toString(), shares)) }
+                    withContext(Dispatchers.IO) { JSONObject(SealCore.openReceived(myDeviceSeed, bundle.toString(), shares, chainSlot)) }
                 }.getOrNull()
                 if (opened != null && opened.optBoolean("ok")) {
                     seen.add(sealId)

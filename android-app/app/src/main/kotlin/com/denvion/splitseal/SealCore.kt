@@ -19,14 +19,14 @@ object SealCore {
     private external fun nativeMailboxTag(devicePub: String): String
     private external fun nativeSealTo(devicePub: String, text: String, fast: Boolean): String
     private external fun nativeSealShippable(identitySeed: String, senderCard: String, devicePub: String, text: String, fast: Boolean, revealAt: Long, destroyAt: Long, currentSlot: Long): String
-    private external fun nativeOpenReceived(deviceSeed: String, bundle: String, shares: String): String
+    private external fun nativeOpenReceived(deviceSeed: String, bundle: String, shares: String, currentSlot: Long): String
     private external fun nativeSealMediaFile(
         identitySeed: String, senderCard: String, devicePub: String, inPath: String,
         mime: String, kind: String, caption: String, previewPath: String, outDir: String,
         fast: Boolean, revealAt: Long, destroyAt: Long, currentSlot: Long,
     ): String
-    private external fun nativeOpenMediaInfo(deviceSeed: String, bundle: String, shares: String, previewOut: String): String
-    private external fun nativeOpenMediaFile(deviceSeed: String, bundle: String, shares: String, chunkDir: String, outPath: String): String
+    private external fun nativeOpenMediaInfo(deviceSeed: String, bundle: String, shares: String, previewOut: String, currentSlot: Long): String
+    private external fun nativeOpenMediaFile(deviceSeed: String, bundle: String, shares: String, chunkDir: String, outPath: String, currentSlot: Long): String
 
     /** `{ "protocol":"DSCP-2", "version":2, "chain_id":7789 }` */
     fun version(): String = nativeVersion()
@@ -62,7 +62,7 @@ object SealCore {
         nativeSealShippable(identitySeed, senderCard, devicePub, text, fast, revealAt, destroyAt, currentSlot)
 
     /** Open a collected message with the recipient's device seed. Returns {ok, plaintext} or {ok:false, reason}. */
-    fun openReceived(deviceSeed: String, bundle: String, shares: String): String = nativeOpenReceived(deviceSeed, bundle, shares)
+    fun openReceived(deviceSeed: String, bundle: String, shares: String, currentSlot: Long = 0): String = nativeOpenReceived(deviceSeed, bundle, shares, currentSlot)
 
     // ── media ──
     // Media crosses this boundary as FILE PATHS, never as bytes: pushing a 40 MB video
@@ -91,14 +91,14 @@ object SealCore {
      * fetch: `{ok, mime_type, kind, chunk_count, chunks:[hash], plaintext_size}`.
      * Writes the locked preview to `previewOut` when the item carries one.
      */
-    fun openMediaInfo(deviceSeed: String, bundle: String, shares: String, previewOut: String): String =
-        nativeOpenMediaInfo(deviceSeed, bundle, shares, previewOut)
+    fun openMediaInfo(deviceSeed: String, bundle: String, shares: String, previewOut: String, currentSlot: Long = 0): String =
+        nativeOpenMediaInfo(deviceSeed, bundle, shares, previewOut, currentSlot)
 
     /**
      * Media step 2 — every chunk having been downloaded into `chunkDir` (each file named by
      * its hex hash, exactly as `openMediaInfo` listed), decrypt and reassemble into `outPath`.
      * A missing or altered chunk fails here rather than producing a corrupt file.
      */
-    fun openMediaFile(deviceSeed: String, bundle: String, shares: String, chunkDir: String, outPath: String): String =
-        nativeOpenMediaFile(deviceSeed, bundle, shares, chunkDir, outPath)
+    fun openMediaFile(deviceSeed: String, bundle: String, shares: String, chunkDir: String, outPath: String, currentSlot: Long = 0): String =
+        nativeOpenMediaFile(deviceSeed, bundle, shares, chunkDir, outPath, currentSlot)
 }

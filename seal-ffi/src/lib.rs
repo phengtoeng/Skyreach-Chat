@@ -175,7 +175,7 @@ fn seal_shippable_json(
 /// Refuses MEDIA leaves outright: a media envelope carries a bincode `MediaManifest`, and
 /// running it through here would hand the app binary that `from_utf8_lossy` turns into a
 /// bubble full of replacement characters. Callers must route media to `ss_open_media_info`.
-fn open_received_json(device_seed_hex: &str, bundle_str: &str, shares_str: &str) -> String {
+fn open_received_json(device_seed_hex: &str, bundle_str: &str, shares_str: &str, current_slot: i64) -> String {
     let recipient = sc::DeviceKey::from_seed(seed_from_hex(device_seed_hex));
     let Ok(bundle): Result<Value, _> = serde_json::from_str(bundle_str) else {
         return json!({ "ok": false, "reason": "bad bundle" }).to_string();
@@ -216,8 +216,9 @@ fn open_received_json(device_seed_hex: &str, bundle_str: &str, shares_str: &str)
         return json!({ "ok": false, "reason": "locked", "reveal_at": signed_leaf.leaf.reveal_at_unix }).to_string();
     }
 
-    // gateways already enforced finality before releasing, so mark the seal finalised.
-    let mut chain = MockSealChain::new(1000);
+    // chain view at the slot the app read from a node — see open_ctx for why
+    let view_slot = if current_slot > 0 { current_slot as u64 } else { signed_leaf.leaf.not_before_finalized_slot };
+    let mut chain = MockSealChain::new(view_slot);
     let _ = chain.submit_leaf(&signed_leaf, &sender_pub);
     let _ = chain.finalize(&signed_leaf.leaf.seal_id);
 
@@ -398,7 +399,7 @@ struct OpenCtx {
 /// Parse a bundle + shares and apply the timelock window. `Err` is a ready-to-return JSON
 /// string. The gateways are the primary gate — they withhold shares outside the window —
 /// so the checks here are defence in depth.
-fn open_ctx(bundle_str: &str, shares_str: &str) -> std::result::Result<OpenCtx, String> {
+fn open_ctx(bundle_str: &str, shares_str: &str, current_slot: i64) -> std::result::Result<OpenCtx, String> {
     let Ok(bundle): Result<Value, _> = serde_json::from_str(bundle_str) else {
         return Err(json!({ "ok": false, "reason": "bad bundle" }).to_string());
     };
@@ -428,8 +429,17 @@ fn open_ctx(bundle_str: &str, shares_str: &str) -> std::result::Result<OpenCtx, 
         return Err(json!({ "ok": false, "reason": "locked", "reveal_at": leaf.reveal_at_unix }).to_string());
     }
 
-    // gateways already enforced finality before releasing, so mark the seal finalised.
-    let mut chain = MockSealChain::new(1000);
+    // The gateways gate on finality before releasing, but the recipient should not have to
+    // take their word for the CHAIN TIME: building the chain view at the slot the app just read
+    // from a node means `release_gate` compares the seal's signed slot floor against real
+    // finality here, on the recipient's device.
+    //
+    // `current_slot == 0` means the app could not reach a node. Fall back to the leaf's own
+    // floor — that satisfies the slot gate without pretending the chain has run far ahead
+    // (a huge stand-in slot would trip the seal's `expires_at_slot` instead). Offline, the
+    // signed wall-clock window and the gateways' release are what still apply.
+    let view_slot = if current_slot > 0 { current_slot as u64 } else { signed_leaf.leaf.not_before_finalized_slot };
+    let mut chain = MockSealChain::new(view_slot);
     let _ = chain.submit_leaf(&signed_leaf, &sender_pub);
     let _ = chain.finalize(&signed_leaf.leaf.seal_id);
     Ok(OpenCtx { envelope, signed_leaf, sender_pub, shares, chain })
@@ -438,9 +448,9 @@ fn open_ctx(bundle_str: &str, shares_str: &str) -> std::result::Result<OpenCtx, 
 /// Step 1 of receiving media: open the MANIFEST only. Tells the app what the item is and
 /// which chunks to fetch. Writes the locked preview (if any) to `preview_out` so the app
 /// can show something while the chunks download.
-fn open_media_info_json(device_seed_hex: &str, bundle_str: &str, shares_str: &str, preview_out: &str) -> String {
+fn open_media_info_json(device_seed_hex: &str, bundle_str: &str, shares_str: &str, preview_out: &str, current_slot: i64) -> String {
     let recipient = sc::DeviceKey::from_seed(seed_from_hex(device_seed_hex));
-    let ctx = match open_ctx(bundle_str, shares_str) {
+    let ctx = match open_ctx(bundle_str, shares_str, current_slot) {
         Ok(c) => c,
         Err(e) => return e,
     };
@@ -480,9 +490,10 @@ fn open_media_file_json(
     shares_str: &str,
     chunk_dir: &str,
     out_path: &str,
+    current_slot: i64,
 ) -> String {
     let recipient = sc::DeviceKey::from_seed(seed_from_hex(device_seed_hex));
-    let ctx = match open_ctx(bundle_str, shares_str) {
+    let ctx = match open_ctx(bundle_str, shares_str, current_slot) {
         Ok(c) => c,
         Err(e) => return e,
     };
@@ -662,8 +673,8 @@ pub unsafe extern "C" fn ss_seal_shippable(
 /// # Safety
 /// All arguments must be null or valid NUL-terminated C strings.
 #[no_mangle]
-pub unsafe extern "C" fn ss_open_received(device_seed: *const c_char, bundle: *const c_char, shares: *const c_char) -> *mut c_char {
-    to_c(open_received_json(&cstr(device_seed), &cstr(bundle), &cstr(shares)))
+pub unsafe extern "C" fn ss_open_received(device_seed: *const c_char, bundle: *const c_char, shares: *const c_char, current_slot: i64) -> *mut c_char {
+    to_c(open_received_json(&cstr(device_seed), &cstr(bundle), &cstr(shares), current_slot))
 }
 
 /// Seal a media FILE. Chunks land in `out_dir` named by hash; returns `{bundle, shares, chunks}`.
@@ -714,8 +725,9 @@ pub unsafe extern "C" fn ss_open_media_info(
     bundle: *const c_char,
     shares: *const c_char,
     preview_out: *const c_char,
+    current_slot: i64,
 ) -> *mut c_char {
-    to_c(open_media_info_json(&cstr(device_seed), &cstr(bundle), &cstr(shares), &cstr(preview_out)))
+    to_c(open_media_info_json(&cstr(device_seed), &cstr(bundle), &cstr(shares), &cstr(preview_out), current_slot))
 }
 
 /// Media step 2: reassemble the downloaded chunks into `out_path`.
@@ -729,8 +741,9 @@ pub unsafe extern "C" fn ss_open_media_file(
     shares: *const c_char,
     chunk_dir: *const c_char,
     out_path: *const c_char,
+    current_slot: i64,
 ) -> *mut c_char {
-    to_c(open_media_file_json(&cstr(device_seed), &cstr(bundle), &cstr(shares), &cstr(chunk_dir), &cstr(out_path)))
+    to_c(open_media_file_json(&cstr(device_seed), &cstr(bundle), &cstr(shares), &cstr(chunk_dir), &cstr(out_path), current_slot))
 }
 
 /// Free a string returned by any `ss_*` function. Safe on null.
@@ -1036,11 +1049,12 @@ pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeOpenReceived<'l
     device_seed: JString<'local>,
     bundle: JString<'local>,
     shares: JString<'local>,
+    current_slot: jni::sys::jlong,
 ) -> jstring {
     let ds = jstr(&mut env, &device_seed);
     let b = jstr(&mut env, &bundle);
     let s = jstr(&mut env, &shares);
-    ret(env, open_received_json(&ds, &b, &s))
+    ret(env, open_received_json(&ds, &b, &s, current_slot as i64))
 }
 
 #[no_mangle]
@@ -1085,12 +1099,13 @@ pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeOpenMediaInfo<'
     bundle: JString<'local>,
     shares: JString<'local>,
     preview_out: JString<'local>,
+    current_slot: jni::sys::jlong,
 ) -> jstring {
     let ds = jstr(&mut env, &device_seed);
     let b = jstr(&mut env, &bundle);
     let s = jstr(&mut env, &shares);
     let p = jstr(&mut env, &preview_out);
-    ret(env, open_media_info_json(&ds, &b, &s, &p))
+    ret(env, open_media_info_json(&ds, &b, &s, &p, current_slot as i64))
 }
 
 #[no_mangle]
@@ -1102,13 +1117,14 @@ pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeOpenMediaFile<'
     shares: JString<'local>,
     chunk_dir: JString<'local>,
     out_path: JString<'local>,
+    current_slot: jni::sys::jlong,
 ) -> jstring {
     let ds = jstr(&mut env, &device_seed);
     let b = jstr(&mut env, &bundle);
     let s = jstr(&mut env, &shares);
     let cd = jstr(&mut env, &chunk_dir);
     let op = jstr(&mut env, &out_path);
-    ret(env, open_media_file_json(&ds, &b, &s, &cd, &op))
+    ret(env, open_media_file_json(&ds, &b, &s, &cd, &op, current_slot as i64))
 }
 
 #[cfg(test)]
@@ -1148,11 +1164,11 @@ mod tests {
             let _ = seal_to_json(s, s, false);
             let _ = seal_shippable_json(s, s, s, s, true, 0, 0, 0);
             let _ = card_for_json(s, s, s);
-            let _ = open_received_json(s, s, s);
+            let _ = open_received_json(s, s, s, 0);
             // the media entry points take PATHS from the platform — equally untrusted
             let _ = seal_media_file_json(s, s, s, s, s, s, s, s, s, false, 0, 0, 0);
-            let _ = open_media_info_json(s, s, s, s);
-            let _ = open_media_file_json(s, s, s, s, s);
+            let _ = open_media_info_json(s, s, s, s, 0);
+            let _ = open_media_file_json(s, s, s, s, s, 0);
         }
     }
 
@@ -1211,7 +1227,7 @@ mod tests {
 
         // step 1: the manifest tells the recipient what to fetch
         let info: Value =
-            serde_json::from_str(&open_media_info_json(bob["device_seed"].as_str().unwrap(), &bundle, &shares, &tmp.join("pv.out")))
+            serde_json::from_str(&open_media_info_json(bob["device_seed"].as_str().unwrap(), &bundle, &shares, &tmp.join("pv.out"), 0))
                 .unwrap();
         assert_eq!(info["ok"], true, "{info}");
         assert_eq!(info["mime_type"], "image/jpeg");
@@ -1229,6 +1245,7 @@ mod tests {
             &shares,
             &chunks_dir,
             &out,
+            0,
         ))
         .unwrap();
         assert_eq!(done["ok"], true, "{done}");
@@ -1259,6 +1276,7 @@ mod tests {
                 &m["bundle"].to_string(),
                 &m["shares"].to_string(),
                 "",
+                0,
             ))
             .unwrap()
         };
@@ -1314,6 +1332,7 @@ mod tests {
             bob["device_seed"].as_str().unwrap(),
             &sealed["bundle"].to_string(),
             &sealed["shares"].to_string(),
+            0,
         ))
         .unwrap();
         assert_eq!(opened["ok"], false, "text path must refuse a media seal: {opened}");
@@ -1353,7 +1372,7 @@ mod tests {
 
         // an item addressed to Bob must not open for Mallory, even holding every chunk
         let bad: Value =
-            serde_json::from_str(&open_media_info_json(mallory["device_seed"].as_str().unwrap(), &bundle, &shares, "")).unwrap();
+            serde_json::from_str(&open_media_info_json(mallory["device_seed"].as_str().unwrap(), &bundle, &shares, "", 0)).unwrap();
         assert_eq!(bad["ok"], false, "media opened for the wrong device: {bad}");
 
         // and a chunk the relay never served fails rather than yielding a truncated file
@@ -1365,6 +1384,7 @@ mod tests {
             &shares,
             &chunks_dir,
             &tmp.join("out.bin"),
+            0,
         ))
         .unwrap();
         assert_eq!(missing["ok"], false);
@@ -1416,14 +1436,14 @@ mod tests {
         let bundle = ship["bundle"].to_string();
         let shares = ship["shares"].to_string();
 
-        let opened: Value = serde_json::from_str(&open_received_json(device_seed, &bundle, &shares)).unwrap();
+        let opened: Value = serde_json::from_str(&open_received_json(device_seed, &bundle, &shares, 0)).unwrap();
         assert_eq!(opened["ok"], true, "should open: {opened}");
         assert_eq!(opened["plaintext"], "meet at 9");
 
         // the wrong device seed must NOT open it.
         let mallory: Value = serde_json::from_str(&new_identity_json("Mallory")).unwrap();
         let wrong_seed = mallory["device_seed"].as_str().unwrap();
-        let denied: Value = serde_json::from_str(&open_received_json(wrong_seed, &bundle, &shares)).unwrap();
+        let denied: Value = serde_json::from_str(&open_received_json(wrong_seed, &bundle, &shares, 0)).unwrap();
         assert_eq!(denied["ok"], false, "wrong device must be denied: {denied}");
     }
 
@@ -1437,19 +1457,19 @@ mod tests {
 
         // reveal_at in the future -> LOCKED even with the shares in hand.
         let s1: Value = serde_json::from_str(&seal_shippable_json(aseed, acard, dp, "future", false, now + 3600, 0, 0)).unwrap();
-        let o1: Value = serde_json::from_str(&open_received_json(ds, &s1["bundle"].to_string(), &s1["shares"].to_string())).unwrap();
+        let o1: Value = serde_json::from_str(&open_received_json(ds, &s1["bundle"].to_string(), &s1["shares"].to_string(), 0)).unwrap();
         assert_eq!(o1["ok"], false);
         assert_eq!(o1["reason"], "locked");
 
         // destroy_at in the past -> DESTROYED, unopenable.
         let s2: Value = serde_json::from_str(&seal_shippable_json(aseed, acard, dp, "gone", false, 0, now - 10, 0)).unwrap();
-        let o2: Value = serde_json::from_str(&open_received_json(ds, &s2["bundle"].to_string(), &s2["shares"].to_string())).unwrap();
+        let o2: Value = serde_json::from_str(&open_received_json(ds, &s2["bundle"].to_string(), &s2["shares"].to_string(), 0)).unwrap();
         assert_eq!(o2["ok"], false);
         assert_eq!(o2["reason"], "destroyed");
 
         // a window that is open right now -> opens fine.
         let s3: Value = serde_json::from_str(&seal_shippable_json(aseed, acard, dp, "now", false, now - 10, now + 3600, 0)).unwrap();
-        let o3: Value = serde_json::from_str(&open_received_json(ds, &s3["bundle"].to_string(), &s3["shares"].to_string())).unwrap();
+        let o3: Value = serde_json::from_str(&open_received_json(ds, &s3["bundle"].to_string(), &s3["shares"].to_string(), 0)).unwrap();
         assert_eq!(o3["ok"], true, "open window should open: {o3}");
         assert_eq!(o3["plaintext"], "now");
     }

@@ -56,7 +56,10 @@ char *ss_seal_shippable(const char *identity_seed, const char *sender_card, cons
 
 /* Open a message COLLECTED from the services:
  *   { ok, plaintext }  or  { ok:false, reason }  (device_seed = recipient's stored seed). */
-char *ss_open_received(const char *device_seed, const char *bundle, const char *shares);
+/* current_slot = the chain's finalised slot right now, or 0 if unknown. Non-zero lets the
+ * recipient check the seal's signed slot floor against REAL finality instead of taking the
+ * gateways' release as proof. */
+char *ss_open_received(const char *device_seed, const char *bundle, const char *shares, long long current_slot);
 
 /* ── media ────────────────────────────────────────────────────────────────────
  * Media crosses this boundary as FILE PATHS, never as bytes: pushing a 40 MB video
@@ -83,14 +86,14 @@ char *ss_seal_media_file(const char *identity_seed, const char *sender_card, con
  *   { ok, mime_type, kind, plaintext_size, chunk_count, chunks:[hash], width, height, duration_ms }
  * Writes the locked preview to preview_out when the item carries one ("" to skip). */
 char *ss_open_media_info(const char *device_seed, const char *bundle, const char *shares,
-                         const char *preview_out);
+                         const char *preview_out, long long current_slot);
 
 /* Media step 2 — with every chunk downloaded into chunk_dir (each file named by its hex hash,
  * exactly as ss_open_media_info listed), decrypt and reassemble into out_path:
  *   { ok, out_path, mime_type, kind, bytes }  or  { ok:false, reason }.
  * A missing or altered chunk fails here rather than producing a corrupt file. */
 char *ss_open_media_file(const char *device_seed, const char *bundle, const char *shares,
-                         const char *chunk_dir, const char *out_path);
+                         const char *chunk_dir, const char *out_path, long long current_slot);
 
 /* Free a string returned by any ss_* function. Safe on NULL. */
 void ss_free(char *ptr);
