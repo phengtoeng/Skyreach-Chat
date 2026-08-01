@@ -21,11 +21,12 @@ denvion-splitseal/
 │                 (XChaCha20-Poly1305 · Ed25519 · X25519 HPKE · BLAKE3 · Shamir t/n)
 ├─ seal-core/     DSCP-1 objects, client state machine, mock WCAHT seal chain,
 │                 gateways (strict post-finality release), sender/recipient flows,
-│                 + threat-model tests
+│                 sealed MEDIA (chunked + encrypted manifest), + threat-model tests
 ├─ seal-ffi/      C ABI (iOS/Swift) + JNI (Android/Kotlin) over seal-core + on-device demo
 ├─ wcaht-seal-sdk/ REAL WCAHT integration — live finality read + anchor-tx signer
 │                 (WcahtSealChain implements seal_core::SealChain) + HTTP payload-
-│                 prefetch delivery relay (ciphertext-only store-and-forward)
+│                 prefetch delivery relay (ciphertext-only store-and-forward,
+│                 incl. the /blob media chunk store)
 ├─ ios-app/       NATIVE SwiftUI messenger (calls the C ABI)
 └─ android-app/   NATIVE Kotlin + Jetpack Compose messenger (calls JNI)
 ```
@@ -36,13 +37,15 @@ Both apps share the exact same Rust core; only the UI layer differs per platform
 
 ```bash
 cd denvion-splitseal
-cargo test          # 14 tests green: locked-until-finality + full threat matrix
+cargo test          # 45 tests green: locked-until-finality + full threat matrix + media
 ```
 
 The tests prove the core promise: nothing opens before a **finalised** seal **and**
 `t` released key shares, and every misuse is rejected — wrong recipient, altered
 ciphertext, replay, wrong chain id, expiry, revocation, and insufficient shares. A
-single gateway can be offline and a `t=2` item still opens.
+single gateway can be offline and a `t=2` item still opens. For media they also prove
+that a recipient holding **every** chunk still cannot open one before the gate, and that
+an altered or reordered chunk is refused.
 
 ## Two release modes (DSCP-2)
 
@@ -87,6 +90,51 @@ finalised? false   total prefetch+unlock ≈ 37 ms
 
 Well under the 250ms target — because the ciphertext was prefetched, the unlock at
 quorum time is a purely local crypto operation.
+
+## Sealed media — photos and video
+
+A photo or video is **never** carried in the envelope, and never rests anywhere readable.
+The envelope carries an **encrypted `MediaManifest`**; the pixels go out as separately
+encrypted chunks that the relay stores as opaque blobs. The chain sees only
+`manifest_root` — 32 bytes, with no filename, mime type, size, dimensions or thumbnail.
+
+```
+sender ──encrypted chunks────────▶ relay    PUT /blob/<ciphertext-hash>   (opaque)
+       ──encrypted manifest──────▶ relay    POST /inbox/<mailbox tag>
+       ──signed leaf────────────▶ WCAHT    manifest_root, 32 bytes
+       ──key shares─────────────▶ gateways encrypted to the recipient device
+```
+
+Every chunk key is a KDF subkey of `K_content`, which is Shamir-split across the gateways.
+So a recipient can pre-download an **entire video that stays cryptographically unopenable**
+until the release gate opens — the same gate that drives time-reveal and time-destroy. It
+isn't the app politely hiding a file it could show.
+
+The relay verifies the content address (bytes must hash to the name they claim), so it
+cannot substitute a chunk — and it holds no key, so it can never open one. Chunks default
+to 1 MiB, with per-chunk keys from a reviewed KDF so no (key, nonce) pair can repeat.
+
+```bash
+cargo run -p wcaht-seal-sdk --bin wcaht-seal-media-e2e   # relay + 3 gateways, over real HTTP
+```
+
+Measured run — the recipient downloads every byte *before* finality and still gets nothing:
+
+```
+1. Alice picks a 2.50 MiB image
+   sealed into 3 encrypted chunks; leaf carries manifest_root 153bd9be… and NOTHING else
+2. uploaded 3 chunks to the relay (it stores ciphertext it cannot open)
+   relay rejects a blob that doesn't match its hash → HTTP 400
+4. Bob downloads all 2621560 bytes of ciphertext BEFORE finality
+   → LOCKED: waiting for WCAHT finality (StrictSeal vault mode)
+5. seal FINALISED on WCAHT; 3 gateways released their shares
+6. decrypted + reassembled 2621440 bytes — byte-identical to Alice's file ✓
+7. a single flipped byte in chunk 1 → REFUSED: chunk 1 does not match its manifest hash
+```
+
+Verified on the live backbone (2026-08-01): a photo sent from the Android app round-tripped
+byte-identically through N5/N6/N7, with the relay's stored copy at **7.997 bits/byte entropy**
+and no image magic — indistinguishable from random.
 
 ### Gateway staking & slashing (on-chain)
 
@@ -178,7 +226,10 @@ open SplitSeal.xcodeproj
 
 `project.yml` already sets the bridging header, the `seal-ffi/include` header search path, and
 `-force_load` (which stops the linker dead-stripping the `ss_*` symbols), and runs
-`scripts/build_rust_ios.sh` as a prebuild step to compile + lipo the Rust core for the simulator.
+`scripts/build_rust_ios.sh` as a prebuild step. That script builds **two** static libs — a
+simulator lib (`libseal_ffi_sim.a`, x86_64 + arm64-sim) and a device one
+(`libseal_ffi_ios.a`, arm64) — because a simulator slice cannot run on a phone;
+`OTHER_LDFLAGS[sdk=…]` links whichever matches the active SDK.
 It also carries the Info.plist keys the app needs at runtime — `NSAppTransportSecurity ▸
 NSAllowsArbitraryLoads` (the backend is plain http), plus the camera and contacts usage
 descriptions. **Edit `project.yml`, not the generated project.**
@@ -186,14 +237,18 @@ descriptions. **Edit `project.yml`, not the generated project.**
 [XcodeGen]: https://github.com/yonaskolb/XcodeGen
 
 ### Run
-Launch on a simulator/device. A segmented control at the top switches the release mode:
+Launch on a simulator/device. The chat list has a floating bottom bar —
+**Contacts · Calls · Chats · Settings**, plus a search button. Inside a conversation, the
+lock/bolt button in the header switches the release mode for the next message:
 
-- **StrictSeal · vault** — the bubble renders **locked**, shows **Securing seal…**, then
-  **opens** once the (mock) WCAHT seal finalises and the gateways release shares
-  (`ss_run_demo`).
-- **FastSeal · instant** — the bubble opens on a **gateway pre-confirmation quorum**,
-  before finality (`ss_run_fast_demo`); the status chip reads *Awaiting gateway pre-confs*
-  → *Opened · pre-confirmed*.
+- **StrictSeal · vault** (lock) — the bubble renders **locked** and shows
+  **Waiting for finality**, then opens once the WCAHT seal finalises and the gateways
+  release their shares.
+- **FastSeal · instant** (bolt) — the bubble opens on a **gateway pre-confirmation quorum**,
+  before finality; the chip reads *Waiting for pre-confirms*.
+
+The clock button sets a one-shot **time-reveal / time-destroy** window on the next message,
+and the camera button seals a **photo or video** (§ Sealed media).
 
 Both flows execute in the shared Rust core, on-device, identically on iOS and Android.
 
@@ -204,9 +259,13 @@ Both flows execute in the shared Rust core, on-device, identically on iOS and An
 - **No homemade crypto** — everything is in `seal-crypto` over audited crates (spec §7.1).
 - **Wallet keys ≠ chat keys** — chat identity/device keys are independent of any WCAHT wallet.
 - **Off-chain content, on-chain commitment** — the chain only ever sees the seal leaf/root, never plaintext.
+- **Media is opaque to every server** — the relay stores ciphertext chunks it cannot open, and
+  the chain never learns the mime type, size, filename or thumbnail.
 - ⚠️ **Not production-ready:** needs an independent crypto/protocol audit, real (not mock)
   WCAHT finality, and hardened key storage before any real use. Do not make “unbreakable”
   or legal-enforceability claims (spec §25).
+- ⚠️ **iOS media UI is written but has never been compiled** — there is no Mac in the loop
+  that produced it. Build it before trusting it.
 
 ## Roadmap (what's next, on top of this core)
 
@@ -214,7 +273,7 @@ Both flows execute in the shared Rust core, on-device, identically on iOS and An
 |---|---|
 | 2 ▸ *started* | ✅ `wcaht-seal-sdk`: live finality read + `WcahtSealChain` (real `SealChain`, verified end-to-end); ✅ byte-exact `TX::v2` anchor signer. ▸ remaining: submit the anchor tx from a funded gateway account (API key), 3 independent seal-gateway services, delivery-relay service, device linking + proof screen |
 | 2+ ▸ **done** | ✅ **DSCP-2** protocol: `SealMode` on the leaf, slashable `PreConfirmation`s, mode-aware `try_open_dscp2`, equivocation → `SlashingEvidence`. ✅ **payload-prefetch delivery relay** (ciphertext-only HTTP; FastSeal e2e ~37ms, no finality). ✅ **gateway staking/slashing** (`GatewayRegistry` + on-chain stake/slash anchors — full loop verified live). ✅ **StrictSeal/FastSeal UI toggle** in both native apps |
-| 3 | Real multi-gateway + delivery-relay services in production, device linking + proof screen, media (encrypted chunked images/voice/docs), MLS groups, `CALL_SESSION` live calls, 24h soak + external audit |
+| 3 ▸ *started* | ✅ **sealed media** — chunked + encrypted manifest, `manifest_root` on-chain, `/blob` store on the live relays (N5/N6/N7), photo+video send/receive in the Android app. ▸ remaining: production multi-gateway services, device linking + proof screen, voice notes/documents, blob GC after `destroy_at`, MLS groups, `CALL_SESSION` live calls, 24h soak + external audit |
 
 The core here is written so FastSeal slots in as an alternative release gate without
 rewriting the client protocol.
