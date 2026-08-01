@@ -26,6 +26,7 @@ object SealCore {
         fast: Boolean, revealAt: Long, destroyAt: Long, currentSlot: Long,
     ): String
     private external fun nativeOpenMediaInfo(deviceSeed: String, bundle: String, shares: String, previewOut: String, currentSlot: Long): String
+    private external fun nativeVerifyAnchor(bundle: String, txJson: String): String
     private external fun nativeOpenMediaFile(deviceSeed: String, bundle: String, shares: String, chunkDir: String, outPath: String, currentSlot: Long): String
 
     /** `{ "protocol":"DSCP-2", "version":2, "chain_id":7789 }` */
@@ -85,6 +86,15 @@ object SealCore {
     ): String = nativeSealMediaFile(
         identitySeed, senderCard, devicePub, inPath, mime, kind, caption, previewPath, outDir, fast, revealAt, destroyAt, currentSlot,
     )
+
+    /**
+     * Verify a REAL on-chain anchor against a bundle's own leaf: `{ok, anchor_slot}`.
+     * `txJson` is the body of `GET /transaction/<anchor_sig>` from a WCAHT node. The anchor
+     * commits the leaf hash as the recipient address, so a confirmed tx paying that address is
+     * the chain attesting that this leaf existed by that slot — checked against bytes the
+     * recipient already holds, trusting neither the relay nor the gateways.
+     */
+    fun verifyAnchor(bundle: String, txJson: String): String = nativeVerifyAnchor(bundle, txJson)
 
     /**
      * Media step 1 — open the MANIFEST only, to learn what the item is and which chunks to

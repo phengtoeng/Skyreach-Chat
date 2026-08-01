@@ -95,6 +95,13 @@ char *ss_open_media_info(const char *device_seed, const char *bundle, const char
 char *ss_open_media_file(const char *device_seed, const char *bundle, const char *shares,
                          const char *chunk_dir, const char *out_path, long long current_slot);
 
+/* Verify a REAL on-chain anchor against the bundle's own leaf: { ok, anchor_slot } or
+ * { ok:false, reason }. `tx_json` is the body of GET /transaction/<anchor_sig> from a WCAHT
+ * node. anchor_tx commits the leaf hash AS the recipient address, so a confirmed transaction
+ * paying that address is the chain attesting that THIS leaf existed by that slot — inclusion
+ * the recipient checks itself, rather than taking a gateway's word that finality happened. */
+char *ss_verify_anchor(const char *bundle, const char *tx_json);
+
 /* Free a string returned by any ss_* function. Safe on NULL. */
 void ss_free(char *ptr);
 

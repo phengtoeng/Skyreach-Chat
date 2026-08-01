@@ -532,6 +532,48 @@ fn open_media_file_json(
     .to_string()
 }
 
+/// Verify a real on-chain anchor against the bundle's OWN leaf.
+///
+/// The app fetches `GET /transaction/<anchor_sig>` from a WCAHT node and hands the JSON here.
+/// We recompute the leaf hash from the signed leaf we already hold and require the anchor's
+/// destination address to equal it — `anchor_tx` commits the leaf hash AS the recipient
+/// address, so a confirmed tx paying that address is the chain attesting that THIS leaf
+/// existed by that slot.
+///
+/// Returns `{ ok:true, anchor_slot }` or `{ ok:false, reason }`. Nothing here trusts the
+/// relay or the gateways: the binding is between bytes the recipient already has and a
+/// transaction the chain confirmed.
+fn verify_anchor_json(bundle_str: &str, tx_json: &str) -> String {
+    let Ok(bundle): Result<Value, _> = serde_json::from_str(bundle_str) else {
+        return json!({ "ok": false, "reason": "bad bundle" }).to_string();
+    };
+    let signed_leaf: Option<SignedLeaf> =
+        serde_json::from_value(bundle.get("signed_leaf").cloned().unwrap_or(Value::Null)).ok();
+    let Some(signed_leaf) = signed_leaf else {
+        return json!({ "ok": false, "reason": "bundle has no signed leaf" }).to_string();
+    };
+    let Ok(tx): Result<Value, _> = serde_json::from_str(tx_json) else {
+        return json!({ "ok": false, "reason": "bad transaction json" }).to_string();
+    };
+    if tx.get("status").and_then(Value::as_str) != Some("confirmed") {
+        return json!({ "ok": false, "reason": "anchor not confirmed" }).to_string();
+    }
+    let Some(dest) = tx
+        .pointer("/transaction/message/instructions/0/parsed/info/destination")
+        .and_then(Value::as_str)
+    else {
+        return json!({ "ok": false, "reason": "anchor tx has no destination" }).to_string();
+    };
+    let want = bs58::encode(signed_leaf.leaf.leaf_hash()).into_string();
+    if dest != want {
+        return json!({ "ok": false, "reason": "anchor commits a different leaf" }).to_string();
+    }
+    match tx.get("slot").and_then(Value::as_u64) {
+        Some(slot) => json!({ "ok": true, "anchor_slot": slot }).to_string(),
+        None => json!({ "ok": false, "reason": "anchor has no slot yet" }).to_string(),
+    }
+}
+
 /// Privacy-preserving directory key for a phone number (never the raw number, never
 /// on-chain). `hash(normalized phone)` — what resolves to a WCAHT address in the directory.
 fn phone_commitment_json(phone: &str) -> String {
@@ -744,6 +786,15 @@ pub unsafe extern "C" fn ss_open_media_file(
     current_slot: i64,
 ) -> *mut c_char {
     to_c(open_media_file_json(&cstr(device_seed), &cstr(bundle), &cstr(shares), &cstr(chunk_dir), &cstr(out_path), current_slot))
+}
+
+/// Verify an on-chain anchor against a bundle's leaf: `{ ok, anchor_slot }`.
+///
+/// # Safety
+/// All arguments must be null or valid NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn ss_verify_anchor(bundle: *const c_char, tx_json: *const c_char) -> *mut c_char {
+    to_c(verify_anchor_json(&cstr(bundle), &cstr(tx_json)))
 }
 
 /// Free a string returned by any `ss_*` function. Safe on null.
@@ -1127,6 +1178,18 @@ pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeOpenMediaFile<'
     ret(env, open_media_file_json(&ds, &b, &s, &cd, &op, current_slot as i64))
 }
 
+#[no_mangle]
+pub extern "system" fn Java_com_denvion_splitseal_SealCore_nativeVerifyAnchor<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    bundle: JString<'local>,
+    tx_json: JString<'local>,
+) -> jstring {
+    let b = jstr(&mut env, &bundle);
+    let t = jstr(&mut env, &tx_json);
+    ret(env, verify_anchor_json(&b, &t))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1299,6 +1362,57 @@ mod tests {
         let r = info(&live);
         assert_eq!(r["ok"], true, "media inside its window must open: {r}");
         assert_eq!(r["mime_type"], "image/jpeg");
+    }
+
+    /// The exact JSON shape a WCAHT node returns from GET /transaction/<sig>.
+    fn anchor_tx_json(destination: &str, slot: u64, status: &str) -> String {
+        serde_json::json!({
+            "status": status,
+            "slot": slot,
+            "transaction": {
+                "message": {
+                    "instructions": [{
+                        "parsed": { "type": "transfer", "info": { "destination": destination } }
+                    }]
+                }
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn an_anchor_is_verified_against_the_recipients_own_leaf() {
+        let alice: Value = serde_json::from_str(&new_identity_json("Alice")).unwrap();
+        let bob: Value = serde_json::from_str(&new_identity_json("Bob")).unwrap();
+        let ship: Value = serde_json::from_str(&seal_shippable_json(
+            alice["identity_seed"].as_str().unwrap(),
+            alice["card"].as_str().unwrap(),
+            bob["device_pub"].as_str().unwrap(),
+            "anchored", false, 0, 0, 0,
+        ))
+        .unwrap();
+        let bundle = ship["bundle"].to_string();
+
+        // the leaf hash the RECIPIENT computes from bytes it already holds
+        let leaf: SignedLeaf =
+            serde_json::from_value(ship["bundle"]["signed_leaf"].clone()).unwrap();
+        let addr = bs58::encode(leaf.leaf.leaf_hash()).into_string();
+
+        // a confirmed tx paying exactly that address verifies, and yields its slot
+        let ok: Value = serde_json::from_str(&verify_anchor_json(&bundle, &anchor_tx_json(&addr, 4242, "confirmed"))).unwrap();
+        assert_eq!(ok["ok"], true, "{ok}");
+        assert_eq!(ok["anchor_slot"], 4242);
+
+        // an anchor for SOME OTHER leaf does not verify this one
+        let other = bs58::encode([7u8; 32]).into_string();
+        let bad: Value = serde_json::from_str(&verify_anchor_json(&bundle, &anchor_tx_json(&other, 4242, "confirmed"))).unwrap();
+        assert_eq!(bad["ok"], false);
+        assert_eq!(bad["reason"], "anchor commits a different leaf");
+
+        // and an unconfirmed one is not proof of anything yet
+        let pending: Value = serde_json::from_str(&verify_anchor_json(&bundle, &anchor_tx_json(&addr, 0, "pending"))).unwrap();
+        assert_eq!(pending["ok"], false);
+        assert_eq!(pending["reason"], "anchor not confirmed");
     }
 
     #[test]

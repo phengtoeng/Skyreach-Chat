@@ -1044,6 +1044,7 @@ dependencies = [
 name = "seal-ffi"
 version = "0.1.0"
 dependencies = [
+ "bs58",
  "hex",
  "jni",
  "seal-core",

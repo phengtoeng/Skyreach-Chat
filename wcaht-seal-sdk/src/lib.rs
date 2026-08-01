@@ -282,6 +282,35 @@ impl WcahtSealChain {
         &self.rpc
     }
 
+    /// Verify a real on-chain anchor and return the slot it confirmed in.
+    ///
+    /// This is inclusion verification, not a promise: `anchor_tx` commits the leaf hash AS the
+    /// recipient address, so a confirmed transaction whose destination equals `base58(leaf_hash)`
+    /// is the chain itself attesting that THIS exact leaf existed by that slot. The caller can
+    /// then gate opening on the chain having finalised past it, instead of trusting a gateway's
+    /// word that finality happened.
+    ///
+    /// Returns `Ok(None)` when the anchor is unknown or not yet confirmed.
+    pub fn verify_anchor(&self, leaf_hash: &[u8; 32], signature: &str) -> Result<Option<u64>> {
+        let v = match self.rpc.transaction(signature) {
+            Ok(v) => v,
+            Err(_) => return Ok(None), // not found / not yet confirmed
+        };
+        if v.get("status").and_then(|s| s.as_str()) != Some("confirmed") {
+            return Ok(None);
+        }
+        let dest = v
+            .pointer("/transaction/message/instructions/0/parsed/info/destination")
+            .and_then(|d| d.as_str())
+            .ok_or_else(|| anyhow!("anchor tx has no destination"))?;
+        // THE binding: the address the anchor paid IS the leaf hash. A tx for some other leaf,
+        // however well-formed, does not verify this one.
+        if dest != bs58::encode(leaf_hash).into_string() {
+            return Err(anyhow!("anchor tx does not commit this leaf"));
+        }
+        Ok(v.get("slot").and_then(|s| s.as_u64()))
+    }
+
     /// Record an on-chain anchor. Call AFTER the anchor tx is accepted. `leaf_hash`
     /// must equal `signed_leaf.leaf.leaf_hash()`.
     pub fn record_anchor(&self, seal_id: [u8; 32], leaf_hash: [u8; 32]) -> Result<()> {

@@ -95,6 +95,15 @@ enum SealCore {
         chunkDir.withCString { c in outPath.withCString { o in copy(ss_open_media_file(s, b, sh, c, o, currentSlot)) } } } } }
     }
 
+    /// Verify a REAL on-chain anchor against a bundle's own leaf: `{ok, anchor_slot}`.
+    /// `txJson` is the body of `GET /transaction/<anchor_sig>` from a WCAHT node. The anchor
+    /// commits the leaf hash as the recipient address, so a confirmed tx paying that address
+    /// is the chain attesting that this leaf existed by that slot — checked here against bytes
+    /// the recipient already holds, trusting neither the relay nor the gateways.
+    static func verifyAnchor(_ bundle: String, _ txJson: String) -> String {
+        bundle.withCString { b in txJson.withCString { t in copy(ss_verify_anchor(b, t)) } }
+    }
+
     /// Copy a Rust-owned C string into a Swift String and free the original.
     private static func copy(_ ptr: UnsafeMutablePointer<CChar>?) -> String {
         guard let ptr = ptr else { return "{}" }

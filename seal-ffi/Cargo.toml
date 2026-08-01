@@ -15,5 +15,6 @@ seal-core = { path = "../seal-core" }
 seal-crypto = { path = "../seal-crypto" }
 serde_json = "1"
 hex = "0.4"
+bs58 = "0.5" # anchor addresses are base58, same encoding as a WCAHT address
 # JNI bridge for the native Android (Kotlin) app. Swift/iOS uses the C ABI directly.
 jni = "0.21"
