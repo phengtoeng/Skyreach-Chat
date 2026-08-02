@@ -765,7 +765,9 @@ private fun App(proto: String) {
                         }
                     }
                     if (store.addInbox(myTag, sealId, text, sender)) {
-                        store.addThreadMsg(sender, sealId, text, true)
+                        // Carry the destroy deadline, or a self-destructing text received while
+                        // the chat is closed is persisted with destroyAt = 0 and never burns.
+                        store.addThreadMsg(sender, sealId, text, true, destroyAt = bundle.optLong("destroy_at"))
                         notifyMessage(ctx, senderName, text)
                     }
                 }
@@ -1771,10 +1773,15 @@ private fun ConversationScreen(
                     seen.add(sealId)
                     val text = opened.optString("plaintext")
                     val sender = bundle.optString("sender_id_pub") // sender's stable identity_pub
+                    // Carry the destroy deadline across, exactly as the media path above does.
+                    // Without this the recipient's copy of a self-destructing TEXT message lands
+                    // with destroyAt = 0 and never burns — the countdown only ever ran on the
+                    // sender's side, so "self-destruct" silently did nothing for text.
+                    val dz = bundle.optLong("destroy_at")
                     // dedup on the opened seal, persist to the sender's transcript, show if it's THIS chat.
                     // Persist once (addInbox is a one-shot dedup) …
                     if (store.addInbox(myTag, sealId, text, sender)) {
-                        store.addThreadMsg(sender, sealId, text, true)
+                        store.addThreadMsg(sender, sealId, text, true, destroyAt = dz)
                     }
                     // … but decide the on-screen append SEPARATELY. The chat-list poll and this
                     // conversation poll both run, and if the list one persists the message first
@@ -1785,7 +1792,7 @@ private fun ConversationScreen(
                         "opened ${sealId.take(12)} sender=${sender.take(12)} chatPeer=${chat.identityPub.take(12)} match=${sender == chat.identityPub}"
                     )
                     if (sender == chat.identityPub && messages.none { it.sealId == sealId }) {
-                        messages.add(Msg(System.nanoTime(), text, true, now(), state = State.OPENED, sealId = sealId))
+                        messages.add(Msg(System.nanoTime(), text, true, now(), state = State.OPENED, destroyAt = dz, sealId = sealId))
                         listState.animateScrollToItem(messages.lastIndex)
                         android.util.Log.i("SealPoll", "APPENDED to open conversation")
                     }

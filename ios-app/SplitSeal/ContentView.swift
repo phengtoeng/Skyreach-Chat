@@ -768,7 +768,10 @@ struct ContentView: View {
                         }
                     }
                     if Store.addInbox(tag, sealId, plain, sender) {
-                        Store.addThreadMsg(sender, sealId, plain, true)
+                        // Carry the destroy deadline, or a self-destructing text received while
+                        // the chat is closed is persisted with destroyAt = 0 and never burns.
+                        Store.addThreadMsg(sender, sealId, plain, true,
+                                           destroyAt: (bmap?["destroy_at"] as? NSNumber)?.int64Value ?? 0)
                         notifyMessage(senderName, plain)
                     }
                 }
@@ -1674,16 +1677,21 @@ struct ConversationView: View {
             if let r = (try? JSONSerialization.jsonObject(with: Data(openStr.utf8))) as? [String: Any],
                (r["ok"] as? Bool) == true, let plain = r["plaintext"] as? String {
                 seen.insert(sealId)
+                // Carry the destroy deadline across, exactly as the media path above does.
+                // Without it the recipient's copy of a self-destructing TEXT lands with
+                // destroyAt = 0 and never burns — the countdown only ever ran on the sender.
+                let dz = ((item["bundle"] as? [String: Any])?["destroy_at"] as? NSNumber)?.int64Value ?? 0
                 // Persist once (addInbox is a one-shot dedup) …
                 if Store.addInbox(myTag, sealId, plain, sender) {
-                    Store.addThreadMsg(sender, sealId, plain, true)
+                    Store.addThreadMsg(sender, sealId, plain, true, destroyAt: dz)
                 }
                 // … but decide the on-screen append SEPARATELY. The chat-list poll and this one
                 // both run, and if the list persists the message first it eats the dedup — so
                 // gating the UI on addInbox() meant the bubble never appeared until the user
                 // left the chat and came back.
                 if sender == chat.identityPub, !messages.contains(where: { $0.sealId == sealId }) {
-                    messages.append(Msg(text: plain, incoming: true, time: nowTime(), state: .opened, sealId: sealId))
+                    messages.append(Msg(text: plain, incoming: true, time: nowTime(), state: .opened,
+                                        destroyAt: dz, sealId: sealId))
                 }
             } else if let r = (try? JSONSerialization.jsonObject(with: Data(openStr.utf8))) as? [String: Any],
                       (r["reason"] as? String) == "destroyed" {
