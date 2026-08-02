@@ -161,6 +161,24 @@ private data class Msg(
     val sealId: String = "",
 )
 
+/** Give up opening a seal after this many *permanent* failures (see `openFailures`). Generous
+ *  enough that a blip never discards a real message, small enough that a dead seal stops eating
+ *  poll cycles within about a minute. */
+private const val MAX_OPEN_ATTEMPTS = 5
+
+/** True only when a seal can NEVER open, so it is safe to stop retrying it.
+ *
+ *  Being wrong in the "permanent" direction silently loses a real message, so this is a
+ *  whitelist of transient states rather than a blacklist: anything about the timelock, missing
+ *  key shares, or chain finality is a gate that will clear on its own and must keep retrying.
+ *  Only failures that no amount of waiting can fix — ciphertext we cannot decrypt, a malformed
+ *  or truncated bundle — count against the give-up budget. */
+private fun isPermanentOpenFailure(reason: String): Boolean {
+    val r = reason.lowercase()
+    val transient = listOf("locked", "share", "final", "pending", "quorum", "not yet", "await")
+    return transient.none { it in r }
+}
+
 private val CHATS = listOf(
     Chat("Maya", "See you tonight!", "9:41 AM", 2),
     Chat("Ethan", "That works for me.", "9:32 AM"),
@@ -1574,6 +1592,17 @@ private fun ConversationScreen(
         else runCatching { JSONObject(SealCore.mailboxTag(myDevicePub)).optString("mailbox_tag") }.getOrDefault("")
     }
     val seen = remember { mutableSetOf<String>() }
+    /** How many times each seal has been tried and failed to open.
+     *
+     *  A seal that cannot be opened — sealed to a device key we no longer hold, ciphertext we
+     *  can never decrypt — used to be retried on EVERY poll forever, because only a successful
+     *  open marks a seal `seen`. Each retry costs ~15 HTTP calls (shares, anchor, proof), so a
+     *  handful of dead seals at the front of the mailbox consumed every cycle and newly arrived
+     *  messages were never reached. The inbox looked frozen while the app was in fact busy.
+     *
+     *  So: give up after [MAX_OPEN_ATTEMPTS]. Timelocked and still-gathering seals are NOT
+     *  counted here — those `continue` earlier and must keep retrying until their window opens. */
+    val openFailures = remember { mutableMapOf<String, Int>() }
     val ctx = LocalContext.current
     val messages = remember {
         mutableStateListOf<Msg>().apply {
@@ -1623,11 +1652,13 @@ private fun ConversationScreen(
         if (!polling.compareAndSet(false, true)) return
         try {
             val items = withContext(Dispatchers.IO) { fetchInboxAll(myTag) }
+            android.util.Log.i("SealPoll", "poll: ${items.size} items in mailbox, seen=${seen.size}, onScreen=${messages.size}")
             val chainSlot = if (items.isEmpty()) 0L else withContext(Dispatchers.IO) { finalizedSlot() }
             for (item in items) {
                 val sealId = item.optString("seal_id")
                 val bundle = item.optJSONObject("bundle") ?: continue
                 if (sealId.isBlank() || sealId in seen) continue
+                android.util.Log.i("SealPoll", "processing ${sealId.take(12)}")
                 val shares = withContext(Dispatchers.IO) { collectShares(sealId) }
                 // If an anchor exists and contradicts this bundle, the bundle is not what was
                 // committed on-chain — drop it rather than opening it.
@@ -1699,7 +1730,26 @@ private fun ConversationScreen(
                             listState.animateScrollToItem(messages.lastIndex)
                         }
                     }
-                    continue // still locked / chunks not all there yet → retry on the next poll
+                    // Media that did NOT open this round. A timelocked item returned "locked"
+                    // above and already `continue`d, so reaching here with got == null means the
+                    // open genuinely failed (chunks missing, or ciphertext we can never decrypt).
+                    // Count it and give up eventually — otherwise one dead photo is retried on
+                    // every poll forever and starves the loop, which is exactly what jammed the
+                    // inbox: a single undecryptable media seal consumed every cycle.
+                    // `gate` above already told us WHY; only count reasons that can never clear.
+                    // A photo still gathering chunks or shares must keep retrying.
+                    if (got == null) {
+                        val why = gate?.optString("reason") ?: "no result"
+                        if (isPermanentOpenFailure(why)) {
+                            val n = (openFailures[sealId] ?: 0) + 1
+                            openFailures[sealId] = n
+                            if (n >= MAX_OPEN_ATTEMPTS) {
+                                seen.add(sealId)
+                                android.util.Log.w("SealPoll", "giving up on media ${sealId.take(12)} after $n: $why")
+                            }
+                        }
+                    }
+                    continue // still gathering chunks → retry on the next poll
                 }
 
                 val opened = runCatching {
@@ -1718,12 +1768,32 @@ private fun ConversationScreen(
                     // conversation poll both run, and if the list one persists the message first
                     // it eats the dedup — so gating the UI on addInbox() meant the bubble never
                     // appeared until the user left the chat and came back.
+                    android.util.Log.i(
+                        "SealPoll",
+                        "opened ${sealId.take(12)} sender=${sender.take(12)} chatPeer=${chat.identityPub.take(12)} match=${sender == chat.identityPub}"
+                    )
                     if (sender == chat.identityPub && messages.none { it.sealId == sealId }) {
                         messages.add(Msg(System.nanoTime(), text, true, now(), state = State.OPENED, sealId = sealId))
                         listState.animateScrollToItem(messages.lastIndex)
+                        android.util.Log.i("SealPoll", "APPENDED to open conversation")
                     }
                 } else if (opened?.optString("reason") == "destroyed") {
                     seen.add(sealId) // self-destructed before it was opened → stop retrying, never shows
+                } else {
+                    val why = opened?.optString("reason") ?: "no result"
+                    android.util.Log.i("SealPoll", "not opened ${sealId.take(12)}: $why")
+                    if (isPermanentOpenFailure(why)) {
+                        // Genuinely unopenable — count it and stop after a few. Otherwise one
+                        // undecryptable seal is retried every poll forever and starves the loop.
+                        val n = (openFailures[sealId] ?: 0) + 1
+                        openFailures[sealId] = n
+                        if (n >= MAX_OPEN_ATTEMPTS) {
+                            seen.add(sealId)
+                            android.util.Log.w("SealPoll", "giving up on ${sealId.take(12)} after $n: $why")
+                        }
+                    }
+                    // else: waiting on the timelock, on shares, or on finality — all transient.
+                    // Never count those; the message is fine and will open once the gate clears.
                 }
                 // timelocked ("locked") or shares still gathering → leave unseen; it opens when the window does
             }
