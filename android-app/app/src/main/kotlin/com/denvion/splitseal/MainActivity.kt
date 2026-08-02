@@ -2301,7 +2301,6 @@ private fun ConversationScreen(
     var showAttach by remember { mutableStateOf(false) }
     // "Full size" stages exactly like Photos does but skips the resize on the way out.
     var pendingOriginal by remember { mutableStateOf(false) }
-    val pickOriginal = rememberMediaPicker { uri -> pending = uri; pendingOriginal = true }
     // A document goes straight out: there is nothing to preview and nothing to caption.
     var pickedDoc by remember { mutableStateOf<android.net.Uri?>(null) }
     val pickDocument = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -2445,10 +2444,10 @@ private fun ConversationScreen(
             takePhoto.launch(u)
         },
         onDocument = { showAttach = false; pickDocument.launch(arrayOf("*/*")) },
-        onOriginal = {
-            showAttach = false
-            pickOriginal.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
-        },
+        // Tapping the roll stages the picture exactly as the picker does.
+        onPickRecent = { u -> showAttach = false; pending = u },
+        fullSize = pendingOriginal,
+        onFullSize = { pendingOriginal = it },
     )
 
     if (showTimer) TimedSealDialog(
@@ -2463,10 +2462,56 @@ private fun rememberMediaPicker(onPicked: (android.net.Uri) -> Unit) =
     rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri -> uri?.let(onPicked) }
 
 /**
+ * Newest items in the phone's camera roll, for the strip under the attachment tiles.
+ *
+ * Needs the media-read permission, which `PickVisualMedia` deliberately avoids — showing the
+ * roll inline is the thing that costs it. Returns empty when the permission is not granted, and
+ * the sheet shows an "allow" row instead.
+ */
+private fun recentMedia(ctx: Context, limit: Int = 60): List<android.net.Uri> {
+    // Query the Images and Video collections directly. The combined `Files` table looks like the
+    // tidier option but returns nothing under scoped storage, which is why the strip came up
+    // empty the first time.
+    fun collect(base: android.net.Uri, dateCol: String): List<Pair<Long, android.net.Uri>> {
+        val rows = mutableListOf<Pair<Long, android.net.Uri>>()
+        runCatching {
+            ctx.contentResolver.query(
+                base, arrayOf(android.provider.MediaStore.MediaColumns._ID, dateCol),
+                null, null, "$dateCol DESC",
+            )?.use { c ->
+                while (c.moveToNext() && rows.size < limit) {
+                    rows += c.getLong(1) to android.content.ContentUris.withAppendedId(base, c.getLong(0))
+                }
+            }
+        }
+        return rows
+    }
+    val images = collect(
+        android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+        android.provider.MediaStore.Images.Media.DATE_ADDED,
+    )
+    val videos = collect(
+        android.provider.MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+        android.provider.MediaStore.Video.Media.DATE_ADDED,
+    )
+    return (images + videos).sortedByDescending { it.first }.take(limit).map { it.second }
+}
+
+/** The permission that lets us list the camera roll ourselves, by platform version. */
+private val MEDIA_READ_PERMISSION =
+    if (android.os.Build.VERSION.SDK_INT >= 33) android.Manifest.permission.READ_MEDIA_IMAGES
+    else android.Manifest.permission.READ_EXTERNAL_STORAGE
+
+private fun hasMediaRead(ctx: Context) =
+    androidx.core.content.ContextCompat.checkSelfPermission(ctx, MEDIA_READ_PERMISSION) ==
+        android.content.pm.PackageManager.PERMISSION_GRANTED
+
+/**
  * The attachment sheet behind the composer's `+`.
  *
- * Only what actually works is on it. Location, Contact, Poll and Event each need a backend this
- * app does not have yet, and a tile that does nothing is worse than no tile.
+ * Photos, Camera and Document are wired. Location, Contact, Poll, Event and AI images are drawn
+ * because the sheet is meant to look like this, but each needs a backend the app does not have
+ * — they say so when tapped rather than failing silently.
  */
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
@@ -2474,21 +2519,108 @@ private fun AttachSheet(
     onPhotos: () -> Unit,
     onCamera: () -> Unit,
     onDocument: () -> Unit,
-    onOriginal: () -> Unit,
+    onPickRecent: (android.net.Uri) -> Unit,
+    fullSize: Boolean,
+    onFullSize: (Boolean) -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val ctx = LocalContext.current
+    var granted by remember { mutableStateOf(hasMediaRead(ctx)) }
+    var roll by remember { mutableStateOf(emptyList<android.net.Uri>()) }
+    val askMedia = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
+        granted = ok
+    }
+    LaunchedEffect(granted) {
+        roll = if (granted) withContext(Dispatchers.IO) { recentMedia(ctx) } else emptyList()
+    }
+    val soon = { what: String ->
+        android.widget.Toast.makeText(ctx, "$what isn't built yet", android.widget.Toast.LENGTH_SHORT).show()
+    }
+
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = Color.White) {
-        Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp).padding(bottom = 28.dp)) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+        Column(Modifier.fillMaxWidth()) {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
                 AttachTile(Icons.Filled.PhotoLibrary, "Photos", Color(0xFF2E9BF6), onPhotos)
-                AttachTile(Icons.Filled.PhotoCamera, "Camera", Color(0xFF5B6570), onCamera)
+                AttachTile(Icons.Filled.PhotoCamera, "Camera", Color(0xFF4A5560), onCamera)
+                AttachTile(Icons.Filled.LocationOn, "Location", Color(0xFF16B27A)) { soon("Location") }
+                AttachTile(Icons.Filled.AccountCircle, "Contact", Color(0xFF6B7784)) { soon("Contact") }
+            }
+            Spacer(Modifier.height(14.dp))
+            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
                 AttachTile(Icons.Filled.InsertDriveFile, "Document", Color(0xFF2E9BF6), onDocument)
-                AttachTile(Icons.Filled.HighQuality, "Full size", Color(0xFF7B61FF), onOriginal)
+                AttachTile(Icons.Filled.BarChart, "Poll", Color(0xFFF0A32E)) { soon("Polls") }
+                AttachTile(Icons.Filled.CalendarMonth, "Event", Color(0xFFE0403A)) { soon("Events") }
+                AttachTile(Icons.Filled.AutoAwesome, "AI images", Color(0xFF2E9BF6)) { soon("AI images") }
             }
             Spacer(Modifier.height(16.dp))
-            Text(
-                "Photos are resized for speed. \"Full size\" and \"Document\" send the original file, byte for byte.",
-                color = Sub, fontSize = 12.sp,
+            // Photos go out resized unless this is on; a document is always sent untouched.
+            Row(
+                Modifier.fillMaxWidth().clickable { onFullSize(!fullSize) }.padding(horizontal = 20.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    if (fullSize) Icons.Filled.CheckCircle else Icons.Filled.RadioButtonUnchecked,
+                    null, tint = if (fullSize) Blue else Sub, modifier = Modifier.size(19.dp),
+                )
+                Spacer(Modifier.width(9.dp))
+                Text("Send photos at full size", color = Ink, fontSize = 13.sp)
+            }
+            Spacer(Modifier.height(12.dp))
+
+            if (!granted) {
+                Row(
+                    Modifier.fillMaxWidth().clickable { askMedia.launch(MEDIA_READ_PERMISSION) }
+                        .padding(horizontal = 20.dp, vertical = 18.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Filled.PhotoLibrary, null, tint = Blue, modifier = Modifier.size(20.dp))
+                    Spacer(Modifier.width(10.dp))
+                    Text("Show my recent photos here", color = Blue, fontSize = 13.sp)
+                }
+            } else {
+                androidx.compose.foundation.lazy.grid.LazyVerticalGrid(
+                    columns = androidx.compose.foundation.lazy.grid.GridCells.Fixed(4),
+                    modifier = Modifier.fillMaxWidth().height(280.dp),
+                    horizontalArrangement = Arrangement.spacedBy(2.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    items(roll.size) { i -> RollThumb(roll[i]) { onPickRecent(roll[i]) } }
+                }
+            }
+        }
+    }
+}
+
+/** One camera-roll thumbnail. Decoded small, and only while it is on screen. */
+@Composable
+private fun RollThumb(uri: android.net.Uri, onClick: () -> Unit) {
+    val ctx = LocalContext.current
+    var bmp by remember(uri) { mutableStateOf<android.graphics.Bitmap?>(null) }
+    LaunchedEffect(uri) {
+        bmp = withContext(Dispatchers.IO) {
+            runCatching {
+                if (android.os.Build.VERSION.SDK_INT >= 29) {
+                    ctx.contentResolver.loadThumbnail(uri, android.util.Size(256, 256), null)
+                } else {
+                    // Pre-29 has no loadThumbnail; decode the file downsampled instead.
+                    ctx.contentResolver.openInputStream(uri)?.use { ins ->
+                        android.graphics.BitmapFactory.decodeStream(
+                            ins, null,
+                            android.graphics.BitmapFactory.Options().apply { inSampleSize = 8 },
+                        )
+                    }
+                }
+            }.getOrNull()
+        }
+    }
+    Box(
+        Modifier.aspectRatio(1f).background(Color(0xFFE3E9EF)).clickable(onClick = onClick),
+    ) {
+        bmp?.let {
+            Image(
+                bitmap = it.asImageBitmap(), contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = androidx.compose.ui.layout.ContentScale.Crop,
             )
         }
     }
@@ -2503,10 +2635,10 @@ private fun AttachTile(
 ) {
     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.clickable(onClick = onClick)) {
         Box(
-            Modifier.size(62.dp).clip(RoundedCornerShape(20.dp)).background(Color(0xFFF1F4F7)),
+            Modifier.size(60.dp).clip(RoundedCornerShape(20.dp)).background(Color(0xFFF1F4F7)),
             contentAlignment = Alignment.Center,
-        ) { Icon(icon, label, tint = tint, modifier = Modifier.size(28.dp)) }
-        Spacer(Modifier.height(7.dp))
+        ) { Icon(icon, label, tint = tint, modifier = Modifier.size(27.dp)) }
+        Spacer(Modifier.height(6.dp))
         Text(label, color = Ink, fontSize = 12.sp)
     }
 }
