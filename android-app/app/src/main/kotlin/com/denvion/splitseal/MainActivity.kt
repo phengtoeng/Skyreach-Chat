@@ -2616,17 +2616,24 @@ private fun MetaRow(m: Msg) {
             Spacer(Modifier.width(6.dp))
         }
         Text(m.time, color = Sub, fontSize = 11.sp)
-        // Delivery/read ticks on our own messages: grey = delivered, blue = the recipient has
-        // opened it and sent a receipt back. This used to be gated on `sealedFor == null`, but
-        // every real sent message carries a `sealedFor`, so the ticks only ever appeared on the
-        // demo thread — a real message could never show read status at all.
+        // Read status on our own messages: a grey R once delivered, blue once the recipient has
+        // opened it and sent a receipt back. An R rather than ticks, because ticks read as
+        // "delivered" in every other messenger and this is specifically about being READ.
+        //
+        // This used to be gated on `sealedFor == null`, but every real sent message carries a
+        // `sealedFor`, so the indicator only ever appeared on the demo thread — a real message
+        // could never show read status at all.
+        // Always on our own messages — including ones restored from the transcript, which come
+        // back with sealedFor = null and state = OPENED and so used to fall into the green
+        // "sealed" badge instead, hiding read status the moment the chat was reopened.
         if (!m.incoming) {
             Spacer(Modifier.width(4.dp))
-            if (m.sealedFor == null && m.state == State.OPENED) {
-                SealBadge()
-            } else {
-                Icon(Icons.Filled.DoneAll, null, tint = if (m.read) Blue else Sub, modifier = Modifier.size(15.dp))
-            }
+            Text(
+                "R",
+                color = if (m.read) Blue else Sub,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+            )
         }
     }
 }
