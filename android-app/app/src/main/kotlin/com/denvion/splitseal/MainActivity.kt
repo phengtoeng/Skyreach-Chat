@@ -286,10 +286,31 @@ private class Store(ctx: Context) {
         a.put(
             JSONObject().put("id", id).put("text", text).put("incoming", incoming)
                 .put("ts", System.currentTimeMillis()).put("media", media).put("mime", mime)
-                .put("destroy_at", destroyAt)
+                .put("destroy_at", destroyAt).put("read", false)
         )
         p.edit().putString("thread_$peer", a.toString()).apply()
         return true
+    }
+
+    /**
+     * Mark one of OUR sent messages as read, because the recipient told us so.
+     *
+     * Matched by seal id — which is why an outgoing message is persisted under its seal id rather
+     * than a local counter: the receipt travels with the seal id and nothing else identifies the
+     * message on both devices.
+     */
+    fun markThreadRead(peer: String, sealId: String): Boolean {
+        if (peer.isBlank() || sealId.isBlank()) return false
+        val a = thread(peer)
+        for (i in 0 until a.length()) {
+            val o = a.getJSONObject(i)
+            if (o.optString("id") == sealId && !o.optBoolean("read")) {
+                o.put("read", true)
+                p.edit().putString("thread_$peer", a.toString()).apply()
+                return true
+            }
+        }
+        return false
     }
     fun clearThread(peer: String) { if (peer.isNotBlank()) p.edit().remove("thread_$peer").apply() }
 
@@ -430,6 +451,31 @@ private fun httpGet(url: String): String? = try {
     val conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply { connectTimeout = 4000; readTimeout = 4000 }
     if (conn.responseCode == 200) conn.inputStream.bufferedReader().use { it.readText() } else null
 } catch (e: Exception) { null }
+
+/**
+ * Tell the sender we have read their message (WhatsApp's blue ticks).
+ *
+ * A receipt is NOT a seal — there is no ciphertext and nothing to open. It is a tiny marker
+ * dropped in the sender's own mailbox saying "seal X was read". It carries no content, so the
+ * relay learns only that some mailbox acknowledged some seal id, which it already saw delivered.
+ *
+ * The sender's mailbox tag comes from the device key inside the `sender_card` that travelled with
+ * their message — the recipient never has to be told where to reply.
+ */
+private fun sendReadReceipt(senderCard: String, sealId: String, myIdentityPub: String) {
+    if (senderCard.isBlank() || sealId.isBlank()) return
+    val card = runCatching { JSONObject(SealCore.parseCard(senderCard)) }.getOrNull() ?: return
+    if (!card.optBoolean("ok")) return
+    val devicePub = card.optString("device_pub")
+    if (devicePub.isBlank()) return
+    val tag = runCatching { JSONObject(SealCore.mailboxTag(devicePub)).optString("mailbox_tag") }
+        .getOrNull().orEmpty()
+    if (tag.isBlank()) return
+    val item = JSONObject()
+        .put("seal_id", "rcpt-$sealId")           // unique so the relay dedups it like any item
+        .put("receipt", JSONObject().put("read_seal", sealId).put("by", myIdentityPub))
+    for (r in Server.relays) httpPost("$r/inbox/$tag", item.toString())
+}
 
 /** Ship a shippable seal: {seal_id,bundle} → ALL relays, each share → a gateway (+ finalize).
  *  Returns true if AT LEAST ONE relay accepted the ciphertext (delivery survives node outages). */
@@ -745,6 +791,19 @@ private fun App(proto: String) {
             val chainSlot = if (items.isEmpty()) 0L else withContext(Dispatchers.IO) { finalizedSlot() }
             for (item in items) {
                 val sealId = item.optString("seal_id")
+                // A read receipt, not a message: no bundle, nothing to open. Mark OUR sent
+                // message read and move on. Handled before the bundle check below, which would
+                // otherwise skip it silently.
+                item.optJSONObject("receipt")?.let { rc ->
+                    if (sealId in seenGlobal) return@let
+                    seenGlobal.add(sealId)
+                    val readSeal = rc.optString("read_seal")
+                    val by = rc.optString("by")
+                    if (readSeal.isNotBlank() && by.isNotBlank() && store.markThreadRead(by, readSeal)) {
+                        contacts = loadContacts(store) // refresh so the list reflects it
+                    }
+                }
+                if (item.has("receipt")) continue
                 val bundle = item.optJSONObject("bundle") ?: continue
                 if (sealId.isBlank() || sealId in seenGlobal) continue
                 val shares = withContext(Dispatchers.IO) { collectShares(sealId) }
@@ -1593,6 +1652,11 @@ private fun ConversationScreen(
         if (myDevicePub.isBlank()) ""
         else runCatching { JSONObject(SealCore.mailboxTag(myDevicePub)).optString("mailbox_tag") }.getOrDefault("")
     }
+    /** My own identity key, read out of my contact card — the receipt has to say who read the
+     *  message so the sender can find the right transcript to tick. */
+    val myIdentityPub = remember(myCard) {
+        runCatching { JSONObject(SealCore.parseCard(myCard)).optString("identity_pub") }.getOrDefault("")
+    }
     val seen = remember { mutableSetOf<String>() }
     /** How many times each seal has been tried and failed to open.
      *
@@ -1624,6 +1688,10 @@ private fun ConversationScreen(
                             state = State.OPENED,
                             mediaPath = media, mediaMime = o.optString("mime"),
                             destroyAt = o.optLong("destroy_at"),
+                            // carry the persisted read state and seal id so ticks survive a
+                            // reopen, and a receipt arriving later can still find the message
+                            read = o.optBoolean("read"),
+                            sealId = o.optString("id"),
                         )
                     )
                 }
@@ -1660,6 +1728,19 @@ private fun ConversationScreen(
             // outright — so the read is dropped rather than left as dead work.)
             for (item in items) {
                 val sealId = item.optString("seal_id")
+                // A read receipt from the peer: mark OUR sent message read, on screen and on
+                // disk. Handled before the bundle check, which would otherwise skip it silently.
+                item.optJSONObject("receipt")?.let { rc ->
+                    if (sealId in seen) return@let
+                    seen.add(sealId)
+                    val readSeal = rc.optString("read_seal")
+                    if (readSeal.isNotBlank()) {
+                        store.markThreadRead(rc.optString("by"), readSeal)
+                        messages.indexOfFirst { it.sealId == readSeal && !it.incoming }
+                            .takeIf { it >= 0 }?.let { messages[it] = messages[it].copy(read = true) }
+                    }
+                }
+                if (item.has("receipt")) continue
                 val bundle = item.optJSONObject("bundle") ?: continue
                 if (sealId.isBlank() || sealId in seen) continue
                 android.util.Log.i("SealPoll", "processing ${sealId.take(12)}")
@@ -1791,6 +1872,13 @@ private fun ConversationScreen(
                         "SealPoll",
                         "opened ${sealId.take(12)} sender=${sender.take(12)} chatPeer=${chat.identityPub.take(12)} match=${sender == chat.identityPub}"
                     )
+                    // We have opened and are about to display it — tell the sender (blue ticks).
+                    // Sent from the conversation poll only: this is the path that runs when the
+                    // chat is actually on screen, so a receipt means "seen", not merely
+                    // "delivered to the device".
+                    withContext(Dispatchers.IO) {
+                        sendReadReceipt(bundle.optString("sender_card"), sealId, myIdentityPub)
+                    }
                     // a timelocked text put a sealed placeholder on screen — swap it for the real
                     // message now the window has opened, rather than leaving both.
                     messages.indexOfFirst { it.lockedSealId == sealId }.takeIf { it >= 0 }?.let { messages.removeAt(it) }
@@ -1928,8 +2016,6 @@ private fun ConversationScreen(
         val fast = fastMode
         val rv = revealAt; val dz = destroyAt // capture the one-shot timelock for THIS message
         messages.add(Msg(System.nanoTime(), text, false, now(), state = State.SEALING, mode = if (fast) "FAST" else "STRICT", revealAt = rv, destroyAt = dz))
-        // persist the outgoing message immediately so it survives leaving/reopening the chat.
-        if (real) store.addThreadMsg(chat.identityPub, "out-" + System.nanoTime(), text, false)
         val idx = messages.lastIndex
         draft = ""; revealAt = 0L; destroyAt = 0L // reset the timelock after each send
         scope.launch {
@@ -1937,16 +2023,24 @@ private fun ConversationScreen(
             if (real) {
                 // seal + SHIP over the relay + gateways; the recipient's device polls + opens.
                 // `ok` now means the RELAY actually accepted the ciphertext (real delivery signal).
+                // Persist AFTER sealing, under the seal id: a read receipt names the seal, and
+                // that is the only identifier both devices share. Storing under a local counter
+                // (the old "out-<nanotime>") left nothing for an incoming receipt to match.
+                var sentSealId = ""
                 val ok = runCatching {
                     withContext(Dispatchers.IO) {
                         val slot = if (rv > 0) finalizedSlot() else 0L // only needed for a reveal floor
                         val ship = JSONObject(SealCore.sealShippable(myIdentitySeed, myCard, chat.devicePub, text, fast, rv, dz, slot))
                         if (!ship.optBoolean("ok")) return@withContext false
+                        sentSealId = ship.optString("seal_id")
                         shipSeal(ship)
                     }
                 }.getOrDefault(false)
+                if (real && sentSealId.isNotBlank()) {
+                    store.addThreadMsg(chat.identityPub, sentSealId, text, false, destroyAt = dz)
+                }
                 delay(if (fast) 400 else 800)
-                messages[idx] = messages[idx].copy(state = if (ok) State.OPENED else State.SEALING, sealedFor = chat.name)
+                messages[idx] = messages[idx].copy(state = if (ok) State.OPENED else State.SEALING, sealedFor = chat.name, sealId = sentSealId, read = false)
                 if (!ok) android.widget.Toast.makeText(ctx, "Couldn't reach the server — message not sent", android.widget.Toast.LENGTH_SHORT).show()
                 poll() // pick up a self-loopback / any pending inbound right away
             } else {
@@ -2475,9 +2569,13 @@ private fun MetaRow(m: Msg) {
             Spacer(Modifier.width(6.dp))
         }
         Text(m.time, color = Sub, fontSize = 11.sp)
-        if (!m.incoming && m.sealedFor == null) {
+        // Delivery/read ticks on our own messages: grey = delivered, blue = the recipient has
+        // opened it and sent a receipt back. This used to be gated on `sealedFor == null`, but
+        // every real sent message carries a `sealedFor`, so the ticks only ever appeared on the
+        // demo thread — a real message could never show read status at all.
+        if (!m.incoming) {
             Spacer(Modifier.width(4.dp))
-            if (m.state == State.OPENED) {
+            if (m.sealedFor == null && m.state == State.OPENED) {
                 SealBadge()
             } else {
                 Icon(Icons.Filled.DoneAll, null, tint = if (m.read) Blue else Sub, modifier = Modifier.size(15.dp))
