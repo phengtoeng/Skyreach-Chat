@@ -2081,14 +2081,13 @@ private struct Bubble: View {
     }
 
     private var textContent: some View {
-        // .trailing so the timestamp line hugs the right edge of whatever the bubble's real
-        // width turns out to be. Previously metaRow held a leading Spacer(), which expanded to
-        // the full 300pt proposal and stretched every bubble to maximum width — a three-letter
-        // message got the same slab as a paragraph.
-        VStack(alignment: .trailing, spacing: 2) {
-            Text(m.text).font(.system(size: 15)).foregroundColor(.dvInk)
-            metaRow
-        }
+        // One paragraph, not a stack: concatenated Text runs let the timestamp and read marker
+        // sit at the end of the last line when there is room, and wrap onto their own line only
+        // when there isn't. It also means the bubble hugs the content — the old version held a
+        // leading Spacer() that expanded to the full 300pt proposal, so a five-letter message
+        // got the same slab as a paragraph.
+        (Text(m.text).font(.system(size: 15)).foregroundColor(.dvInk) + Text("  ") + metaText)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     private var sealing: some View {
@@ -2163,32 +2162,29 @@ private struct Bubble: View {
         }
     }
 
-    private var metaRow: some View {
-        // No leading Spacer: it would expand to the bubble's max width proposal and defeat the
-        // hug-the-content sizing. The enclosing VStack's .trailing alignment does the job.
-        HStack(spacing: 4) {
-            if m.revealAt > 0 {
-                Image(systemName: "clock").font(.system(size: 10)).foregroundColor(.dvBlue)
-                Text("Opens in \(relLabel(m.revealAt))").font(.system(size: 10)).foregroundColor(.dvBlue)
-                Spacer().frame(width: 4)
-            } else if m.destroyAt > 0 {
-                Text("💥 \(relLabel(m.destroyAt))").font(.system(size: 10)).foregroundColor(Color(hex: 0xE0403A))
-                Spacer().frame(width: 4)
-            }
-            if let who = m.sealedFor {
-                Image(systemName: "lock.fill").font(.system(size: 10)).foregroundColor(.dvBlue)
-                Text("Sealed for \(who)").font(.system(size: 10)).foregroundColor(.dvBlue)
-                Spacer().frame(width: 4)
-            }
-            Text(m.time).font(.system(size: 11)).foregroundColor(.dvSub)
-            if !m.incoming && m.sealedFor == nil {
-                if m.state == .opened {
-                    sealBadge
-                } else {
-                    Text("✓✓").font(.system(size: 12, weight: .bold)).foregroundColor(m.read ? .dvBlue : .dvSub)
-                }
-            }
+    /// The trailing run: badges, timestamp, read marker. A `Text` rather than a `View` so it can
+    /// be concatenated onto the message body — that is what makes it flow at the end of the last
+    /// line instead of claiming a row of its own.
+    private var metaText: Text {
+        var t = Text("")
+        if m.revealAt > 0 {
+            t = t + Text(Image(systemName: "clock")).font(.system(size: 10)).foregroundColor(.dvBlue)
+                  + Text(" Opens in \(relLabel(m.revealAt))  ").font(.system(size: 10)).foregroundColor(.dvBlue)
+        } else if m.destroyAt > 0 {
+            t = t + Text("💥 \(relLabel(m.destroyAt))  ").font(.system(size: 10)).foregroundColor(Color(hex: 0xE0403A))
         }
+        if let who = m.sealedFor {
+            t = t + Text(Image(systemName: "lock.fill")).font(.system(size: 10)).foregroundColor(.dvBlue)
+                  + Text(" Sealed for \(who)  ").font(.system(size: 10)).foregroundColor(.dvBlue)
+        }
+        t = t + Text(m.time).font(.system(size: 11)).foregroundColor(.dvSub)
+        // Read status on our own messages: grey R once delivered, blue once the recipient has
+        // opened it. An R rather than ticks, because ticks read as "delivered" everywhere else
+        // and this is specifically about being READ.
+        if !m.incoming {
+            t = t + Text(" R").font(.system(size: 12, weight: .bold)).foregroundColor(m.read ? .dvBlue : .dvSub)
+        }
+        return t
     }
 
     private var sealBadge: some View {

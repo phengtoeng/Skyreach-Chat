@@ -40,6 +40,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import org.json.JSONArray
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -50,6 +51,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.layout.Layout
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.HazeStyle
 import dev.chrisbanes.haze.haze
@@ -66,6 +68,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
+import kotlin.math.max
+import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -112,6 +116,10 @@ private val AvatarColors = listOf(
 )
 
 private fun now(): String = SimpleDateFormat("h:mm a", Locale.US).format(Date())
+
+/** Clock label for a message read back from the transcript, which stores epoch millis. */
+private fun clockLabel(ts: Long): String =
+    if (ts <= 0L) "" else SimpleDateFormat("h:mm a", Locale.US).format(Date(ts))
 /** Short "time from now" label for a unix-seconds target, e.g. "10m", "1h", "1d". */
 private fun relLabel(targetUnixSecs: Long): String {
     val s = targetUnixSecs - System.currentTimeMillis() / 1000
@@ -1712,7 +1720,10 @@ private fun ConversationScreen(
                     val media = o.optString("media")
                     add(
                         Msg(
-                            System.nanoTime() + i, o.optString("text"), o.optBoolean("incoming"), "",
+                            // the transcript keeps epoch millis, so rebuild the clock from it —
+                            // this used to restore as "" and every reopened message lost its time
+                            System.nanoTime() + i, o.optString("text"), o.optBoolean("incoming"),
+                            clockLabel(o.optLong("ts")),
                             kind = if (media.isNotBlank()) Kind.IMAGE else Kind.TEXT,
                             state = State.OPENED,
                             mediaPath = media, mediaMime = o.optString("mime"),
@@ -2503,12 +2514,44 @@ private fun Bubble(m: Msg, now: Long = 0L, onDestroyed: () -> Unit = {}) {
 
 @Composable
 private fun TextContent(m: Msg) {
-    // Column width = its widest child, so the bubble hugs the text. The meta row is pushed to
-    // the trailing edge with align() rather than by stretching, which keeps the text itself
-    // left-aligned when the timestamp line happens to be the wider of the two.
-    Column {
-        Text(m.text, color = Ink, fontSize = 15.sp)
-        MetaRow(m, Modifier.align(Alignment.End))
+    // Timestamp + read marker ride at the END of the message, on the same line as the last word
+    // whenever there is room for them — the way every messenger does it. They only drop onto a
+    // line of their own when the last line is too full to take them.
+    //
+    // A Column can't express that: it would always give the meta its own row. So this measures
+    // both and decides. The width of the final rendered text line comes from the text's own
+    // layout result; reading that state inside measure() re-runs this block when it arrives.
+    var lastLineWidth by remember(m.text) { mutableStateOf(-1f) }
+    val gapPx = with(LocalDensity.current) { 8.dp.toPx() }
+
+    Layout(
+        content = {
+            Text(
+                m.text, color = Ink, fontSize = 15.sp,
+                onTextLayout = { r ->
+                    val w = if (r.lineCount > 0) r.getLineRight(r.lineCount - 1) else 0f
+                    if (w != lastLineWidth) lastLineWidth = w
+                },
+            )
+            MetaRow(m)
+        }
+    ) { measurables, constraints ->
+        val meta = measurables[1].measure(constraints.copy(minWidth = 0, minHeight = 0))
+        val text = measurables[0].measure(constraints.copy(minWidth = 0, minHeight = 0))
+
+        // -1 means the text hasn't reported its layout yet (first pass only). Assume the meta
+        // needs its own line until we know better, so nothing ever renders overlapped.
+        val trailing = lastLineWidth + gapPx + meta.width
+        val inline = lastLineWidth >= 0f && trailing <= constraints.maxWidth
+
+        val w = if (inline) max(text.width, trailing.roundToInt()) else max(text.width, meta.width)
+        val h = if (inline) text.height else text.height + meta.height
+        layout(w.coerceAtMost(constraints.maxWidth), h) {
+            text.place(0, 0)
+            // Bottom-aligned: the meta is smaller than the body type, so sitting it on the
+            // text's baseline-ish bottom edge is what reads as "on the same line".
+            meta.place(w - meta.width, h - meta.height)
+        }
     }
 }
 
