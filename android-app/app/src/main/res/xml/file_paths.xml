@@ -3,4 +3,7 @@
      video. Nothing else in app storage (seeds, transcripts, chunks) is exposed. -->
 <paths>
     <files-path name="media" path="media/" />
+    <!-- Where the camera app writes a capture. Also nothing but photos, and each one is
+         deleted as soon as it has been sealed. -->
+    <files-path name="capture" path="capture/" />
 </paths>

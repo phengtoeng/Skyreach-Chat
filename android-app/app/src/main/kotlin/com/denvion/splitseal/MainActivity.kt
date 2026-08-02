@@ -145,7 +145,35 @@ private fun initials(name: String) =
 // ─────────────────────────────── models ─────────────────────────────────────
 private data class Chat(val name: String, val last: String, val time: String, val unread: Int = 0, val devicePub: String = "", val identityPub: String = "", val isContact: Boolean = false)
 
-private enum class Kind { TEXT, IMAGE, VOICE }
+private enum class Kind { TEXT, IMAGE, VOICE, FILE }
+
+/**
+ * A document's original name has nowhere to live in the manifest — spec §8.2 carries mime and
+ * size but no filename — so it rides in front of the caption behind a NUL, which cannot occur
+ * in text the user typed. A `file_name` field in the manifest would be the honest fix.
+ */
+private const val FILE_NAME_SEP = '\u0000'
+
+private fun fileCaption(name: String, caption: String) =
+    if (caption.isBlank()) name else "$name$FILE_NAME_SEP$caption"
+
+/** Split what `fileCaption` packed: (display name, caption). */
+private fun splitFileCaption(packed: String): Pair<String, String> {
+    val i = packed.indexOf(FILE_NAME_SEP)
+    return if (i < 0) packed to "" else packed.substring(0, i) to packed.substring(i + 1)
+}
+
+/** "240 KB", "1.8 MB" — what a document bubble shows under its name. */
+private fun sizeLabel(bytes: Long): String = when {
+    bytes <= 0L -> ""
+    bytes < 1024 -> "$bytes B"
+    bytes < 1024 * 1024 -> "${bytes / 1024} KB"
+    else -> String.format(Locale.US, "%.1f MB", bytes / 1048576.0)
+}
+
+/** True for anything we cannot render inline and therefore treat as a document. */
+private fun isFileMime(mime: String) =
+    !(mime.startsWith("image/") || mime.startsWith("video/"))
 private enum class State {
     PLAIN, SEALING, OPENED,
     /** Received but time-locked: the gateways withhold the shares until `revealAt`, so there is
@@ -167,6 +195,8 @@ private data class Msg(
     val destroyAt: Long = 0, // unix secs: self-destructs after this time (0 = none)
     val mediaPath: String = "", // decrypted file on THIS device only; never uploaded
     val mediaMime: String = "",
+    /** Plaintext byte count, for the size line on a document bubble. 0 when unknown. */
+    val mediaSize: Long = 0,
     /** Set on a LOCKED placeholder so the real item can replace it when the window opens. */
     val lockedSealId: String = "",
     /** The seal this bubble came from, so the live poll can tell "already on screen" apart from
@@ -644,6 +674,19 @@ private fun downloadBlob(hashHex: String): ByteArray? {
 // The picked file is copied into the app cache, sealed by Rust into encrypted chunks on
 // disk, and only those chunks are uploaded. The readable original never leaves the device.
 
+/** The name the picker shows for a content:// item, for a document bubble. */
+private fun displayName(ctx: Context, uri: android.net.Uri): String {
+    runCatching {
+        ctx.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+            if (c.moveToFirst()) {
+                val n = c.getString(0)
+                if (!n.isNullOrBlank()) return n
+            }
+        }
+    }
+    return uri.lastPathSegment?.substringAfterLast('/') ?: "File"
+}
+
 /** Copy a picked content:// item into our cache so Rust can read it by path. */
 private fun cacheFromUri(ctx: Context, uri: android.net.Uri, name: String): java.io.File? = try {
     val f = java.io.File(ctx.cacheDir, name)
@@ -772,7 +815,12 @@ private fun receiveMedia(ctx: Context, deviceSeed: String, sealId: String, bundl
     }
 
     val mime = info.optString("mime_type", "application/octet-stream")
+    val caption = info.optString("caption")
+    // A document keeps its own name and extension, which is what lets the viewer app that
+    // opens it recognise the thing. Photos and video keep the old fixed extensions.
+    val name = if (info.optString("kind") == "file") splitFileCaption(caption).first else ""
     val ext = when {
+        name.contains('.') -> name.substringAfterLast('.')
         mime.startsWith("video") -> "mp4"
         mime.contains("png") -> "png"
         else -> "jpg"
@@ -784,7 +832,7 @@ private fun receiveMedia(ctx: Context, deviceSeed: String, sealId: String, bundl
     }.getOrNull() ?: return null
     if (!done.optBoolean("ok")) return null
     chunkDir.deleteRecursively() // plaintext is assembled; the ciphertext copies are dead weight
-    return Triple(out.path, mime, info.optString("caption"))
+    return Triple(out.path, mime, caption)
 }
 
 /**
@@ -1803,9 +1851,14 @@ private fun ConversationScreen(
                             // this used to restore as "" and every reopened message lost its time
                             System.nanoTime() + i, o.optString("text"), o.optBoolean("incoming"),
                             clockLabel(o.optLong("ts")),
-                            kind = if (media.isNotBlank()) Kind.IMAGE else Kind.TEXT,
+                            kind = when {
+                                media.isBlank() -> Kind.TEXT
+                                isFileMime(o.optString("mime")) -> Kind.FILE
+                                else -> Kind.IMAGE
+                            },
                             state = State.OPENED,
                             mediaPath = media, mediaMime = o.optString("mime"),
+                            mediaSize = java.io.File(media).length(),
                             destroyAt = o.optLong("destroy_at"),
                             // carry the persisted read state and seal id so ticks survive a
                             // reopen, and a receipt arriving later can still find the message
@@ -1941,7 +1994,12 @@ private fun ConversationScreen(
                             store.markReceipted(listOf(sealId))
                         }
                         val sender = bundle.optString("sender_id_pub")
-                        val label = got.third.ifBlank { if (got.second.startsWith("video")) "Video" else "Photo" }
+                        // Anything we cannot render inline is a document: its bubble shows the
+                        // sender's filename, which travels packed in front of the caption.
+                        val asFile = isFileMime(got.second)
+                        val label =
+                            if (asFile) splitFileCaption(got.third).first
+                            else got.third.ifBlank { if (got.second.startsWith("video")) "Video" else "Photo" }
                         // carry the destroy deadline across: the recipient's copy must burn too,
                         // otherwise a "self-destruct" only ever removed the sender's side.
                         val dz = bundle.optLong("destroy_at")
@@ -1954,8 +2012,10 @@ private fun ConversationScreen(
                         if (sender == chat.identityPub && messages.none { it.sealId == sealId }) {
                             messages.add(
                                 Msg(
-                                    System.nanoTime(), label, true, now(), kind = Kind.IMAGE,
+                                    System.nanoTime(), label, true, now(),
+                                    kind = if (asFile) Kind.FILE else Kind.IMAGE,
                                     state = State.OPENED, mediaPath = got.first, mediaMime = got.second,
+                                    mediaSize = java.io.File(got.first).length(),
                                     destroyAt = dz, sealId = sealId, justRevealed = cameOutOfLock,
                                 )
                             )
@@ -2088,7 +2148,78 @@ private fun ConversationScreen(
      * Rust can chunk-encrypt it; ONLY the encrypted chunks are uploaded, and they go to the
      * relay addressed by ciphertext hash. The sender's own copy stays local for the bubble.
      */
-    fun sendMedia(uri: android.net.Uri, caption: String) {
+    /**
+     * Seal and send an arbitrary file, byte for byte — no resize, no re-encode.
+     *
+     * Goes out immediately rather than staging in the composer: there is no thumbnail to show
+     * and nothing useful to caption. The core already understands `ContentKind::File`, so the
+     * only new thing here is the bubble at each end.
+     */
+    fun sendFile(uri: android.net.Uri) {
+        if (!real) {
+            android.widget.Toast.makeText(ctx, "Add this person as a contact first", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        val mime = ctx.contentResolver.getType(uri) ?: "application/octet-stream"
+        val name = displayName(ctx, uri)
+        val fast = fastMode
+        val rv = revealAt; val dz = destroyAt
+        messages.add(
+            Msg(
+                System.nanoTime(), name, false, now(), kind = Kind.FILE, state = State.SEALING,
+                mode = if (fast) "FAST" else "STRICT", revealAt = rv, destroyAt = dz, mediaMime = mime,
+            )
+        )
+        val idx = messages.lastIndex
+        revealAt = 0L; destroyAt = 0L
+        var sentSealId = ""
+        var sentSize = 0L
+        scope.launch {
+            listState.animateScrollToItem(messages.lastIndex)
+            val result = withContext(Dispatchers.IO) {
+                val src = cacheFromUri(ctx, uri, "doc-${System.nanoTime()}") ?: return@withContext null
+                sentSize = src.length()
+                val chunkDir = java.io.File(ctx.cacheDir, "out-${System.nanoTime()}")
+                val slot = if (rv > 0) finalizedSlot() else 0L
+                val sealed = runCatching {
+                    JSONObject(
+                        SealCore.sealMediaFile(
+                            myIdentitySeed, myCard, chat.devicePub, src.path, mime,
+                            "file", fileCaption(name, ""), "", chunkDir.path, fast, rv, dz, slot,
+                        )
+                    )
+                }.getOrNull()
+                if (sealed == null || !sealed.optBoolean("ok")) {
+                    chunkDir.deleteRecursively(); src.delete()
+                    return@withContext null
+                }
+                val up = uploadChunks(sealed)
+                chunkDir.deleteRecursively()
+                if (!up) { src.delete(); return@withContext null }
+                if (!shipSeal(sealed)) { src.delete(); return@withContext null }
+                sentSealId = sealed.optString("seal_id")
+                // keep OUR readable copy so the sent bubble can open it
+                val mediaDir = java.io.File(ctx.filesDir, "media").apply { mkdirs() }
+                val mine = java.io.File(mediaDir, "sent-$sentSealId-$name")
+                src.copyTo(mine, overwrite = true); src.delete()
+                mine.path
+            }
+            if (result != null) {
+                messages[idx] = messages[idx].copy(
+                    state = State.OPENED, sealedFor = chat.name, mediaPath = result, mediaMime = mime,
+                    mediaSize = sentSize, sealId = sentSealId, read = false,
+                )
+                if (sentSealId.isNotBlank()) {
+                    store.addThreadMsg(chat.identityPub, sentSealId, name, false, media = result, mime = mime, destroyAt = dz)
+                }
+            } else {
+                messages.removeAt(idx)
+                android.widget.Toast.makeText(ctx, "Couldn't send $name — check the server", android.widget.Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    fun sendMedia(uri: android.net.Uri, caption: String, original: Boolean = false) {
         if (!real) {
             android.widget.Toast.makeText(ctx, "Add this person as a contact first", android.widget.Toast.LENGTH_SHORT).show()
             return
@@ -2115,7 +2246,7 @@ private fun ConversationScreen(
                 // Send a resized copy rather than the camera original — see compressForSend.
                 // `body` is what actually gets sealed, previewed and kept locally, so both ends
                 // hold the same picture.
-                val shrunk = compressForSend(ctx, src, isVideo)
+                val shrunk = if (original) null else compressForSend(ctx, src, isVideo)
                 val body = shrunk ?: src
                 sentMime = if (shrunk != null) "image/jpeg" else mime
                 val cleanup = { if (shrunk != null) src.delete(); body.delete() }
@@ -2167,15 +2298,31 @@ private fun ConversationScreen(
     }
 
     val pickMedia = rememberMediaPicker { uri -> pending = uri } // stage it; the user captions + sends
+    var showAttach by remember { mutableStateOf(false) }
+    // "Full size" stages exactly like Photos does but skips the resize on the way out.
+    var pendingOriginal by remember { mutableStateOf(false) }
+    val pickOriginal = rememberMediaPicker { uri -> pending = uri; pendingOriginal = true }
+    // A document goes straight out: there is nothing to preview and nothing to caption.
+    var pickedDoc by remember { mutableStateOf<android.net.Uri?>(null) }
+    val pickDocument = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        pickedDoc = uri
+    }
+    // The camera writes into files/capture, the one other place the FileProvider exposes.
+    var captureUri by remember { mutableStateOf<android.net.Uri?>(null) }
+    val takePhoto = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
+        if (ok) captureUri?.let { pending = it }
+    }
 
     fun send() {
         // An attached photo/video takes the typed text as its (sealed) caption, so the two
         // travel as ONE item rather than a picture followed by a stray message.
         pending?.let { uri ->
             val caption = draft.trim()
+            val asIs = pendingOriginal
             draft = ""
             pending = null
-            sendMedia(uri, caption)
+            pendingOriginal = false
+            sendMedia(uri, caption, original = asIs)
             return
         }
         val text = draft.trim()
@@ -2270,12 +2417,39 @@ private fun ConversationScreen(
         }
         Composer(
             draft, { draft = it }, timerLabel, { showTimer = true }, { revealAt = 0L; destroyAt = 0L },
+            onPlus = { showAttach = true },
             onAttach = { pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)) },
             onSend = ::send,
             attachment = pending,
-            onClearAttachment = { pending = null },
+            onClearAttachment = { pending = null; pendingOriginal = false },
         )
     }
+
+    // A picked document goes out on its own, so it is handled here rather than in send().
+    LaunchedEffect(pickedDoc) {
+        pickedDoc?.let { sendFile(it); pickedDoc = null }
+    }
+
+    if (showAttach) AttachSheet(
+        onDismiss = { showAttach = false },
+        onPhotos = {
+            showAttach = false
+            pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
+        },
+        onCamera = {
+            showAttach = false
+            val dir = java.io.File(ctx.filesDir, "capture").apply { mkdirs() }
+            val f = java.io.File(dir, "cam-${System.nanoTime()}.jpg")
+            val u = androidx.core.content.FileProvider.getUriForFile(ctx, "${ctx.packageName}.files", f)
+            captureUri = u
+            takePhoto.launch(u)
+        },
+        onDocument = { showAttach = false; pickDocument.launch(arrayOf("*/*")) },
+        onOriginal = {
+            showAttach = false
+            pickOriginal.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
+        },
+    )
 
     if (showTimer) TimedSealDialog(
         onDismiss = { showTimer = false },
@@ -2287,6 +2461,55 @@ private fun ConversationScreen(
 @Composable
 private fun rememberMediaPicker(onPicked: (android.net.Uri) -> Unit) =
     rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri -> uri?.let(onPicked) }
+
+/**
+ * The attachment sheet behind the composer's `+`.
+ *
+ * Only what actually works is on it. Location, Contact, Poll and Event each need a backend this
+ * app does not have yet, and a tile that does nothing is worse than no tile.
+ */
+@Composable
+@OptIn(ExperimentalMaterial3Api::class)
+private fun AttachSheet(
+    onPhotos: () -> Unit,
+    onCamera: () -> Unit,
+    onDocument: () -> Unit,
+    onOriginal: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = Color.White) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp).padding(bottom = 28.dp)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                AttachTile(Icons.Filled.PhotoLibrary, "Photos", Color(0xFF2E9BF6), onPhotos)
+                AttachTile(Icons.Filled.PhotoCamera, "Camera", Color(0xFF5B6570), onCamera)
+                AttachTile(Icons.Filled.InsertDriveFile, "Document", Color(0xFF2E9BF6), onDocument)
+                AttachTile(Icons.Filled.HighQuality, "Full size", Color(0xFF7B61FF), onOriginal)
+            }
+            Spacer(Modifier.height(16.dp))
+            Text(
+                "Photos are resized for speed. \"Full size\" and \"Document\" send the original file, byte for byte.",
+                color = Sub, fontSize = 12.sp,
+            )
+        }
+    }
+}
+
+@Composable
+private fun AttachTile(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    tint: Color,
+    onClick: () -> Unit,
+) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.clickable(onClick = onClick)) {
+        Box(
+            Modifier.size(62.dp).clip(RoundedCornerShape(20.dp)).background(Color(0xFFF1F4F7)),
+            contentAlignment = Alignment.Center,
+        ) { Icon(icon, label, tint = tint, modifier = Modifier.size(28.dp)) }
+        Spacer(Modifier.height(7.dp))
+        Text(label, color = Ink, fontSize = 12.sp)
+    }
+}
 
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
@@ -2576,6 +2799,7 @@ private fun Bubble(m: Msg, now: Long = 0L, onDestroyed: () -> Unit = {}) {
                     // A translucent scrim still let the picture read straight through it.
                     stillSealed && m.kind == Kind.IMAGE -> LockedContent(m, now, caption = m.text)
                     m.kind == Kind.IMAGE -> ImageContent(m, glow = m.justRevealed || senderJustOpened)
+                    m.kind == Kind.FILE -> FileContent(m)
                     m.kind == Kind.VOICE -> VoiceContent(m)
                     else -> TextContent(m)
                 }
@@ -2804,6 +3028,32 @@ private fun openExternally(ctx: Context, path: String, mime: String) {
     }
 }
 
+/** A document: name, size, and a tap that hands the DECRYPTED file to a viewer app. */
+@Composable
+private fun FileContent(m: Msg) {
+    val ctx = LocalContext.current
+    Column {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .then(if (m.mediaPath.isNotBlank()) Modifier.clickable { openExternally(ctx, m.mediaPath, m.mediaMime) } else Modifier)
+                .widthIn(max = 240.dp),
+        ) {
+            Box(
+                Modifier.size(38.dp).clip(RoundedCornerShape(10.dp)).background(Color(0xFFE3E9EF)),
+                contentAlignment = Alignment.Center,
+            ) { Icon(Icons.Filled.InsertDriveFile, null, tint = Blue, modifier = Modifier.size(21.dp)) }
+            Spacer(Modifier.width(10.dp))
+            Column {
+                Text(m.text, color = Ink, fontSize = 14.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                val size = sizeLabel(m.mediaSize)
+                if (size.isNotBlank()) Text(size, color = Sub, fontSize = 11.sp)
+            }
+        }
+        MetaRow(m, Modifier.align(Alignment.End))
+    }
+}
+
 @Composable
 private fun VoiceContent(m: Msg) {
     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -2881,6 +3131,7 @@ private fun Composer(
     timerLabel: String?,
     onClock: () -> Unit,
     onClearTimer: () -> Unit,
+    onPlus: () -> Unit,
     onAttach: () -> Unit,
     onSend: () -> Unit,
     attachment: android.net.Uri? = null,
@@ -2963,6 +3214,11 @@ private fun Composer(
     ) {
         IconButton(onClick = onClock) {
             Icon(Icons.Filled.Schedule, "Timed seal", tint = if (timerLabel != null) Blue else Sub, modifier = Modifier.size(23.dp))
+        }
+        // `+` opens everything that can be attached; the camera stays as the one-tap shortcut
+        // to the picker, which is what it already did.
+        IconButton(onClick = onPlus) {
+            Icon(Icons.Filled.Add, "Attach", tint = Sub, modifier = Modifier.size(26.dp))
         }
         IconButton(onClick = onAttach) {
             Icon(Icons.Filled.PhotoCamera, "Send photo or video", tint = Sub, modifier = Modifier.size(23.dp))
