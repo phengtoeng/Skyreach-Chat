@@ -671,6 +671,73 @@ private fun buildPreview(ctx: Context, src: java.io.File, isVideo: Boolean): jav
     }
 } catch (_: Exception) { null }
 
+/** Long edge, in pixels, of a photo as actually sent. WhatsApp uses ~1600, Telegram ~1280. */
+private const val SEND_MAX_EDGE = 1600
+private const val SEND_JPEG_QUALITY = 80
+
+/**
+ * Resize and re-encode a picked photo before it is sealed.
+ *
+ * A phone camera file is 3–12 MB, and every byte of it gets encrypted, split into 1 MiB chunks,
+ * and pushed to the relay — then pulled down again by the recipient. At 1600px/q80 the same
+ * picture is a few hundred KB with no visible difference on a phone screen, which is most of the
+ * reason a photo takes as long as it does to arrive.
+ *
+ * Re-encoding also drops every EXIF tag, GPS coordinates included. That is a real win for a
+ * sealed messenger, but it means the orientation tag goes too — so rotation is baked into the
+ * pixels first, or portrait shots would arrive on their side.
+ *
+ * Returns null when the original should be sent as-is (video, undecodable, or already smaller).
+ */
+private fun compressForSend(ctx: Context, src: java.io.File, isVideo: Boolean): java.io.File? {
+    if (isVideo) return null // re-encoding video is a different job entirely; sent untouched
+    return try {
+        val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        android.graphics.BitmapFactory.decodeFile(src.path, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        // Sample down during decode so a 12 MP file never has to be fully materialised.
+        var sample = 1
+        while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= SEND_MAX_EDGE) sample *= 2
+        val decoded = android.graphics.BitmapFactory.decodeFile(
+            src.path,
+            android.graphics.BitmapFactory.Options().apply { inSampleSize = sample },
+        ) ?: return null
+        val longEdge = maxOf(decoded.width, decoded.height)
+        val scaled = if (longEdge > SEND_MAX_EDGE) {
+            val f = SEND_MAX_EDGE.toFloat() / longEdge
+            android.graphics.Bitmap.createScaledBitmap(
+                decoded,
+                (decoded.width * f).toInt().coerceAtLeast(1),
+                (decoded.height * f).toInt().coerceAtLeast(1),
+                true,
+            )
+        } else decoded
+        val out = java.io.File(ctx.cacheDir, "send-${System.nanoTime()}.jpg")
+        out.outputStream().use {
+            uprightCopy(src, scaled).compress(android.graphics.Bitmap.CompressFormat.JPEG, SEND_JPEG_QUALITY, it)
+        }
+        // A picture already smaller than what we would produce is left exactly as it is.
+        if (out.length() in 1 until src.length()) out else { out.delete(); null }
+    } catch (_: Exception) { null }
+}
+
+/** Bake the EXIF orientation into the pixels, since re-encoding discards the tag. */
+private fun uprightCopy(src: java.io.File, bmp: android.graphics.Bitmap): android.graphics.Bitmap = try {
+    val deg = when (
+        android.media.ExifInterface(src.path)
+            .getAttributeInt(android.media.ExifInterface.TAG_ORIENTATION, android.media.ExifInterface.ORIENTATION_NORMAL)
+    ) {
+        android.media.ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+        android.media.ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+        android.media.ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+        else -> 0f
+    }
+    if (deg == 0f) bmp else android.graphics.Bitmap.createBitmap(
+        bmp, 0, 0, bmp.width, bmp.height,
+        android.graphics.Matrix().apply { postRotate(deg) }, true,
+    )
+} catch (_: Exception) { bmp }
+
 /** Upload every encrypted chunk listed by `sealMediaFile`, then delete the local copies. */
 private fun uploadChunks(sealed: JSONObject): Boolean {
     val chunks = sealed.optJSONArray("chunks") ?: return false
@@ -2040,17 +2107,25 @@ private fun ConversationScreen(
         val idx = messages.lastIndex
         revealAt = 0L; destroyAt = 0L
         var sentSealId = "" // captured inside the IO block so the receipt can match this photo
+        var sentMime = mime // a re-encoded photo ships as JPEG whatever the original was
         scope.launch {
             listState.animateScrollToItem(messages.lastIndex)
             val result = withContext(Dispatchers.IO) {
                 val src = cacheFromUri(ctx, uri, "pick-${System.nanoTime()}") ?: return@withContext null
-                val preview = buildPreview(ctx, src, isVideo)
+                // Send a resized copy rather than the camera original — see compressForSend.
+                // `body` is what actually gets sealed, previewed and kept locally, so both ends
+                // hold the same picture.
+                val shrunk = compressForSend(ctx, src, isVideo)
+                val body = shrunk ?: src
+                sentMime = if (shrunk != null) "image/jpeg" else mime
+                val cleanup = { if (shrunk != null) src.delete(); body.delete() }
+                val preview = buildPreview(ctx, body, isVideo)
                 val chunkDir = java.io.File(ctx.cacheDir, "out-${System.nanoTime()}")
                 val slot = if (rv > 0) finalizedSlot() else 0L // only needed for a reveal floor
                 val sealed = runCatching {
                     JSONObject(
                         SealCore.sealMediaFile(
-                            myIdentitySeed, myCard, chat.devicePub, src.path, mime,
+                            myIdentitySeed, myCard, chat.devicePub, body.path, sentMime,
                             if (isVideo) "video" else "image", caption,
                             preview?.path ?: "", chunkDir.path, fast, rv, dz, slot,
                         )
@@ -2058,19 +2133,19 @@ private fun ConversationScreen(
                 }.getOrNull()
                 preview?.delete()
                 if (sealed == null || !sealed.optBoolean("ok")) {
-                    chunkDir.deleteRecursively(); src.delete()
+                    chunkDir.deleteRecursively(); cleanup()
                     return@withContext null
                 }
                 // upload the opaque chunks, then the manifest bundle + key shares
                 val up = uploadChunks(sealed)
                 chunkDir.deleteRecursively()
-                if (!up) { src.delete(); return@withContext null }
-                if (!shipSeal(sealed)) { src.delete(); return@withContext null }
+                if (!up) { cleanup(); return@withContext null }
+                if (!shipSeal(sealed)) { cleanup(); return@withContext null }
                 sentSealId = sealed.optString("seal_id")
                 // keep OUR readable copy locally so the sent bubble can render it
                 val mediaDir = java.io.File(ctx.filesDir, "media").apply { mkdirs() }
                 val mine = java.io.File(mediaDir, "sent-${sealed.optString("seal_id")}.${if (isVideo) "mp4" else "jpg"}")
-                src.copyTo(mine, overwrite = true); src.delete()
+                body.copyTo(mine, overwrite = true); cleanup()
                 mine.path
             }
             if (result != null) {
@@ -2078,11 +2153,11 @@ private fun ConversationScreen(
                 // that is the only identifier both devices share. Under a local counter a photo
                 // could never be matched to its receipt, so its R stayed grey forever.
                 messages[idx] = messages[idx].copy(
-                    state = State.OPENED, sealedFor = chat.name, mediaPath = result, mediaMime = mime,
+                    state = State.OPENED, sealedFor = chat.name, mediaPath = result, mediaMime = sentMime,
                     sealId = sentSealId, read = false,
                 )
                 if (sentSealId.isNotBlank()) {
-                    store.addThreadMsg(chat.identityPub, sentSealId, label, false, media = result, mime = mime, destroyAt = dz)
+                    store.addThreadMsg(chat.identityPub, sentSealId, label, false, media = result, mime = sentMime, destroyAt = dz)
                 }
             } else {
                 messages.removeAt(idx)

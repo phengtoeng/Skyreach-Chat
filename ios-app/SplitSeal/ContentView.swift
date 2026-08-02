@@ -476,6 +476,39 @@ func buildPreview(_ src: URL, isVideo: Bool) -> URL? {
     return out
 }
 
+/// Long edge, in points, of a photo as actually sent. WhatsApp uses ~1600, Telegram ~1280.
+let sendMaxEdge: CGFloat = 1600
+let sendJpegQuality: CGFloat = 0.8
+
+/// Resize and re-encode a picked photo before it is sealed.
+///
+/// A phone camera file is 3–12 MB, and every byte of it gets encrypted, split into 1 MiB chunks,
+/// and pushed to the relay — then pulled down again by the recipient. At 1600px/q80 the same
+/// picture is a few hundred KB with no visible difference on a phone screen, which is most of the
+/// reason a photo takes as long as it does to arrive.
+///
+/// Re-encoding also drops every EXIF tag, GPS coordinates included — a real win for a sealed
+/// messenger. `UIImage` drawing already resolves orientation, so rotation lands in the pixels.
+///
+/// Returns nil when the original should be sent as-is (video, undecodable, or already smaller).
+func compressForSend(_ src: URL, isVideo: Bool) -> URL? {
+    if isVideo { return nil } // re-encoding video is a different job entirely; sent untouched
+    guard let img = UIImage(contentsOfFile: src.path) else { return nil }
+    let longEdge = max(img.size.width, img.size.height)
+    let scale = longEdge > sendMaxEdge ? sendMaxEdge / longEdge : 1
+    let target = CGSize(width: max(img.size.width * scale, 1), height: max(img.size.height * scale, 1))
+    let resized = UIGraphicsImageRenderer(size: target).image { _ in
+        img.draw(in: CGRect(origin: .zero, size: target))
+    }
+    guard let data = resized.jpegData(compressionQuality: sendJpegQuality) else { return nil }
+    // A picture already smaller than what we would produce is left exactly as it is.
+    let originalSize = (try? FileManager.default.attributesOfItem(atPath: src.path)[.size] as? Int) ?? nil
+    if let orig = originalSize, data.count >= orig { return nil }
+    let out = cacheDir.appendingPathComponent("send-\(UUID().uuidString).jpg")
+    guard (try? data.write(to: out)) != nil else { return nil }
+    return out
+}
+
 /// Upload every encrypted chunk listed by `sealMediaFile`, then delete the local copies.
 func uploadChunks(_ sealed: [String: Any]) async -> Bool {
     guard let chunks = sealed["chunks"] as? [[String: Any]] else { return false }
@@ -1747,11 +1780,21 @@ struct ConversationView: View {
         let idx = messages.count - 1
         revealAt = 0; destroyAt = 0
         Task {
-            let preview = buildPreview(src, isVideo: isVideo)
+            // Send a resized copy rather than the camera original — see compressForSend.
+            // `body` is what actually gets sealed, previewed and kept locally, so both ends
+            // hold the same picture. A re-encoded photo ships as JPEG whatever the original was.
+            let shrunk = compressForSend(src, isVideo: isVideo)
+            let body = shrunk ?? src
+            let sendMime = shrunk != nil ? "image/jpeg" : mime
+            let cleanup = {
+                if shrunk != nil { try? FileManager.default.removeItem(at: src) }
+                try? FileManager.default.removeItem(at: body)
+            }
+            let preview = buildPreview(body, isVideo: isVideo)
             let chunkDir = cacheDir.appendingPathComponent("out-\(UUID().uuidString)")
 
             let sealedStr = SealCore.sealMediaFile(
-                myIdentitySeed, myCard, chat.devicePub, src.path, mime,
+                myIdentitySeed, myCard, chat.devicePub, body.path, sendMime,
                 isVideo ? "video" : "image", caption, preview?.path ?? "", chunkDir.path, fast, rv, dz,
                 rv > 0 ? await finalizedSlot() : 0
             )
@@ -1759,7 +1802,7 @@ struct ConversationView: View {
             guard let sealed = (try? JSONSerialization.jsonObject(with: Data(sealedStr.utf8))) as? [String: Any],
                   (sealed["ok"] as? Bool) == true else {
                 try? FileManager.default.removeItem(at: chunkDir)
-                try? FileManager.default.removeItem(at: src)
+                cleanup()
                 await MainActor.run { failMedia(idx, label) }
                 return
             }
@@ -1768,21 +1811,22 @@ struct ConversationView: View {
             try? FileManager.default.removeItem(at: chunkDir)
             let shipped = up ? await shipSeal(sealed) : false
             guard shipped else {
-                try? FileManager.default.removeItem(at: src)
+                cleanup()
                 await MainActor.run { failMedia(idx, label) }
                 return
             }
             // keep OUR readable copy locally so the sent bubble can render it
             let mine = mediaDir.appendingPathComponent("sent-\(sealed["seal_id"] as? String ?? UUID().uuidString).\(isVideo ? "mp4" : "jpg")")
             try? FileManager.default.removeItem(at: mine)
-            try? FileManager.default.moveItem(at: src, to: mine)
+            try? FileManager.default.moveItem(at: body, to: mine)
+            if shrunk != nil { try? FileManager.default.removeItem(at: src) }
             await MainActor.run {
                 guard idx < messages.count else { return }
                 messages[idx].state = .opened
                 messages[idx].sealedFor = chat.name
                 messages[idx].mediaPath = mine.path
-                messages[idx].mediaMime = mime
-                Store.addThreadMsg(chat.identityPub, "out-\(UUID().uuidString)", label, false, media: mine.path, mime: mime, destroyAt: dz)
+                messages[idx].mediaMime = sendMime
+                Store.addThreadMsg(chat.identityPub, "out-\(UUID().uuidString)", label, false, media: mine.path, mime: sendMime, destroyAt: dz)
             }
         }
     }
