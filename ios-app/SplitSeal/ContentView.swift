@@ -1602,12 +1602,10 @@ struct ConversationView: View {
             // If an anchor exists and contradicts this bundle, the bundle is not what was
             // committed on-chain — drop it rather than opening it.
             if await verifiedAnchorSlot(sealId, bundleStr) < 0 { seen.insert(sealId); continue }
-            // A verified batched proof is the strongest evidence available: it says THIS leaf
-            // is inside a root the chain committed. Prefer its slot over the chain's tip.
-            // (No slot is passed to the open calls any more — see the note further down. The
-            // batched-proof fetch that used to feed it is dropped here rather than left dangling:
-            // it was 3 HTTP calls per message per poll, and with the value unused it was pure
-            // overhead on the very loop that needs to stay fast.)
+            // No slot is passed to the open calls any more (see the note on the text open below),
+            // so the batched-proof fetch that used to feed it is dropped rather than left
+            // dangling: it was 3 HTTP calls per message per poll for a value nothing reads, on
+            // the loop that most needs to stay fast.
 
             // Media arrives as a manifest, not as bytes: open the manifest, pull the chunks
             // the relay is holding, then decrypt and reassemble locally.
