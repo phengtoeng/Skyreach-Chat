@@ -65,6 +65,9 @@ Two release modes, both bound into the signed seal leaf so they can't be silentl
 | **Batched on-chain commitment (SEAL_ROOT) + sponsored fees** | ✅ done + LIVE on N5/N6/N7; every message is committed under a root anchored in a real tx, the app pays |
 | **Treasury monitoring / alerting** | ✅ done; `:9300/health` → 503 on low treasury, anchor failure, or backlog overflow |
 | Total Rust tests | **63 green** |
+| Android live receive (text + media, chat open) | ✅ fixed 2026-08-02, verified on two paired emulators — see §9b |
+| Timed reveal firing on the RECIPIENT | ❌ open — countdown expires but the item does not reveal (§9b) |
+| iOS receive | ❌ open — messages delivered to its mailbox are not fetched; ATS is the prime suspect |
 | iOS media UI | ⚠️ written, NOT yet compiled — needs a Mac |
 | Production gateway services, device linking, groups/calls, audit | ❌ Phase 3 |
 
@@ -255,6 +258,22 @@ Restarting the relay is safe: the inbox is an append log reloaded on start, so q
 messages survive (verified — 25 items intact across all three restarts). Only restart the
 units whose binary actually changed. **Rollback** = `install -m 755` the `.bak-*` copy and
 restart.
+
+**Relay storage** (`WCAHT_RELAY_DATA=/home/ubuntu/skyreach/data/relay`):
+`inbox.log` (append log of every delivered ciphertext) and `blobs/` (media chunks, ~93 MB).
+Relays **gossip to each other** via `WCAHT_RELAY_PEERS`, which is why a message POSTed to one
+node is readable from all three — and why clearing a backlog needs every relay stopped first,
+or a surviving peer re-gossips it straight back:
+```bash
+# on ALL of N5/N6/N7: stop first, then clear, then start
+sudo systemctl stop skyreach-relay
+cp -a ~/skyreach/data/relay/inbox.log ~/skyreach/data/relay/inbox.log.bak-$(date +%Y%m%d-%H%M%S)
+: > ~/skyreach/data/relay/inbox.log      # blobs are content-addressed; leave them
+sudo systemctl start skyreach-relay
+```
+This is a blunt instrument — it drops undelivered messages for **every** mailbox. It was needed
+once (2026-08-02) when ~110 stale seals head-of-line blocked the client; the real fix is §9b
+item 2, which stops the backlog mattering.
 
 ---
 
@@ -520,6 +539,48 @@ without a client rewrite. Keep new release gates composable the same way.
 
 ---
 
+## 9b. Client receive path — four bugs found 2026-08-02 (all fixed)
+
+All four presented identically — "I don't receive messages" — and three of them were diagnosed
+wrong before logging was added. **Instrument the poll loop before theorising**; reading the
+source produced two confident wrong answers in a row.
+
+1. **The open chat used a stricter gate than the chat list** (`5f517c2`) — THE cause of "the
+   message only shows after I leave the chat and come back".
+   ```kotlin
+   chat list:    SealCore.openReceived(seed, bundle, shares)             // no slot
+   conversation: SealCore.openReceived(seed, bundle, shares, openSlot)   // slot
+   ```
+   Passing `currentSlot` makes the core enforce the seal's finality floor against that slot.
+   Chain finality routinely runs **a minute or more behind wall clock**, so the freshly-read slot
+   was OLDER than the floor and the open was refused — while the list poll opened the same
+   message fine. And the list poll is gated on `openChat == null`, i.e. paused while a chat is
+   open. Hence: fails inside the chat, succeeds the moment you leave. Both media call sites had
+   it too, which is why photos never arrived. Now aligned on the list's behaviour — the gateways
+   withholding shares are the primary gate; the slot check is defense-in-depth and the list poll
+   never had it anyway.
+2. **Undecryptable seals jammed the loop forever** (`1ae14b5`). Only a *successful* open marked a
+   seal `seen`, so a seal that can never open (sealed to a device key we no longer hold) was
+   retried every poll forever at ~15 HTTP calls each. Two dead seals consumed the whole cycle and
+   newer messages were never reached — the inbox looked frozen while the app was busy. Now each
+   seal gets a small budget of failures. **`isPermanentOpenFailure()` whitelists the transient
+   gates** (timelock, shares, finality, quorum): being wrong in the "permanent" direction silently
+   loses a real message, and an earlier draft would have discarded a StrictSeal message that was
+   merely waiting ~17s for finality.
+3. **The UI append was nested inside the store's one-shot dedup** (`d7e6564`). Two poll loops run;
+   whichever persisted the message first consumed the dedup, so the conversation's
+   `messages.add(...)` never ran. `Msg.sealId` now lets "already on screen" be tested directly
+   instead of inferred from a storage side effect.
+4. **A stale relay backlog head-of-line blocks the client.** ~110 unopenable messages at the front
+   of the mailbox meant one poll cycle took minutes. Clearing `inbox.log` unjams it (§6b), but
+   fix 2 is what actually prevents it recurring.
+
+**Still open:** a timed-reveal ("opens later") seal does **not** reveal on the recipient when the
+countdown expires. Not yet diagnosed. Suspect the same family — the reveal path re-checks a gate
+with a slot/clock the receiver reads differently from the sender.
+
+---
+
 ## 10. Gotchas / lessons
 
 - **`ss_version` / `SealMsg.mode`:** the two FFI demos have DIFFERENT transcript shapes —
@@ -538,6 +599,21 @@ without a client rewrite. Keep new release gates composable the same way.
   transcript via `Store.addThreadMsg` BEFORE it knows whether `shipSeal` succeeded, then on
   failure leaves the bubble on "Sealing…" forever with no retry and no error. A message in your
   own transcript is NOT evidence it reached the relay — check the peer's mailbox on the relay.
+- **Pairing must be BIDIRECTIONAL.** The mailbox tag is `blake3("DSCP-2/mailbox" ‖ recipient
+  device_pub)`, so each side needs the *other's* contact card. Add one way only and messages go
+  to a box nobody polls — they deliver "successfully" and are never seen. To check a device's
+  mailbox directly: derive the tag from its `device_pub` and `GET /inbox/<tag>`; verify your
+  derivation against a known device first (its own `inbox_<tag>` key in `shared_prefs/denvion.xml`).
+- **The chat list mixes real contacts with hardcoded demo rows** (`MainActivity.kt` `CHATS`:
+  Maya, Ethan, Lena, Weekend Plan, Noah, Zoe, Daniel). Those have empty `identityPub`/`devicePub`,
+  so sending to one silently goes nowhere. Real contacts show a base58 address under the name.
+- **The emulator always exposes a hardware keyboard** (`AT Translated Set 2 keyboard`), so Android
+  hides the on-screen keyboard and shows only a small floating toolbar. **Click the emulator
+  window and type on the host keyboard** — the soft keyboard appears on the first keystroke.
+  `hw.keyboard=no` in the AVD config does NOT change this. `adb shell input text` always works.
+- **`adb shell run-as com.denvion.splitseal cat shared_prefs/denvion.xml`** is the fastest way to
+  see a device's identity, contacts, threads and inbox — invaluable for two-device debugging.
+  Contacts can be injected the same way (force-stop first) to pair devices without UI fiddling.
 - **The relay + gateways are in-memory only** (`relay.rs`, `gateway_service.rs` both use a plain
   `HashMap`). Restarting a `skyreach-*` unit on N6 drops every queued ciphertext and every
   finalized share, so undelivered messages are gone for good. Fix before any real use.
