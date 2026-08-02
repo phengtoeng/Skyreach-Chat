@@ -51,4 +51,7 @@ dependencies {
     implementation("dev.chrisbanes.haze:haze:0.7.3")
     implementation("com.google.zxing:core:3.5.3") // QR code for the profile card
     implementation("com.journeyapps:zxing-android-embedded:4.3.0") // camera QR scanner
+    // "Scan document" in the attach sheet: camera capture with edge detection, returning a PDF.
+    // Runs in Play services, so the pages never pass through this app before they are sealed.
+    implementation("com.google.android.gms:play-services-mlkit-document-scanner:16.0.0-beta1")
 }

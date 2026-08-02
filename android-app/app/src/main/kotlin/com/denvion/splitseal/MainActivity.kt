@@ -329,6 +329,9 @@ private class Store(ctx: Context) {
         media: String = "", // local path to the DECRYPTED file (this device only)
         mime: String = "",
         destroyAt: Long = 0, // persisted so a self-destruct still fires after an app restart
+        // Sent AS a document. Not derivable from the mime: a photo sent deliberately as a file
+        // has an image mime but must still come back as a file bubble after a restart.
+        asFile: Boolean = false,
     ): Boolean {
         if (peer.isBlank()) return false
         val a = thread(peer)
@@ -336,7 +339,7 @@ private class Store(ctx: Context) {
         a.put(
             JSONObject().put("id", id).put("text", text).put("incoming", incoming)
                 .put("ts", System.currentTimeMillis()).put("media", media).put("mime", mime)
-                .put("destroy_at", destroyAt).put("read", false)
+                .put("destroy_at", destroyAt).put("read", false).put("file", asFile)
         )
         p.edit().putString("thread_$peer", a.toString()).apply()
         return true
@@ -674,6 +677,21 @@ private fun downloadBlob(hashHex: String): ByteArray? {
 // The picked file is copied into the app cache, sealed by Rust into encrypted chunks on
 // disk, and only those chunks are uploaded. The readable original never leaves the device.
 
+/**
+ * What an opened media seal turned out to be.
+ *
+ * `kind` is the sender's declared ContentKind, not a guess from the mime type — a photo sent
+ * deliberately AS a document has an image mime but must still arrive as a file, untouched.
+ */
+private data class GotMedia(val path: String, val mime: String, val caption: String, val kind: String)
+
+/**
+ * The core refuses to seal anything larger in one item (seal-ffi's MAX_MEDIA_BYTES): it holds
+ * the plaintext in memory while chunking. Streaming is the follow-up that lifts this — until
+ * then the sheet must not advertise a limit the core will reject.
+ */
+private const val MAX_SEAL_BYTES = 64L * 1024 * 1024
+
 /** The name the picker shows for a content:// item, for a document bubble. */
 private fun displayName(ctx: Context, uri: android.net.Uri): String {
     runCatching {
@@ -799,7 +817,7 @@ private fun uploadChunks(sealed: JSONObject): Boolean {
  * decrypt and reassemble. Returns (localPath, mime), or null while it is still locked or
  * the chunks have not all arrived — the caller simply retries on the next poll.
  */
-private fun receiveMedia(ctx: Context, deviceSeed: String, sealId: String, bundle: String, shares: String, slot: Long): Triple<String, String, String>? {
+private fun receiveMedia(ctx: Context, deviceSeed: String, sealId: String, bundle: String, shares: String, slot: Long): GotMedia? {
     val previewPath = java.io.File(ctx.cacheDir, "pv-$sealId.jpg").path
     val info = runCatching { JSONObject(SealCore.openMediaInfo(deviceSeed, bundle, shares, previewPath, slot)) }.getOrNull() ?: return null
     if (!info.optBoolean("ok")) return null // locked, or not enough shares released yet
@@ -832,7 +850,7 @@ private fun receiveMedia(ctx: Context, deviceSeed: String, sealId: String, bundl
     }.getOrNull() ?: return null
     if (!done.optBoolean("ok")) return null
     chunkDir.deleteRecursively() // plaintext is assembled; the ciphertext copies are dead weight
-    return Triple(out.path, mime, caption)
+    return GotMedia(out.path, mime, caption, info.optString("kind"))
 }
 
 /**
@@ -1853,7 +1871,7 @@ private fun ConversationScreen(
                             clockLabel(o.optLong("ts")),
                             kind = when {
                                 media.isBlank() -> Kind.TEXT
-                                isFileMime(o.optString("mime")) -> Kind.FILE
+                                o.optBoolean("file") || isFileMime(o.optString("mime")) -> Kind.FILE
                                 else -> Kind.IMAGE
                             },
                             state = State.OPENED,
@@ -1994,18 +2012,19 @@ private fun ConversationScreen(
                             store.markReceipted(listOf(sealId))
                         }
                         val sender = bundle.optString("sender_id_pub")
-                        // Anything we cannot render inline is a document: its bubble shows the
-                        // sender's filename, which travels packed in front of the caption.
-                        val asFile = isFileMime(got.second)
+                        // A document bubble shows the sender's filename, which travels packed in
+                        // front of the caption. Decided by the sender's declared kind, so a photo
+                        // sent deliberately as a document stays a document here.
+                        val asFile = got.kind == "file" || isFileMime(got.mime)
                         val label =
-                            if (asFile) splitFileCaption(got.third).first
-                            else got.third.ifBlank { if (got.second.startsWith("video")) "Video" else "Photo" }
+                            if (asFile) splitFileCaption(got.caption).first
+                            else got.caption.ifBlank { if (got.mime.startsWith("video")) "Video" else "Photo" }
                         // carry the destroy deadline across: the recipient's copy must burn too,
                         // otherwise a "self-destruct" only ever removed the sender's side.
                         val dz = bundle.optLong("destroy_at")
                         // persist once …
                         if (store.addInbox(myTag, sealId, label, sender)) {
-                            store.addThreadMsg(sender, sealId, label, true, media = got.first, mime = got.second, destroyAt = dz)
+                            store.addThreadMsg(sender, sealId, label, true, media = got.path, mime = got.mime, destroyAt = dz, asFile = asFile)
                         }
                         // … and append to the open conversation independently of that dedup, or a
                         // photo that the chat-list poll persisted first never shows up live.
@@ -2014,8 +2033,8 @@ private fun ConversationScreen(
                                 Msg(
                                     System.nanoTime(), label, true, now(),
                                     kind = if (asFile) Kind.FILE else Kind.IMAGE,
-                                    state = State.OPENED, mediaPath = got.first, mediaMime = got.second,
-                                    mediaSize = java.io.File(got.first).length(),
+                                    state = State.OPENED, mediaPath = got.path, mediaMime = got.mime,
+                                    mediaSize = java.io.File(got.path).length(),
                                     destroyAt = dz, sealId = sealId, justRevealed = cameOutOfLock,
                                 )
                             )
@@ -2178,6 +2197,9 @@ private fun ConversationScreen(
             listState.animateScrollToItem(messages.lastIndex)
             val result = withContext(Dispatchers.IO) {
                 val src = cacheFromUri(ctx, uri, "doc-${System.nanoTime()}") ?: return@withContext null
+                // Refuse here rather than letting the core reject it after the copy: the error it
+                // returns is opaque, and the user deserves to know which limit they hit.
+                if (src.length() > MAX_SEAL_BYTES) { src.delete(); return@withContext "TOO_BIG" }
                 sentSize = src.length()
                 val chunkDir = java.io.File(ctx.cacheDir, "out-${System.nanoTime()}")
                 val slot = if (rv > 0) finalizedSlot() else 0L
@@ -2204,13 +2226,18 @@ private fun ConversationScreen(
                 src.copyTo(mine, overwrite = true); src.delete()
                 mine.path
             }
-            if (result != null) {
+            if (result == "TOO_BIG") {
+                messages.removeAt(idx)
+                android.widget.Toast.makeText(
+                    ctx, "$name is over the 64 MB limit for one seal", android.widget.Toast.LENGTH_LONG,
+                ).show()
+            } else if (result != null) {
                 messages[idx] = messages[idx].copy(
                     state = State.OPENED, sealedFor = chat.name, mediaPath = result, mediaMime = mime,
                     mediaSize = sentSize, sealId = sentSealId, read = false,
                 )
                 if (sentSealId.isNotBlank()) {
-                    store.addThreadMsg(chat.identityPub, sentSealId, name, false, media = result, mime = mime, destroyAt = dz)
+                    store.addThreadMsg(chat.identityPub, sentSealId, name, false, media = result, mime = mime, destroyAt = dz, asFile = true)
                 }
             } else {
                 messages.removeAt(idx)
@@ -2303,8 +2330,19 @@ private fun ConversationScreen(
     var pendingOriginal by remember { mutableStateOf(false) }
     // A document goes straight out: there is nothing to preview and nothing to caption.
     var pickedDoc by remember { mutableStateOf<android.net.Uri?>(null) }
+    var showDocSheet by remember { mutableStateOf(false) }
     val pickDocument = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         pickedDoc = uri
+    }
+    // "Choose photo or video" under Document: the same picker, but the result is sealed as a
+    // FILE — original bytes, no resize — rather than as a photo.
+    val pickMediaAsDoc = rememberMediaPicker { uri -> pickedDoc = uri }
+    // Document scanning runs inside Play services and hands back a PDF, so the captured pages
+    // never pass through this app before they are sealed.
+    val scanDocument = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { res ->
+        val pdf = com.google.mlkit.vision.documentscanner.GmsDocumentScanningResult
+            .fromActivityResultIntent(res.data)?.getPdf()?.getUri()
+        if (pdf != null) pickedDoc = pdf
     }
     // The camera writes into files/capture, the one other place the FileProvider exposes.
     var captureUri by remember { mutableStateOf<android.net.Uri?>(null) }
@@ -2443,11 +2481,44 @@ private fun ConversationScreen(
             captureUri = u
             takePhoto.launch(u)
         },
-        onDocument = { showAttach = false; pickDocument.launch(arrayOf("*/*")) },
+        onDocument = { showAttach = false; showDocSheet = true },
         // Tapping the roll stages the picture exactly as the picker does.
         onPickRecent = { u -> showAttach = false; pending = u },
         fullSize = pendingOriginal,
         onFullSize = { pendingOriginal = it },
+    )
+
+    if (showDocSheet) DocumentSheet(
+        onDismiss = { showDocSheet = false },
+        onFiles = { showDocSheet = false; pickDocument.launch(arrayOf("*/*")) },
+        onPhotoVideo = {
+            showDocSheet = false
+            pickMediaAsDoc.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
+        },
+        onScan = {
+            showDocSheet = false
+            val activity = ctx as? android.app.Activity
+            if (activity == null) {
+                android.widget.Toast.makeText(ctx, "Can't open the scanner here", android.widget.Toast.LENGTH_SHORT).show()
+            } else {
+                val opts = com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions.Builder()
+                    .setGalleryImportAllowed(true)
+                    .setResultFormats(com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions.RESULT_FORMAT_PDF)
+                    .setScannerMode(com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions.SCANNER_MODE_FULL)
+                    .build()
+                com.google.mlkit.vision.documentscanner.GmsDocumentScanning.getClient(opts)
+                    .getStartScanIntent(activity)
+                    .addOnSuccessListener { sender ->
+                        scanDocument.launch(androidx.activity.result.IntentSenderRequest.Builder(sender).build())
+                    }
+                    .addOnFailureListener {
+                        // Play services can decline: no module, too old, or an emulator without it.
+                        android.widget.Toast.makeText(
+                            ctx, "Scanner unavailable on this device", android.widget.Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+            }
+        },
     )
 
     if (showTimer) TimedSealDialog(
@@ -2588,6 +2659,64 @@ private fun AttachSheet(
                 }
             }
         }
+    }
+}
+
+/**
+ * The second sheet, behind Document.
+ *
+ * The limit in the subtitle is the real one the core enforces, not a round marketing number —
+ * see MAX_SEAL_BYTES.
+ */
+@Composable
+@OptIn(ExperimentalMaterial3Api::class)
+private fun DocumentSheet(
+    onFiles: () -> Unit,
+    onPhotoVideo: () -> Unit,
+    onScan: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = Color(0xFFF2F3F5)) {
+        Column(Modifier.fillMaxWidth().padding(bottom = 30.dp)) {
+            Box(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+                Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("Choose document", color = Ink, fontSize = 21.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(5.dp))
+                    Text("Send original files up to 64 MB.", color = Sub, fontSize = 15.sp)
+                }
+                Box(
+                    Modifier.align(Alignment.TopEnd).size(38.dp).clip(CircleShape)
+                        .background(Color(0xFFE4E6E9)).clickable(onClick = onDismiss),
+                    contentAlignment = Alignment.Center,
+                ) { Icon(Icons.Filled.Close, "Close", tint = Ink, modifier = Modifier.size(20.dp)) }
+            }
+            Spacer(Modifier.height(20.dp))
+            Column(
+                Modifier.padding(horizontal = 14.dp).clip(RoundedCornerShape(20.dp)).background(Color.White),
+            ) {
+                DocRow(Icons.Outlined.InsertDriveFile, "Choose from files", onFiles)
+                Box(Modifier.padding(start = 58.dp).fillMaxWidth().height(1.dp).background(Hair))
+                DocRow(Icons.Outlined.Image, "Choose photo or video", onPhotoVideo)
+                Box(Modifier.padding(start = 58.dp).fillMaxWidth().height(1.dp).background(Hair))
+                DocRow(Icons.Outlined.DocumentScanner, "Scan document", onScan)
+            }
+        }
+    }
+}
+
+@Composable
+private fun DocRow(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    onClick: () -> Unit,
+) {
+    Row(
+        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 18.dp, vertical = 17.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(icon, null, tint = Ink, modifier = Modifier.size(24.dp))
+        Spacer(Modifier.width(16.dp))
+        Text(label, color = Ink, fontSize = 17.sp)
     }
 }
 
