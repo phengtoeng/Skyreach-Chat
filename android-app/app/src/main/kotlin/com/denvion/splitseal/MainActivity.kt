@@ -1678,7 +1678,9 @@ private fun ConversationScreen(
                     // Time-locked? Show a locked placeholder with a countdown rather than
                     // nothing at all, and keep polling — it opens by itself at revealAt.
                     val gate = withContext(Dispatchers.IO) {
-                        runCatching { JSONObject(SealCore.openMediaInfo(myDeviceSeed, bundle.toString(), shares, "", openSlot)) }.getOrNull()
+                        // no currentSlot — same reason as the text path below: a lagging chain
+                        // slot makes this refuse a photo the chat-list poll would open fine.
+                        runCatching { JSONObject(SealCore.openMediaInfo(myDeviceSeed, bundle.toString(), shares, "")) }.getOrNull()
                     }
                     if (gate != null && !gate.optBoolean("ok")) {
                         when (gate.optString("reason")) {
@@ -1700,7 +1702,7 @@ private fun ConversationScreen(
                         }
                     }
                     val got = withContext(Dispatchers.IO) {
-                        receiveMedia(ctx, myDeviceSeed, sealId, bundle.toString(), shares, openSlot)
+                        receiveMedia(ctx, myDeviceSeed, sealId, bundle.toString(), shares, 0L)
                     }
                     if (got != null) {
                         // replace the locked placeholder, if one is on screen
@@ -1753,7 +1755,17 @@ private fun ConversationScreen(
                 }
 
                 val opened = runCatching {
-                    withContext(Dispatchers.IO) { JSONObject(SealCore.openReceived(myDeviceSeed, bundle.toString(), shares, openSlot)) }
+                    // NOTE: no currentSlot, deliberately — matching the chat-list poll above.
+                    // Passing a slot makes the core enforce the seal's finality floor against
+                    // THAT slot. Whenever chain finality lags (it routinely runs a minute or
+                    // more behind), the slot we just read is older than the floor, so the open
+                    // is refused — while the chat-list poll, which passes no slot, opens the
+                    // same message happily. Since that poll is paused while a chat is open, the
+                    // message only appeared after leaving the chat and coming back.
+                    // The gateways withholding shares are the primary release gate (see the FFI
+                    // "defense-in-depth" note), so the two paths agreeing matters more here than
+                    // one of them being selectively stricter.
+                    withContext(Dispatchers.IO) { JSONObject(SealCore.openReceived(myDeviceSeed, bundle.toString(), shares)) }
                 }.getOrNull()
                 if (opened != null && opened.optBoolean("ok")) {
                     seen.add(sealId)
