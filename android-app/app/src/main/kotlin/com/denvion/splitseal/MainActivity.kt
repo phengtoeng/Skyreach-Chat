@@ -2503,9 +2503,12 @@ private fun Bubble(m: Msg, now: Long = 0L, onDestroyed: () -> Unit = {}) {
 
 @Composable
 private fun TextContent(m: Msg) {
+    // Column width = its widest child, so the bubble hugs the text. The meta row is pushed to
+    // the trailing edge with align() rather than by stretching, which keeps the text itself
+    // left-aligned when the timestamp line happens to be the wider of the two.
     Column {
         Text(m.text, color = Ink, fontSize = 15.sp)
-        MetaRow(m)
+        MetaRow(m, Modifier.align(Alignment.End))
     }
 }
 
@@ -2520,7 +2523,7 @@ private fun SealingContent(m: Msg) {
                 color = Sub, fontSize = 14.sp,
             )
         }
-        Row(Modifier.fillMaxWidth().padding(top = 4.dp), horizontalArrangement = Arrangement.End) {
+        Row(Modifier.align(Alignment.End).padding(top = 4.dp)) {
             Text(m.time, color = Sub, fontSize = 11.sp)
         }
     }
@@ -2629,8 +2632,11 @@ private fun VoiceContent(m: Msg) {
 }
 
 @Composable
-private fun MetaRow(m: Msg) {
-    Row(Modifier.fillMaxWidth().padding(top = 2.dp), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
+private fun MetaRow(m: Msg, modifier: Modifier = Modifier) {
+    // Deliberately NOT fillMaxWidth: this row sits inside a bubble whose max width is 300.dp,
+    // and filling stretched every bubble to that maximum — a three-letter message got the same
+    // slab as a paragraph. Wrapping content lets the bubble size to its widest child instead.
+    Row(modifier.padding(top = 2.dp), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
         if (m.revealAt > 0) {
             Icon(Icons.Filled.Schedule, null, tint = Blue, modifier = Modifier.size(11.dp))
             Spacer(Modifier.width(3.dp))

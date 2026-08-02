@@ -2081,20 +2081,24 @@ private struct Bubble: View {
     }
 
     private var textContent: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        // .trailing so the timestamp line hugs the right edge of whatever the bubble's real
+        // width turns out to be. Previously metaRow held a leading Spacer(), which expanded to
+        // the full 300pt proposal and stretched every bubble to maximum width — a three-letter
+        // message got the same slab as a paragraph.
+        VStack(alignment: .trailing, spacing: 2) {
             Text(m.text).font(.system(size: 15)).foregroundColor(.dvInk)
             metaRow
         }
     }
 
     private var sealing: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .trailing, spacing: 4) {
             HStack(spacing: 8) {
                 Image(systemName: "lock.fill").font(.system(size: 14)).foregroundColor(.dvSub)
                 Text(m.mode == "FAST" ? "Waiting for pre-confirms" : "Waiting for finality")
                     .font(.system(size: 14)).foregroundColor(.dvSub)
             }
-            HStack { Spacer(); Text(m.time).font(.system(size: 11)).foregroundColor(.dvSub) }
+            Text(m.time).font(.system(size: 11)).foregroundColor(.dvSub)
         }
     }
 
@@ -2160,8 +2164,9 @@ private struct Bubble: View {
     }
 
     private var metaRow: some View {
+        // No leading Spacer: it would expand to the bubble's max width proposal and defeat the
+        // hug-the-content sizing. The enclosing VStack's .trailing alignment does the job.
         HStack(spacing: 4) {
-            Spacer()
             if m.revealAt > 0 {
                 Image(systemName: "clock").font(.system(size: 10)).foregroundColor(.dvBlue)
                 Text("Opens in \(relLabel(m.revealAt))").font(.system(size: 10)).foregroundColor(.dvBlue)
