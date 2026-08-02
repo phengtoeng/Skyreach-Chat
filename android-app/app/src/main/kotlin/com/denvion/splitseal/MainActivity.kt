@@ -1653,7 +1653,9 @@ private fun ConversationScreen(
         try {
             val items = withContext(Dispatchers.IO) { fetchInboxAll(myTag) }
             android.util.Log.i("SealPoll", "poll: ${items.size} items in mailbox, seen=${seen.size}, onScreen=${messages.size}")
-            val chainSlot = if (items.isEmpty()) 0L else withContext(Dispatchers.IO) { finalizedSlot() }
+            // (The chain slot used to be read once per pass and handed to the open calls. It is
+            // no longer passed — a slot behind the seal's finality floor made the open fail
+            // outright — so the read is dropped rather than left as dead work.)
             for (item in items) {
                 val sealId = item.optString("seal_id")
                 val bundle = item.optJSONObject("bundle") ?: continue
@@ -1666,11 +1668,9 @@ private fun ConversationScreen(
                     seen.add(sealId)
                     continue
                 }
-                // A verified batched proof is the strongest evidence available: it says THIS
-                // leaf is inside a root the chain committed. Prefer its slot over the chain's
-                // current tip, so opening is gated on the capsule's own anchoring.
-                val proof = withContext(Dispatchers.IO) { fetchVerifiedProof(sealId, bundle.toString()) }
-                val openSlot = proof?.optLong("finalized_slot") ?: chainSlot
+                // (The batched-proof fetch that used to feed `openSlot` is dropped here rather
+                // than left dangling: it was 3 HTTP calls per message per poll, and with the
+                // value unused it was pure overhead on the loop that most needs to stay fast.)
 
                 // Media arrives as a manifest, not as bytes: open the manifest, pull the
                 // chunks the relay is holding, then decrypt and reassemble locally.

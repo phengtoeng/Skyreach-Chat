@@ -68,6 +68,26 @@ struct Msg: Identifiable {
     var mediaMime: String = ""
     /// Set on a LOCKED placeholder so the real item can replace it when the window opens.
     var lockedSealId: String = ""
+    /// The seal this bubble came from, so the live poll can tell "already on screen" apart from
+    /// "already in the store". Those are NOT the same: two poll loops run, and whichever gets
+    /// there first consumes the store's one-shot dedup — which used to mean the message never
+    /// appeared until you left the chat and came back. Dedup the UI on this, not on the store.
+    var sealId: String = ""
+}
+
+/// Give up opening a seal after this many *permanent* failures (see `openFailures`).
+let MAX_OPEN_ATTEMPTS = 5
+
+/// True only when a seal can NEVER open, so it is safe to stop retrying it.
+///
+/// Being wrong in the "permanent" direction silently loses a real message, so this is a
+/// whitelist of transient states rather than a blacklist: anything about the timelock, missing
+/// key shares, chain finality or quorum is a gate that clears on its own and must keep retrying.
+/// Only failures no amount of waiting can fix count against the give-up budget.
+func isPermanentOpenFailure(_ reason: String) -> Bool {
+    let r = reason.lowercased()
+    let transient = ["locked", "share", "final", "pending", "quorum", "not yet", "await"]
+    return !transient.contains { r.contains($0) }
 }
 
 /// Short "time from now" label for a unix-seconds target, e.g. "10m", "1h", "1d".
@@ -1342,6 +1362,11 @@ struct ConversationView: View {
     @State private var draft = ""
     @State private var fastMode = false
     @State private var seen = Set<String>()
+    /// How many times each seal has been tried and failed to open. Only a SUCCESSFUL open used to
+    /// mark a seal `seen`, so a seal that can never open (sealed to a device key we no longer
+    /// hold) was retried on every poll forever at ~15 HTTP calls each — starving the loop so newer
+    /// messages were never reached. The inbox looked frozen while the app was in fact busy.
+    @State private var openFailures: [String: Int] = [:]
     @State private var polling = false
     @State private var myTag = ""
     // one-shot timelock for the NEXT message (unix secs, 0 = none); set via the clock in the composer.
@@ -1564,9 +1589,9 @@ struct ConversationView: View {
         polling = true
         defer { polling = false }
         let inbox = await fetchInboxAll(myTag)
-        // read the chain once per pass so the core can check the seal's slot floor against real
-        // finality rather than trusting that the gateways released
-        let chainSlot: Int64 = inbox.isEmpty ? 0 : await finalizedSlot()
+        // (The chain slot used to be read once per pass and handed to the open calls. It is no
+        // longer passed — a slot behind the seal's finality floor made the open fail outright,
+        // see the note below — so the read is dropped rather than left as dead work.)
         for item in inbox {
             guard let sealId = item["seal_id"] as? String, !sealId.isEmpty, !seen.contains(sealId),
                   let bundle = item["bundle"],
@@ -1579,7 +1604,10 @@ struct ConversationView: View {
             if await verifiedAnchorSlot(sealId, bundleStr) < 0 { seen.insert(sealId); continue }
             // A verified batched proof is the strongest evidence available: it says THIS leaf
             // is inside a root the chain committed. Prefer its slot over the chain's tip.
-            let openSlot = await fetchVerifiedProof(sealId, bundleStr) ?? chainSlot
+            // (No slot is passed to the open calls any more — see the note further down. The
+            // batched-proof fetch that used to feed it is dropped here rather than left dangling:
+            // it was 3 HTTP calls per message per poll, and with the value unused it was pure
+            // overhead on the very loop that needs to stay fast.)
 
             // Media arrives as a manifest, not as bytes: open the manifest, pull the chunks
             // the relay is holding, then decrypt and reassemble locally.
@@ -1587,7 +1615,9 @@ struct ConversationView: View {
             if (leaf?["content_type"] as? String) == "Media" {
                 // Time-locked? Show a locked placeholder with a countdown rather than nothing at
                 // all, and keep polling — it opens by itself at revealAt.
-                let gateStr = SealCore.openMediaInfo(myDeviceSeed, bundleStr, shares, "", openSlot)
+                // no currentSlot — same reason as the text path below: a lagging chain slot makes
+                // this refuse a photo the chat-list poll would open fine.
+                let gateStr = SealCore.openMediaInfo(myDeviceSeed, bundleStr, shares, "")
                 if let gate = (try? JSONSerialization.jsonObject(with: Data(gateStr.utf8))) as? [String: Any],
                    (gate["ok"] as? Bool) != true {
                     let reason = gate["reason"] as? String ?? ""
@@ -1601,41 +1631,75 @@ struct ConversationView: View {
                         continue // NOT marked seen: the next poll opens it once the window does
                     }
                 }
-                if let got = await receiveMedia(myDeviceSeed, sealId, bundleStr, shares, openSlot) {
+                if let got = await receiveMedia(myDeviceSeed, sealId, bundleStr, shares, 0) {
                     seen.insert(sealId)
                     let label = got.2.isEmpty ? (got.1.hasPrefix("video") ? "Video" : "Photo") : got.2
                     // carry the destroy deadline across: the recipient's copy must burn too,
                     // otherwise "self-destruct" only ever removed the sender's side.
                     let dz = ((item["bundle"] as? [String: Any])?["destroy_at"] as? NSNumber)?.int64Value ?? 0
                     messages.removeAll { $0.lockedSealId == sealId } // replace the locked placeholder
+                    // persist once …
                     if Store.addInbox(myTag, sealId, label, sender) {
                         Store.addThreadMsg(sender, sealId, label, true, media: got.0, mime: got.1, destroyAt: dz)
-                        if sender == chat.identityPub {
-                            messages.append(Msg(text: label, incoming: true, time: nowTime(),
-                                                kind: .image, state: .opened, destroyAt: dz,
-                                                mediaPath: got.0, mediaMime: got.1))
-                        }
+                    }
+                    // … and append independently of that dedup, or a photo the chat-list poll
+                    // persisted first never shows up live.
+                    if sender == chat.identityPub, !messages.contains(where: { $0.sealId == sealId }) {
+                        messages.append(Msg(text: label, incoming: true, time: nowTime(),
+                                            kind: .image, state: .opened, destroyAt: dz,
+                                            mediaPath: got.0, mediaMime: got.1, sealId: sealId))
+                    }
+                } else {
+                    // Media that did not open. A timelocked item returned "locked" above and
+                    // already continued, so reaching here means the open genuinely failed.
+                    // Count only permanent reasons — a photo still gathering chunks must retry.
+                    let why = ((try? JSONSerialization.jsonObject(with: Data(gateStr.utf8))) as? [String: Any])?["reason"] as? String ?? "no result"
+                    if isPermanentOpenFailure(why) {
+                        let n = (openFailures[sealId] ?? 0) + 1
+                        openFailures[sealId] = n
+                        if n >= MAX_OPEN_ATTEMPTS { seen.insert(sealId) }
                     }
                 }
-                continue // still locked / chunks not all there yet → retry on the next poll
+                continue // still gathering chunks → retry on the next poll
             }
 
-            let openStr = SealCore.openReceived(myDeviceSeed, bundleStr, shares, openSlot)
+            // NOTE: no currentSlot, deliberately — matching the chat-list poll (~line 736).
+            // Passing a slot makes the core enforce the seal's finality floor against THAT slot.
+            // Chain finality routinely runs a minute or more behind wall clock, so the slot we
+            // just read is older than the floor and the open is refused — while the chat-list
+            // poll, which passes none, opens the same message fine. That poll is paused while a
+            // chat is open, so the message only appeared after leaving the chat and returning.
+            // The gateways withholding shares are the primary release gate (the FFI calls this
+            // check "defense-in-depth"), so the two paths agreeing matters more than one being
+            // selectively stricter. Found and fixed on Android first — see SKYREACH_DOC §9b.
+            let openStr = SealCore.openReceived(myDeviceSeed, bundleStr, shares)
             if let r = (try? JSONSerialization.jsonObject(with: Data(openStr.utf8))) as? [String: Any],
                (r["ok"] as? Bool) == true, let plain = r["plaintext"] as? String {
                 seen.insert(sealId)
-                // dedup on the opened seal, persist to the sender's transcript, show if it's THIS chat.
+                // Persist once (addInbox is a one-shot dedup) …
                 if Store.addInbox(myTag, sealId, plain, sender) {
                     Store.addThreadMsg(sender, sealId, plain, true)
-                    if sender == chat.identityPub {
-                        messages.append(Msg(text: plain, incoming: true, time: nowTime(), state: .opened))
-                    }
+                }
+                // … but decide the on-screen append SEPARATELY. The chat-list poll and this one
+                // both run, and if the list persists the message first it eats the dedup — so
+                // gating the UI on addInbox() meant the bubble never appeared until the user
+                // left the chat and came back.
+                if sender == chat.identityPub, !messages.contains(where: { $0.sealId == sealId }) {
+                    messages.append(Msg(text: plain, incoming: true, time: nowTime(), state: .opened, sealId: sealId))
                 }
             } else if let r = (try? JSONSerialization.jsonObject(with: Data(openStr.utf8))) as? [String: Any],
                       (r["reason"] as? String) == "destroyed" {
                 seen.insert(sealId) // self-destructed before it was opened → stop retrying, never shows
+            } else {
+                // Not opened. Count only failures that can NEVER clear; a seal waiting on the
+                // timelock, on shares or on finality must keep retrying untouched.
+                let why = ((try? JSONSerialization.jsonObject(with: Data(openStr.utf8))) as? [String: Any])?["reason"] as? String ?? "no result"
+                if isPermanentOpenFailure(why) {
+                    let n = (openFailures[sealId] ?? 0) + 1
+                    openFailures[sealId] = n
+                    if n >= MAX_OPEN_ATTEMPTS { seen.insert(sealId) }
+                }
             }
-            // timelocked ("locked") or shares still gathering → leave unseen; opens when the window does
         }
     }
 
