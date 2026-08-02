@@ -293,6 +293,36 @@ private class Store(ctx: Context) {
     }
 
     /**
+     * Seals we have already sent a read receipt for.
+     *
+     * Persisted, because "have I acknowledged this?" must survive the app being closed. Without
+     * it, a message that arrived while the app was shut is opened by the chat-list poll on next
+     * launch, marked seen, and then skipped by the conversation poll — so the sender's tick would
+     * never turn blue no matter how many times the chat was opened.
+     */
+    fun hasReceipted(sealId: String): Boolean =
+        p.getStringSet("receipted", emptySet())?.contains(sealId) == true
+
+    fun markReceipted(sealIds: Collection<String>) {
+        if (sealIds.isEmpty()) return
+        val cur = p.getStringSet("receipted", emptySet())?.toMutableSet() ?: mutableSetOf()
+        cur.addAll(sealIds)
+        p.edit().putStringSet("receipted", cur).apply()
+    }
+
+    /** Incoming seal ids in this peer's transcript — the candidates to acknowledge on open. */
+    fun incomingSealIds(peer: String): List<String> {
+        if (peer.isBlank()) return emptyList()
+        val a = thread(peer)
+        val out = mutableListOf<String>()
+        for (i in 0 until a.length()) {
+            val o = a.getJSONObject(i)
+            if (o.optBoolean("incoming")) o.optString("id").takeIf { it.isNotBlank() }?.let { out.add(it) }
+        }
+        return out
+    }
+
+    /**
      * Mark one of OUR sent messages as read, because the recipient told us so.
      *
      * Matched by seal id — which is why an outgoing message is persisted under its seal id rather
@@ -462,19 +492,18 @@ private fun httpGet(url: String): String? = try {
  * The sender's mailbox tag comes from the device key inside the `sender_card` that travelled with
  * their message — the recipient never has to be told where to reply.
  */
-private fun sendReadReceipt(senderCard: String, sealId: String, myIdentityPub: String) {
-    if (senderCard.isBlank() || sealId.isBlank()) return
-    val card = runCatching { JSONObject(SealCore.parseCard(senderCard)) }.getOrNull() ?: return
-    if (!card.optBoolean("ok")) return
-    val devicePub = card.optString("device_pub")
-    if (devicePub.isBlank()) return
-    val tag = runCatching { JSONObject(SealCore.mailboxTag(devicePub)).optString("mailbox_tag") }
+private fun sendReadReceipts(peerDevicePub: String, sealIds: Collection<String>, myIdentityPub: String) {
+    if (peerDevicePub.isBlank() || sealIds.isEmpty()) return
+    val tag = runCatching { JSONObject(SealCore.mailboxTag(peerDevicePub)).optString("mailbox_tag") }
         .getOrNull().orEmpty()
     if (tag.isBlank()) return
-    val item = JSONObject()
-        .put("seal_id", "rcpt-$sealId")           // unique so the relay dedups it like any item
-        .put("receipt", JSONObject().put("read_seal", sealId).put("by", myIdentityPub))
-    for (r in Server.relays) httpPost("$r/inbox/$tag", item.toString())
+    for (sealId in sealIds) {
+        if (sealId.isBlank()) continue
+        val item = JSONObject()
+            .put("seal_id", "rcpt-$sealId")       // unique so the relay dedups it like any item
+            .put("receipt", JSONObject().put("read_seal", sealId).put("by", myIdentityPub))
+        for (r in Server.relays) httpPost("$r/inbox/$tag", item.toString())
+    }
 }
 
 /** Ship a shippable seal: {seal_id,bundle} → ALL relays, each share → a gateway (+ finalize).
@@ -1716,6 +1745,22 @@ private fun ConversationScreen(
 
     LaunchedEffect(Unit) { if (messages.isNotEmpty()) listState.scrollToItem(messages.lastIndex) }
 
+    // Opening the chat acknowledges everything in it — WhatsApp's semantics, and the fix for
+    // "the tick never turns blue if the app was closed when the message arrived".
+    //
+    // A message that lands while the app is shut is opened and stored by the CHAT-LIST poll on
+    // next launch. That poll deliberately sends no receipt (arriving on the device is not the
+    // same as being seen), and by the time the user opens the chat the seal is already in `seen`,
+    // so the conversation poll skips it and no receipt was ever sent. Sweeping the stored
+    // transcript here catches exactly those, and `hasReceipted` keeps it to once per seal.
+    LaunchedEffect(chat.identityPub, real) {
+        if (!real || chat.devicePub.isBlank() || myIdentityPub.isBlank()) return@LaunchedEffect
+        val pending = store.incomingSealIds(chat.identityPub).filterNot { store.hasReceipted(it) }
+        if (pending.isEmpty()) return@LaunchedEffect
+        withContext(Dispatchers.IO) { sendReadReceipts(chat.devicePub, pending, myIdentityPub) }
+        store.markReceipted(pending)
+    }
+
     // Poll my inbox: fetch delivered ciphertext, collect released shares, open, show. One at a time.
     suspend fun poll() {
         if (!real || myTag.isBlank()) return
@@ -1873,11 +1918,13 @@ private fun ConversationScreen(
                         "opened ${sealId.take(12)} sender=${sender.take(12)} chatPeer=${chat.identityPub.take(12)} match=${sender == chat.identityPub}"
                     )
                     // We have opened and are about to display it — tell the sender (blue ticks).
-                    // Sent from the conversation poll only: this is the path that runs when the
-                    // chat is actually on screen, so a receipt means "seen", not merely
-                    // "delivered to the device".
-                    withContext(Dispatchers.IO) {
-                        sendReadReceipt(bundle.optString("sender_card"), sealId, myIdentityPub)
+                    // Only from the conversation poll: this is the path that runs while the chat
+                    // is on screen, so a receipt means "seen", not merely "reached the device".
+                    if (!store.hasReceipted(sealId)) {
+                        withContext(Dispatchers.IO) {
+                            sendReadReceipts(chat.devicePub, listOf(sealId), myIdentityPub)
+                        }
+                        store.markReceipted(listOf(sealId))
                     }
                     // a timelocked text put a sealed placeholder on screen — swap it for the real
                     // message now the window has opened, rather than leaving both.
