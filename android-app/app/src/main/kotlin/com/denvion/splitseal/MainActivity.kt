@@ -1791,6 +1791,9 @@ private fun ConversationScreen(
                         "SealPoll",
                         "opened ${sealId.take(12)} sender=${sender.take(12)} chatPeer=${chat.identityPub.take(12)} match=${sender == chat.identityPub}"
                     )
+                    // a timelocked text put a sealed placeholder on screen — swap it for the real
+                    // message now the window has opened, rather than leaving both.
+                    messages.indexOfFirst { it.lockedSealId == sealId }.takeIf { it >= 0 }?.let { messages.removeAt(it) }
                     if (sender == chat.identityPub && messages.none { it.sealId == sealId }) {
                         messages.add(Msg(System.nanoTime(), text, true, now(), state = State.OPENED, destroyAt = dz, sealId = sealId))
                         listState.animateScrollToItem(messages.lastIndex)
@@ -1798,6 +1801,23 @@ private fun ConversationScreen(
                     }
                 } else if (opened?.optString("reason") == "destroyed") {
                     seen.add(sealId) // self-destructed before it was opened → stop retrying, never shows
+                } else if (opened?.optString("reason") == "locked") {
+                    // Timelocked text: show the same sealed card a locked photo gets, so the
+                    // recipient sees SOMETHING is waiting and when it opens. Previously a
+                    // timed-reveal text rendered nothing at all until the window passed, so it
+                    // looked like the message had simply never arrived.
+                    // NOT marked seen — the next poll opens it once the window does.
+                    val rv = opened.optLong("reveal_at")
+                    val sender = bundle.optString("sender_id_pub")
+                    if (sender == chat.identityPub && messages.none { it.lockedSealId == sealId }) {
+                        messages.add(
+                            Msg(
+                                System.nanoTime(), "Message", true, now(),
+                                state = State.LOCKED, revealAt = rv, lockedSealId = sealId,
+                            )
+                        )
+                        listState.animateScrollToItem(messages.lastIndex)
+                    }
                 } else {
                     val why = opened?.optString("reason") ?: "no result"
                     android.util.Log.i("SealPoll", "not opened ${sealId.take(12)}: $why")
@@ -2249,7 +2269,12 @@ private fun LockedContent(m: Msg, now: Long, caption: String = "") {
             Spacer(Modifier.height(8.dp))
             Text(countdown(m.revealAt - now), color = Ink, fontSize = 26.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(4.dp))
-            Text("Photo · opens in", color = Sub, fontSize = 12.sp)
+            // A timelocked TEXT gets the same sealed card as a photo — the recipient sees that
+            // something is waiting and when it opens, but never a hint of what it says.
+            Text(
+                if (m.kind == Kind.IMAGE) "Photo · opens in" else "Message · opens in",
+                color = Sub, fontSize = 12.sp,
+            )
         }
         // the sender's own caption stays readable — they wrote it; only the picture is sealed
         if (caption.isNotBlank() && caption != "Photo" && caption != "Video") {

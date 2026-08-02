@@ -1689,6 +1689,9 @@ struct ConversationView: View {
                 // both run, and if the list persists the message first it eats the dedup — so
                 // gating the UI on addInbox() meant the bubble never appeared until the user
                 // left the chat and came back.
+                // a timelocked text put a sealed placeholder on screen — swap it for the real
+                // message now the window has opened, rather than leaving both.
+                messages.removeAll { $0.lockedSealId == sealId }
                 if sender == chat.identityPub, !messages.contains(where: { $0.sealId == sealId }) {
                     messages.append(Msg(text: plain, incoming: true, time: nowTime(), state: .opened,
                                         destroyAt: dz, sealId: sealId))
@@ -1696,6 +1699,18 @@ struct ConversationView: View {
             } else if let r = (try? JSONSerialization.jsonObject(with: Data(openStr.utf8))) as? [String: Any],
                       (r["reason"] as? String) == "destroyed" {
                 seen.insert(sealId) // self-destructed before it was opened → stop retrying, never shows
+            } else if let r = (try? JSONSerialization.jsonObject(with: Data(openStr.utf8))) as? [String: Any],
+                      (r["reason"] as? String) == "locked" {
+                // Timelocked text: show the same sealed card a locked photo gets, so the
+                // recipient sees SOMETHING is waiting and when it opens. Previously a
+                // timed-reveal text rendered nothing at all until the window passed, so it
+                // looked like the message had never arrived.
+                // NOT marked seen — the next poll opens it once the window does.
+                let rv = (r["reveal_at"] as? NSNumber)?.int64Value ?? 0
+                if sender == chat.identityPub, !messages.contains(where: { $0.lockedSealId == sealId }) {
+                    messages.append(Msg(text: "Message", incoming: true, time: nowTime(),
+                                        state: .locked, revealAt: rv, lockedSealId: sealId))
+                }
             } else {
                 // Not opened. Count only failures that can NEVER clear; a seal waiting on the
                 // timelock, on shares or on finality must keep retrying untouched.
@@ -2033,7 +2048,10 @@ private struct Bubble: View {
                 Image(systemName: "lock.fill").font(.system(size: 26)).foregroundColor(.dvSub)
                 Text(countdownLabel(m.revealAt - now))
                     .font(.system(size: 26, weight: .bold)).foregroundColor(.dvInk)
-                Text("Photo · opens in").font(.system(size: 12)).foregroundColor(.dvSub)
+                // A timelocked TEXT gets the same sealed card as a photo — the recipient sees
+                // that something is waiting and when it opens, but never a hint of what it says.
+                Text(m.kind == .image ? "Photo · opens in" : "Message · opens in")
+                    .font(.system(size: 12)).foregroundColor(.dvSub)
             }
             .frame(width: 220, height: 160)
             .background(Color(hex: 0xE3E9EF))
