@@ -1838,6 +1838,15 @@ private fun ConversationScreen(
                     }
                     if (got != null) {
                         seen.add(sealId)
+                        // A photo we have opened and are about to show counts as read too — the
+                        // text path already reported back, media did not, so a photo's R never
+                        // turned blue however long the recipient looked at it.
+                        if (!store.hasReceipted(sealId)) {
+                            withContext(Dispatchers.IO) {
+                                sendReadReceipts(chat.devicePub, listOf(sealId), myIdentityPub)
+                            }
+                            store.markReceipted(listOf(sealId))
+                        }
                         val sender = bundle.optString("sender_id_pub")
                         val label = got.third.ifBlank { if (got.second.startsWith("video")) "Video" else "Photo" }
                         // carry the destroy deadline across: the recipient's copy must burn too,
@@ -2004,6 +2013,7 @@ private fun ConversationScreen(
         )
         val idx = messages.lastIndex
         revealAt = 0L; destroyAt = 0L
+        var sentSealId = "" // captured inside the IO block so the receipt can match this photo
         scope.launch {
             listState.animateScrollToItem(messages.lastIndex)
             val result = withContext(Dispatchers.IO) {
@@ -2030,6 +2040,7 @@ private fun ConversationScreen(
                 chunkDir.deleteRecursively()
                 if (!up) { src.delete(); return@withContext null }
                 if (!shipSeal(sealed)) { src.delete(); return@withContext null }
+                sentSealId = sealed.optString("seal_id")
                 // keep OUR readable copy locally so the sent bubble can render it
                 val mediaDir = java.io.File(ctx.filesDir, "media").apply { mkdirs() }
                 val mine = java.io.File(mediaDir, "sent-${sealed.optString("seal_id")}.${if (isVideo) "mp4" else "jpg"}")
@@ -2037,8 +2048,16 @@ private fun ConversationScreen(
                 mine.path
             }
             if (result != null) {
-                messages[idx] = messages[idx].copy(state = State.OPENED, sealedFor = chat.name, mediaPath = result, mediaMime = mime)
-                store.addThreadMsg(chat.identityPub, "out-" + System.nanoTime(), label, false, media = result, mime = mime, destroyAt = dz)
+                // Store under the SEAL ID, like text does: a read receipt names the seal, and
+                // that is the only identifier both devices share. Under a local counter a photo
+                // could never be matched to its receipt, so its R stayed grey forever.
+                messages[idx] = messages[idx].copy(
+                    state = State.OPENED, sealedFor = chat.name, mediaPath = result, mediaMime = mime,
+                    sealId = sentSealId, read = false,
+                )
+                if (sentSealId.isNotBlank()) {
+                    store.addThreadMsg(chat.identityPub, sentSealId, label, false, media = result, mime = mime, destroyAt = dz)
+                }
             } else {
                 messages.removeAt(idx)
                 android.widget.Toast.makeText(ctx, "Couldn't send $label — check the server", android.widget.Toast.LENGTH_SHORT).show()
