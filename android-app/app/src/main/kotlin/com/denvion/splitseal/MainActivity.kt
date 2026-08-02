@@ -2571,7 +2571,19 @@ private fun ImageContent(m: Msg) {
             Row(Modifier.align(Alignment.BottomEnd).padding(6.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(m.time, color = Color.White, fontSize = 11.sp)
                 Spacer(Modifier.width(3.dp))
-                SealBadge()
+                // Photos overlay their own status corner rather than using MetaRow, so the read
+                // indicator has to be added here too — otherwise a sent photo kept showing the
+                // green "sealed" badge and never reported read, unlike every text message.
+                if (!m.incoming) {
+                    Text(
+                        "R",
+                        color = if (m.read) Blue else Color.White,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
+                } else {
+                    SealBadge()
+                }
             }
         }
         // the caption travelled sealed inside the manifest, so it is as private as the pixels
