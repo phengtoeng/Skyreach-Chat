@@ -12,6 +12,13 @@ import androidx.activity.result.contract.ActivityResultContracts
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.expandVertically
@@ -49,6 +56,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.layout.Layout
@@ -167,6 +175,10 @@ private data class Msg(
      *  one-shot dedup — which used to mean the message never appeared until you left the chat and
      *  came back. Dedup the UI on this, not on the store's return value. */
     val sealId: String = "",
+    /** True only for the bubble that replaced a LOCKED placeholder this session — it earns the
+     *  gradient halo. Not persisted: a timelock opens once, and reopening the chat later should
+     *  show an ordinary photo, not a fresh celebration. */
+    val justRevealed: Boolean = false,
 )
 
 /** Give up opening a seal after this many *permanent* failures (see `openFailures`). Generous
@@ -1843,6 +1855,9 @@ private fun ConversationScreen(
                     val got = withContext(Dispatchers.IO) {
                         receiveMedia(ctx, myDeviceSeed, sealId, bundle.toString(), shares, 0L)
                     }
+                    // Was this photo sitting behind a countdown a moment ago? Has to be read
+                    // BEFORE the placeholder is dropped, and it is what earns the reveal halo.
+                    val cameOutOfLock = got != null && messages.any { it.lockedSealId == sealId }
                     if (got != null) {
                         // replace the locked placeholder, if one is on screen
                         messages.indexOfFirst { it.lockedSealId == sealId }.takeIf { it >= 0 }?.let { messages.removeAt(it) }
@@ -1874,7 +1889,7 @@ private fun ConversationScreen(
                                 Msg(
                                     System.nanoTime(), label, true, now(), kind = Kind.IMAGE,
                                     state = State.OPENED, mediaPath = got.first, mediaMime = got.second,
-                                    destroyAt = dz, sealId = sealId,
+                                    destroyAt = dz, sealId = sealId, justRevealed = cameOutOfLock,
                                 )
                             )
                             listState.animateScrollToItem(messages.lastIndex)
@@ -2470,6 +2485,11 @@ private fun Bubble(m: Msg, now: Long = 0L, onDestroyed: () -> Unit = {}) {
     // The SENDER's own copy of an "opens later" item: they own the picture, but it must not
     // look like an ordinary sent photo — it is sealed shut for the recipient until revealAt.
     val stillSealed = !m.incoming && m.revealAt > 0 && now > 0 && now < m.revealAt
+    // The sender watches the same countdown, so their own copy earns the halo the moment it
+    // opens. Derived from the clock rather than a flag — there is no locked placeholder to
+    // replace on this side, the bubble simply stops being sealed.
+    val senderJustOpened = !m.incoming && m.revealAt > 0 && now > 0 &&
+        now - m.revealAt in 0 until (REVEAL_GLOW_MILLIS / 1000)
 
     Column(Modifier.fillMaxWidth().padding(vertical = 3.dp), horizontalAlignment = align) {
         val body: @Composable () -> Unit = {
@@ -2480,7 +2500,7 @@ private fun Bubble(m: Msg, now: Long = 0L, onDestroyed: () -> Unit = {}) {
                     // Sealed and not yet open: show the lock card on the SENDER's side too.
                     // A translucent scrim still let the picture read straight through it.
                     stillSealed && m.kind == Kind.IMAGE -> LockedContent(m, now, caption = m.text)
-                    m.kind == Kind.IMAGE -> ImageContent(m)
+                    m.kind == Kind.IMAGE -> ImageContent(m, glow = m.justRevealed || senderJustOpened)
                     m.kind == Kind.VOICE -> VoiceContent(m)
                     else -> TextContent(m)
                 }
@@ -2572,8 +2592,55 @@ private fun SealingContent(m: Msg) {
     }
 }
 
+/** How long the reveal halo runs before fading out and stopping. */
+private const val REVEAL_GLOW_MILLIS = 9_000L
+
+/**
+ * A band of colour that travels behind a photo for a few seconds after its timelock opens.
+ *
+ * It stops on its own. An infinite animation left running inside a scrolling list costs frames
+ * for as long as the bubble exists, and there are potentially many of them in a transcript.
+ */
 @Composable
-private fun ImageContent(m: Msg) {
+private fun RevealHalo(modifier: Modifier = Modifier) {
+    var lit by remember { mutableStateOf(true) }
+    LaunchedEffect(Unit) { delay(REVEAL_GLOW_MILLIS); lit = false }
+    val alpha by animateFloatAsState(
+        targetValue = if (lit) 1f else 0f,
+        animationSpec = tween(1400),
+        label = "haloFade",
+    )
+    // Once faded, drop the whole thing so the transition stops ticking.
+    if (alpha <= 0.02f) return
+
+    val t = rememberInfiniteTransition(label = "halo")
+    val shift by t.animateFloat(
+        initialValue = 0f, targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(2600, easing = LinearEasing), RepeatMode.Restart),
+        label = "haloShift",
+    )
+    Canvas(modifier) {
+        // Mirror tiling makes the band seamless, so sliding the gradient's origin across one
+        // full width reads as continuous travel rather than a jump at the wrap.
+        val span = size.width
+        drawRoundRect(
+            brush = Brush.linearGradient(
+                colors = listOf(
+                    Color(0xFF2E9BF6), Color(0xFF7B61FF), Color(0xFFFF6FB5),
+                    Color(0xFFFFC46B), Color(0xFF2E9BF6),
+                ),
+                start = androidx.compose.ui.geometry.Offset(-span + span * shift, 0f),
+                end = androidx.compose.ui.geometry.Offset(span * shift, size.height),
+                tileMode = androidx.compose.ui.graphics.TileMode.Mirror,
+            ),
+            cornerRadius = androidx.compose.ui.geometry.CornerRadius(18.dp.toPx()),
+            alpha = alpha * 0.85f,
+        )
+    }
+}
+
+@Composable
+private fun ImageContent(m: Msg, glow: Boolean = false) {
     val ctx = LocalContext.current
     val isVideo = m.mediaMime.startsWith("video")
     // Decode the DECRYPTED local file. Nothing here ever touches the network — by this
@@ -2589,6 +2656,12 @@ private fun ImageContent(m: Msg) {
         }.getOrNull()
     }
     Column {
+      Box(contentAlignment = Alignment.Center) {
+        // The halo sits BEHIND the picture and slightly proud of it, so what you see is colour
+        // moving around the edges rather than a tint laid over the photo itself.
+        if (glow) {
+            RevealHalo(Modifier.size(width = 238.dp, height = 178.dp).blur(18.dp))
+        }
         Box(
             Modifier.size(width = 220.dp, height = 160.dp).clip(RoundedCornerShape(12.dp))
                 .background(Color(0xFFDDE4EA))
@@ -2632,6 +2705,7 @@ private fun ImageContent(m: Msg) {
                 }
             }
         }
+      }
         // the caption travelled sealed inside the manifest, so it is as private as the pixels
         val caption = m.text
         if (caption.isNotBlank() && caption != "Photo" && caption != "Video") {

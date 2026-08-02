@@ -73,6 +73,10 @@ struct Msg: Identifiable {
     /// there first consumes the store's one-shot dedup — which used to mean the message never
     /// appeared until you left the chat and came back. Dedup the UI on this, not on the store.
     var sealId: String = ""
+    /// True only for the bubble that replaced a LOCKED placeholder this session — it earns the
+    /// gradient halo. Not persisted: a timelock opens once, and reopening the chat later should
+    /// show an ordinary photo, not a fresh celebration.
+    var justRevealed: Bool = false
 }
 
 /// Give up opening a seal after this many *permanent* failures (see `openFailures`).
@@ -1638,6 +1642,9 @@ struct ConversationView: View {
                     // carry the destroy deadline across: the recipient's copy must burn too,
                     // otherwise "self-destruct" only ever removed the sender's side.
                     let dz = ((item["bundle"] as? [String: Any])?["destroy_at"] as? NSNumber)?.int64Value ?? 0
+                    // Was this photo sitting behind a countdown a moment ago? Has to be read
+                    // BEFORE the placeholder is dropped, and it is what earns the reveal halo.
+                    let cameOutOfLock = messages.contains { $0.lockedSealId == sealId }
                     messages.removeAll { $0.lockedSealId == sealId } // replace the locked placeholder
                     // persist once …
                     if Store.addInbox(myTag, sealId, label, sender) {
@@ -1648,7 +1655,8 @@ struct ConversationView: View {
                     if sender == chat.identityPub, !messages.contains(where: { $0.sealId == sealId }) {
                         messages.append(Msg(text: label, incoming: true, time: nowTime(),
                                             kind: .image, state: .opened, destroyAt: dz,
-                                            mediaPath: got.0, mediaMime: got.1, sealId: sealId))
+                                            mediaPath: got.0, mediaMime: got.1, sealId: sealId,
+                                            justRevealed: cameOutOfLock))
                     }
                 } else {
                     // Media that did not open. A timelocked item returned "locked" above and
@@ -1984,6 +1992,40 @@ private struct SmokeDestroy<Content: View>: View {
     }
 }
 
+/// How long the reveal halo runs before fading out.
+private let revealGlowSeconds: Double = 9
+
+/// A band of colour that travels behind a photo for a few seconds after its timelock opens.
+///
+/// A gradient three times the picture's width is slid sideways and clipped back to its footprint,
+/// then blurred — so what shows is a moving coloured shadow rather than a hard edge. The colours
+/// repeat across the run, which is what makes the travel read as continuous instead of looping.
+private struct RevealHalo: View {
+    let width: CGFloat
+    let height: CGFloat
+    @State private var travel: CGFloat = -1
+    @State private var lit = true
+
+    var body: some View {
+        LinearGradient(
+            colors: [Color(hex: 0x2E9BF6), Color(hex: 0x7B61FF), Color(hex: 0xFF6FB5),
+                     Color(hex: 0xFFC46B), Color(hex: 0x2E9BF6), Color(hex: 0x7B61FF),
+                     Color(hex: 0xFF6FB5)],
+            startPoint: .leading, endPoint: .trailing
+        )
+        .frame(width: width * 3, height: height)
+        .offset(x: travel * width)
+        .frame(width: width, height: height)
+        .clipShape(RoundedRectangle(cornerRadius: 18))
+        .blur(radius: 14)
+        .opacity(lit ? 0.85 : 0)
+        .onAppear {
+            withAnimation(.linear(duration: 2.6).repeatForever(autoreverses: false)) { travel = 0 }
+            withAnimation(.easeOut(duration: 1.4).delay(revealGlowSeconds)) { lit = false }
+        }
+    }
+}
+
 private struct Bubble: View {
     let m: Msg
     var now: Int64 = 0
@@ -2114,11 +2156,26 @@ private struct Bubble: View {
     /// True while THIS bubble is the sender's copy of an item still inside its reveal window.
     private var sealedNow: Bool { !m.incoming && m.revealAt > 0 && now > 0 && now < m.revealAt }
 
+    /// True while this photo should wear the reveal halo.
+    private var showRevealGlow: Bool {
+        if m.justRevealed { return true }
+        // The sender watches the same countdown, so their own copy earns the halo the moment it
+        // opens. Derived from the clock rather than a flag — there is no locked placeholder to
+        // replace on this side, the bubble simply stops being sealed.
+        guard !m.incoming, m.revealAt > 0, now > 0 else { return false }
+        let since = now - m.revealAt
+        return since >= 0 && since < Int64(revealGlowSeconds)
+    }
+
     private var imageOnly: some View {
         // Renders the DECRYPTED local file. By this point the bytes exist in readable form
         // only on this device — nothing here touches the network.
         let isVideo = m.mediaMime.hasPrefix("video")
-        return ZStack(alignment: .bottomTrailing) {
+        return ZStack {
+        // The halo sits BEHIND the picture and slightly proud of it, so what you see is colour
+        // moving around the edges rather than a tint laid over the photo itself.
+        if showRevealGlow { RevealHalo(width: 238, height: 178) }
+        ZStack(alignment: .bottomTrailing) {
             Group {
                 if let img = decodedMedia {
                     Image(uiImage: img).resizable().aspectRatio(contentMode: .fill)
@@ -2134,7 +2191,19 @@ private struct Bubble: View {
                     .font(.system(size: 44)).foregroundColor(.white.opacity(0.85))
                     .frame(width: 220, height: 160)
             }
-            HStack(spacing: 3) { Text(m.time).font(.system(size: 11)).foregroundColor(.white); sealBadge }.padding(6)
+            HStack(spacing: 3) {
+                Text(m.time).font(.system(size: 11)).foregroundColor(.white)
+                // Photos overlay their own status corner rather than using the meta run, so the
+                // read indicator has to be repeated here — otherwise a sent photo keeps showing
+                // the green "sealed" badge and never reports read, unlike every text message.
+                if !m.incoming {
+                    Text("R").font(.system(size: 12, weight: .bold))
+                        .foregroundColor(m.read ? .dvBlue : .white)
+                } else {
+                    sealBadge
+                }
+            }.padding(6)
+        }
         }
         .contentShape(Rectangle())
         .onTapGesture {
